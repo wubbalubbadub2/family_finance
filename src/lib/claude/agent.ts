@@ -10,6 +10,8 @@ import {
   getLastNTransactions,
   getMonthSummary,
   upsertMonthlyPlan,
+  getRecentMessages,
+  saveMessage,
 } from '@/lib/db/queries';
 import { todayAlmaty, currentMonthAlmaty, monthNameRu } from '@/lib/utils';
 
@@ -260,17 +262,26 @@ async function executeTool(
 export async function chat(
   userMessage: string,
   telegramId: number,
-  userName: string
+  userName: string,
+  chatId: number
 ): Promise<string> {
   const user = await getUserByTelegramId(telegramId);
   if (!user) return '⛔ Пользователь не найден в системе.';
 
-  const messages: Anthropic.MessageParam[] = [
-    {
-      role: 'user',
-      content: `[${userName}]: ${userMessage}`,
-    },
-  ];
+  // Load conversation history for multi-turn context
+  const history = await getRecentMessages(chatId, 10);
+  const messages: Anthropic.MessageParam[] = [];
+
+  // Add previous messages as context
+  for (const msg of history) {
+    messages.push({ role: msg.role as 'user' | 'assistant', content: msg.content });
+  }
+
+  // Add current message
+  messages.push({ role: 'user', content: `[${userName}]: ${userMessage}` });
+
+  // Save user message to memory
+  await saveMessage(chatId, 'user', `[${userName}]: ${userMessage}`);
 
   // Loop: Claude may call multiple tools before giving final answer
   for (let i = 0; i < 5; i++) {
@@ -282,13 +293,14 @@ export async function chat(
       messages,
     });
 
-    // Collect text and tool_use blocks
     const toolUses = response.content.filter(b => b.type === 'tool_use');
     const textBlocks = response.content.filter(b => b.type === 'text');
 
-    // If no tool calls, return the text response
+    // If no tool calls, return and save the text response
     if (toolUses.length === 0) {
-      return textBlocks.map(b => b.type === 'text' ? b.text : '').join('\n').trim() || '🤔';
+      const reply = textBlocks.map(b => b.type === 'text' ? b.text : '').join('\n').trim() || '🤔';
+      await saveMessage(chatId, 'assistant', reply);
+      return reply;
     }
 
     // Execute all tool calls
@@ -311,11 +323,12 @@ export async function chat(
       })),
     });
 
-    // If stop_reason is 'end_turn', we'll get text in next iteration
     if (response.stop_reason === 'end_turn') {
-      // Shouldn't happen if there were tool uses, but just in case
       const text = textBlocks.map(b => b.type === 'text' ? b.text : '').join('\n').trim();
-      if (text) return text;
+      if (text) {
+        await saveMessage(chatId, 'assistant', text);
+        return text;
+      }
     }
   }
 

@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getMonthlyPlans } from '@/lib/db/queries';
 import { currentMonthAlmaty, monthNameRu } from '@/lib/utils';
+import { sendTelegramMessage } from '@/lib/bot/send-message';
 
 function verifyCron(req: NextRequest): boolean {
   const authHeader = req.headers.get('authorization');
@@ -12,21 +13,23 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
 
-  const { year, month } = currentMonthAlmaty();
+  const chatId = process.env.FAMILY_CHAT_ID;
+  if (!chatId) return NextResponse.json({ ok: true, skipped: 'no FAMILY_CHAT_ID' });
 
-  // Check if a plan exists for the current month
+  const { year, month } = currentMonthAlmaty();
   const plans = await getMonthlyPlans(year, month);
 
   if (plans.length === 0) {
-    // TODO: Send Telegram message to both users:
-    // "Начался {monthName}! Установите план на месяц с /setplan"
-    const message = `Начался ${monthNameRu(month)} ${year}! Установите план с /setplan`;
+    const appUrl = process.env.VERCEL_URL
+      ? `https://${process.env.VERCEL_URL}/plan`
+      : 'the web dashboard';
 
-    // This would use the Telegram Bot API to send a message
-    // For now, just log it
-    console.log('Monthly reminder:', message);
+    await sendTelegramMessage(
+      chatId,
+      `🗓 Начался *${monthNameRu(month)} ${year}*!\n\nУстановите бюджет на месяц через /setplan или на сайте:\n${appUrl}`
+    );
 
-    return NextResponse.json({ ok: true, reminder_sent: true, message });
+    return NextResponse.json({ ok: true, reminder_sent: true });
   }
 
   return NextResponse.json({ ok: true, plan_exists: true });

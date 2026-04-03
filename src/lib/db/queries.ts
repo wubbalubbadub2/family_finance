@@ -211,6 +211,28 @@ export async function upsertMerchantCategory(
   if (error) throw error;
 }
 
+// ── Conversation Memory ──
+
+export async function getRecentMessages(chatId: number, limit = 10): Promise<{ role: string; content: string }[]> {
+  const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+  const { data } = await supabase
+    .from('conversation_messages')
+    .select('role, content')
+    .eq('telegram_chat_id', chatId)
+    .gte('created_at', oneHourAgo)
+    .order('created_at', { ascending: true })
+    .limit(limit);
+  return data ?? [];
+}
+
+export async function saveMessage(chatId: number, role: string, content: string): Promise<void> {
+  await supabase.from('conversation_messages').insert({
+    telegram_chat_id: chatId,
+    role,
+    content,
+  });
+}
+
 // ── Aggregations ──
 
 export async function getMonthSummary(year: number, month: number) {

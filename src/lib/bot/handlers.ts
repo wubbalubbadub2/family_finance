@@ -39,7 +39,7 @@ export function createBot(): Bot {
     try {
       await ctx.replyWithChatAction('typing');
       const userName = ctx.from.first_name || 'User';
-      const response = await chat(cleanText, telegramId, userName);
+      const response = await chat(cleanText, telegramId, userName, ctx.chat.id);
 
       // Split long messages (Telegram limit is 4096)
       if (response.length > 4000) {
