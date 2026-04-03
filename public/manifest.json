@@ -1,0 +1,8 @@
+{
+  "name": "Семейный бюджет",
+  "short_name": "Бюджет",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#fafafa",
+  "theme_color": "#111827"
+}
