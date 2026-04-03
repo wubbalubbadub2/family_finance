@@ -23,3 +23,8 @@ html {
 * {
   -webkit-tap-highlight-color: transparent;
 }
+
+/* Safe area for bottom nav on iPhone */
+.safe-area-pb {
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}

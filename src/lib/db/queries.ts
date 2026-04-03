@@ -1,4 +1,5 @@
 import { supabase } from './supabase';
+import { currentMonthAlmaty, todayAlmaty } from '@/lib/utils';
 import type {
   Transaction,
   User,
@@ -19,6 +20,14 @@ export async function getUserByTelegramId(telegramId: number): Promise<User | nu
     .eq('telegram_id', telegramId)
     .single();
   return data;
+}
+
+export async function getUsers(): Promise<User[]> {
+  const { data } = await supabase
+    .from('users')
+    .select('*')
+    .order('name');
+  return data ?? [];
 }
 
 // ── Categories ──
@@ -232,11 +241,13 @@ export async function getMonthSummary(year: number, month: number) {
   const categorySummaries = categories.map(cat => {
     const planned = planMap.get(cat.id) ?? 0;
     const actual = categoryTotals.get(cat.id) ?? 0;
+    // Only compute remaining for categories WITH a plan
+    const remaining = planned > 0 ? planned - actual : 0;
     return {
       category: cat,
       planned,
       actual,
-      remaining: planned - actual,
+      remaining,
       percentage: planned > 0 ? Math.round((actual / planned) * 100) : 0,
     };
   });
@@ -245,11 +256,22 @@ export async function getMonthSummary(year: number, month: number) {
   const totalActual = expenses.reduce((a, b) => a + b.amount, 0);
   const totalIncome = income.reduce((a, b) => a + b.amount, 0);
 
-  const now = new Date();
+  // Fix: use Almaty timezone for days elapsed (Vercel runs in UTC)
+  const { year: almatyYear, month: almatyMonth } = currentMonthAlmaty();
+  const almatyDay = parseInt(todayAlmaty().split('-')[2], 10);
   const daysInMonth = new Date(year, month, 0).getDate();
-  const daysElapsed = year === now.getFullYear() && month === (now.getMonth() + 1)
-    ? now.getDate()
+  const daysElapsed = year === almatyYear && month === almatyMonth
+    ? almatyDay
     : daysInMonth;
+
+  // Spending pace metrics
+  const dailyBudget = totalPlanned > 0 && daysInMonth > 0 ? Math.round(totalPlanned / daysInMonth) : 0;
+  const dailyActual = daysElapsed > 0 ? Math.round(totalActual / daysElapsed) : 0;
+  const daysLeft = daysInMonth - daysElapsed;
+  const projectedTotal = daysElapsed > 0 ? Math.round(dailyActual * daysInMonth) : 0;
+  const safeDailyRemaining = daysLeft > 0 && totalPlanned > 0
+    ? Math.round((totalPlanned - totalActual) / daysLeft)
+    : 0;
 
   return {
     year,
@@ -258,9 +280,13 @@ export async function getMonthSummary(year: number, month: number) {
     total_income_plan: incomePlan,
     total_planned: totalPlanned,
     total_actual: totalActual,
-    total_remaining: totalPlanned - totalActual,
+    total_remaining: totalPlanned > 0 ? totalPlanned - totalActual : 0,
     days_elapsed: daysElapsed,
     days_in_month: daysInMonth,
+    daily_budget: dailyBudget,
+    daily_actual: dailyActual,
+    projected_total: projectedTotal,
+    safe_daily_remaining: safeDailyRemaining,
     categories: categorySummaries,
   };
 }
