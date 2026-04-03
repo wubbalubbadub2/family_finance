@@ -1,7 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import {
   getMonthTransactions,
-  getTransactionsByDateRange,
   softDeleteTransaction,
 } from '@/lib/db/queries';
 

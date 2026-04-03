@@ -1,4 +1,5 @@
 import { currentMonthAlmaty, formatTenge, monthNameRu } from '@/lib/utils';
+import type { CategorySummary } from '@/types';
 
 // Dashboard data fetching
 async function getDashboardData() {
@@ -107,8 +108,8 @@ export default async function Dashboard() {
         {/* Category cards */}
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
           {categories
-            .filter((c: any) => c.actual > 0 || c.planned > 0)
-            .map((c: any) => (
+            .filter((c: CategorySummary) => c.actual > 0 || c.planned > 0)
+            .map((c: CategorySummary) => (
               <div key={c.category.slug} className="bg-white rounded-xl shadow-sm border p-4">
                 <div className="flex items-center justify-between mb-2">
                   <span className="font-medium">
@@ -134,7 +135,7 @@ export default async function Dashboard() {
         </div>
 
         {/* Empty state */}
-        {categories.every((c: any) => c.actual === 0 && c.planned === 0) && (
+        {categories.every((c: CategorySummary) => c.actual === 0 && c.planned === 0) && (
           <div className="text-center py-12 text-gray-400">
             <p className="text-4xl mb-4">📭</p>
             <p>Пока нет данных за этот месяц.</p>

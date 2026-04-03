@@ -14,7 +14,7 @@ import {
   getMonthSummary,
 } from '@/lib/db/queries';
 import { formatTenge, todayAlmaty, currentMonthAlmaty, formatDateShort, monthNameRu } from '@/lib/utils';
-import type { Category, ParsedExpense } from '@/types';
+import type { ParsedExpense } from '@/types';
 
 const ALLOWED_IDS = (process.env.ALLOWED_TELEGRAM_IDS ?? '')
   .split(',')
@@ -164,7 +164,7 @@ async function recordExpense(ctx: Context, userId: string, parsed: ParsedExpense
     return;
   }
 
-  const tx = await insertTransaction({
+  await insertTransaction({
     user_id: userId,
     category_id: category.id,
     type: 'expense',
