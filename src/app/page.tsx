@@ -1,20 +1,14 @@
 import { currentMonthAlmaty, formatTenge, monthNameRu } from '@/lib/utils';
+import { getMonthSummary } from '@/lib/db/queries';
 import type { CategorySummary } from '@/types';
 
-// Dashboard data fetching
+// Query Supabase directly in the server component
 async function getDashboardData() {
   const { year, month } = currentMonthAlmaty();
-  const baseUrl = process.env.VERCEL_URL
-    ? `https://${process.env.VERCEL_URL}`
-    : 'http://localhost:3000';
-
   try {
-    const res = await fetch(`${baseUrl}/api/summary?year=${year}&month=${month}`, {
-      cache: 'no-store',
-    });
-    if (!res.ok) return null;
-    return res.json();
-  } catch {
+    return await getMonthSummary(year, month);
+  } catch (e) {
+    console.error('Dashboard data fetch error:', e);
     return null;
   }
 }
