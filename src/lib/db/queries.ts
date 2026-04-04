@@ -91,14 +91,17 @@ export async function getLastTransaction(userId: string): Promise<Transaction | 
   return data;
 }
 
-export async function getLastNTransactions(userId: string, n: number): Promise<Transaction[]> {
-  const { data } = await supabase
+export async function getLastNTransactions(userId: string, n: number, familyWide = false): Promise<Transaction[]> {
+  let query = supabase
     .from('transactions')
     .select('*')
-    .eq('user_id', userId)
     .is('deleted_at', null)
     .order('created_at', { ascending: false })
     .limit(n);
+
+  if (!familyWide) query = query.eq('user_id', userId);
+
+  const { data } = await query;
   return data ?? [];
 }
 

@@ -192,7 +192,7 @@ async function executeTool(
 
     case 'get_recent_transactions': {
       const count = Math.min((input.count as number) || 10, 20);
-      const txns = await getLastNTransactions(userId, count);
+      const txns = await getLastNTransactions(userId, count, true);
       const categories = await getCategories();
       const catMap = new Map(categories.map(c => [c.id, c]));
 

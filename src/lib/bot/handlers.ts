@@ -12,6 +12,10 @@ export function createBot(): Bot {
 
   const bot = new Bot(token);
 
+  // Cache bot info to avoid repeated API calls
+  let botId: number | null = null;
+  let botUsername: string | null = null;
+
   // Handle all text messages (DM + group)
   bot.on('message:text', async (ctx) => {
     const telegramId = ctx.from?.id;
@@ -20,20 +24,33 @@ export function createBot(): Bot {
     const text = ctx.message.text.trim();
     if (!text) return;
 
-    // In groups, only respond if bot is mentioned or message starts with /
+    // Cache bot info on first call
+    if (!botId) {
+      try {
+        const me = await bot.api.getMe();
+        botId = me.id;
+        botUsername = me.username ?? '';
+      } catch {
+        botId = 0;
+        botUsername = '';
+      }
+    }
+
+    // In groups: respond to mentions, replies to bot, or commands
     const isGroup = ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
     if (isGroup) {
-      const botInfo = await bot.api.getMe();
-      const botUsername = botInfo.username ?? '';
-      const isMentioned = text.includes(`@${botUsername}`);
-      const isReply = ctx.message.reply_to_message?.from?.id === botInfo.id;
+      const isMentioned = botUsername ? text.toLowerCase().includes(`@${botUsername.toLowerCase()}`) : false;
+      const isReply = ctx.message.reply_to_message?.from?.id === botId;
       const isCommand = text.startsWith('/');
 
-      if (!isMentioned && !isReply && !isCommand) return;
+      // Also respond if the message contains a number (likely an expense)
+      const hasAmount = /\d{3,}/.test(text);
+
+      if (!isMentioned && !isReply && !isCommand && !hasAmount) return;
     }
 
     // Strip bot mention from text
-    const cleanText = text.replace(/@\w+/g, '').trim();
+    const cleanText = text.replace(/@\w+/g, '').replace(/^\/\w+\s*/, '').trim();
     if (!cleanText) return;
 
     try {
@@ -42,11 +59,11 @@ export function createBot(): Bot {
       const response = await chat(cleanText, telegramId, userName, ctx.chat.id);
 
       // Send reply — try Markdown first, fall back to plain text
-      const send = async (text: string) => {
+      const send = async (msg: string) => {
         try {
-          await ctx.reply(text, { parse_mode: 'Markdown' });
+          await ctx.reply(msg, { parse_mode: 'Markdown' });
         } catch {
-          await ctx.reply(text);
+          await ctx.reply(msg);
         }
       };
       if (response.length > 4000) {
