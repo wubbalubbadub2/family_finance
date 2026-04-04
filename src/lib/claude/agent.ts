@@ -268,20 +268,35 @@ export async function chat(
   const user = await getUserByTelegramId(telegramId);
   if (!user) return '⛔ Пользователь не найден в системе.';
 
-  // Load conversation history for multi-turn context
-  const history = await getRecentMessages(chatId, 10);
+  // Load conversation history (gracefully handle missing table)
+  let history: { role: string; content: string }[] = [];
+  try {
+    history = await getRecentMessages(chatId, 10);
+  } catch {
+    // Table may not exist yet — continue without history
+  }
+
   const messages: Anthropic.MessageParam[] = [];
 
-  // Add previous messages as context
+  // Add previous messages, ensuring proper alternation (user/assistant/user/...)
+  let lastRole = '';
   for (const msg of history) {
+    if (msg.role === lastRole) continue; // skip duplicates to maintain alternation
+    if (messages.length === 0 && msg.role === 'assistant') continue; // must start with user
     messages.push({ role: msg.role as 'user' | 'assistant', content: msg.content });
+    lastRole = msg.role;
+  }
+
+  // If last message in history is 'user', add a placeholder assistant to maintain alternation
+  if (lastRole === 'user') {
+    messages.push({ role: 'assistant', content: 'Понял, продолжаем.' });
   }
 
   // Add current message
   messages.push({ role: 'user', content: `[${userName}]: ${userMessage}` });
 
-  // Save user message to memory
-  await saveMessage(chatId, 'user', `[${userName}]: ${userMessage}`);
+  // Save user message to memory (ignore errors)
+  try { await saveMessage(chatId, 'user', `[${userName}]: ${userMessage}`); } catch { /* */ }
 
   // Loop: Claude may call multiple tools before giving final answer
   for (let i = 0; i < 5; i++) {
@@ -299,7 +314,7 @@ export async function chat(
     // If no tool calls, return and save the text response
     if (toolUses.length === 0) {
       const reply = textBlocks.map(b => b.type === 'text' ? b.text : '').join('\n').trim() || '🤔';
-      await saveMessage(chatId, 'assistant', reply);
+      try { await saveMessage(chatId, 'assistant', reply); } catch { /* */ }
       return reply;
     }
 
@@ -326,7 +341,7 @@ export async function chat(
     if (response.stop_reason === 'end_turn') {
       const text = textBlocks.map(b => b.type === 'text' ? b.text : '').join('\n').trim();
       if (text) {
-        await saveMessage(chatId, 'assistant', text);
+        try { await saveMessage(chatId, 'assistant', text); } catch { /* */ }
         return text;
       }
     }

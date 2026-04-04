@@ -41,14 +41,19 @@ export function createBot(): Bot {
       const userName = ctx.from.first_name || 'User';
       const response = await chat(cleanText, telegramId, userName, ctx.chat.id);
 
-      // Split long messages (Telegram limit is 4096)
+      // Send reply — try Markdown first, fall back to plain text
+      const send = async (text: string) => {
+        try {
+          await ctx.reply(text, { parse_mode: 'Markdown' });
+        } catch {
+          await ctx.reply(text);
+        }
+      };
       if (response.length > 4000) {
         const parts = response.match(/[\s\S]{1,4000}/g) ?? [response];
-        for (const part of parts) {
-          await ctx.reply(part, { parse_mode: 'Markdown' });
-        }
+        for (const part of parts) await send(part);
       } else {
-        await ctx.reply(response, { parse_mode: 'Markdown' });
+        await send(response);
       }
     } catch (error) {
       console.error('Bot error:', error);
