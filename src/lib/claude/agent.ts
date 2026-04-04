@@ -301,7 +301,7 @@ export async function chat(
   // Loop: Claude may call multiple tools before giving final answer
   for (let i = 0; i < 5; i++) {
     const response = await client.messages.create({
-      model: 'claude-haiku-4-5-20250507',
+      model: 'claude-haiku-4-5-20251001',
       max_tokens: 1024,
       system: buildSystemPrompt(),
       tools: TOOLS,

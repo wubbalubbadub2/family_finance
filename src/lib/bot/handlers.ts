@@ -56,8 +56,9 @@ export function createBot(): Bot {
         await send(response);
       }
     } catch (error) {
-      console.error('Bot error:', error);
-      await ctx.reply('😔 Произошла ошибка. Попробуйте ещё раз.');
+      const errMsg = error instanceof Error ? error.message : String(error);
+      console.error('Bot error:', errMsg, error);
+      await ctx.reply(`😔 Ошибка: ${errMsg.slice(0, 200)}`);
     }
   });
 
