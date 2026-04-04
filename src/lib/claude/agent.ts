@@ -13,7 +13,7 @@ import {
   getRecentMessages,
   saveMessage,
 } from '@/lib/db/queries';
-import { todayAlmaty, currentMonthAlmaty, monthNameRu } from '@/lib/utils';
+import { todayAlmaty, currentMonthAlmaty, monthNameRu, formatTenge } from '@/lib/utils';
 
 const client = new Anthropic();
 
@@ -106,7 +106,7 @@ function buildSystemPrompt(): string {
 
 Правила:
 1. Когда пользователь пишет расход (напр. "такси 2500", "кофе 1800") — ВСЕГДА используй tool record_expense, а потом СРАЗУ вызови get_month_summary чтобы показать итог месяца. Оба tool вызывай в одном ходе.
-2. После записи расхода ОБЯЗАТЕЛЬНО покажи: ✅ категория + сумма, потом краткий итог месяца (потрачено / план / остаток по категориям где есть расходы).
+2. Результаты tools уже отформатированы — передавай их пользователю КАК ЕСТЬ, не пересчитывай суммы и не переформатируй числа.
 3. Когда спрашивают про бюджет, расходы, план — используй get_month_summary
 4. Когда просят показать транзакции — используй get_recent_transactions
 5. Когда просят удалить/отменить — используй undo_last
@@ -149,17 +149,20 @@ async function executeTool(
       const summary = await getMonthSummary(year, month);
       const catSummary = summary.categories.find((c: { category: { id: number } }) => c.category.id === category.id);
 
-      return JSON.stringify({
-        success: true,
-        category_name: category.name,
-        category_emoji: category.emoji,
-        amount,
-        comment,
-        plan: catSummary?.planned ?? 0,
-        spent: catSummary?.actual ?? 0,
-        remaining: catSummary?.remaining ?? 0,
-        percentage: catSummary?.percentage ?? 0,
-      });
+      // Build pre-formatted response so Claude doesn't recalculate
+      let response = `✅ ${category.emoji} ${category.name} — ${formatTenge(amount)}`;
+      if (comment) response += ` (${comment})`;
+
+      if (catSummary && catSummary.planned > 0) {
+        response += `\nПо статье: ${formatTenge(catSummary.actual)} из ${formatTenge(catSummary.planned)} (${catSummary.percentage}%)`;
+        if (catSummary.remaining > 0) {
+          response += ` — осталось ${formatTenge(catSummary.remaining)}`;
+        } else if (catSummary.remaining < 0) {
+          response += ` — перерасход ${formatTenge(Math.abs(catSummary.remaining))}`;
+        }
+      }
+
+      return response;
     }
 
     case 'get_month_summary': {
@@ -167,28 +170,44 @@ async function executeTool(
       const mo = input.month as number;
       const summary = await getMonthSummary(year, mo);
 
-      const cats = summary.categories
-        .filter((c: { actual: number; planned: number }) => c.actual > 0 || c.planned > 0)
-        .map((c: { category: { emoji: string; name: string }; actual: number; planned: number; percentage: number; remaining: number }) => ({
-          emoji: c.category.emoji,
-          name: c.category.name,
-          actual: c.actual,
-          planned: c.planned,
-          percentage: c.percentage,
-          remaining: c.remaining,
-        }));
+      // Build pre-formatted summary so Claude just passes it through
+      const activeCats = summary.categories.filter(
+        (c: { actual: number; planned: number }) => c.actual > 0 || c.planned > 0
+      );
 
-      return JSON.stringify({
-        month: monthNameRu(mo),
-        year,
-        total_actual: summary.total_actual,
-        total_planned: summary.total_planned,
-        total_remaining: summary.total_remaining,
-        total_income: summary.total_income,
-        days_elapsed: summary.days_elapsed,
-        days_in_month: summary.days_in_month,
-        categories: cats,
-      });
+      let text = `📊 ${monthNameRu(mo)} ${year} (день ${summary.days_elapsed}/${summary.days_in_month})\n\n`;
+
+      if (summary.total_income > 0) {
+        text += `📥 Доход: ${formatTenge(summary.total_income)}\n`;
+      }
+      text += `📤 Расходы: ${formatTenge(summary.total_actual)}`;
+      if (summary.total_planned > 0) {
+        text += ` из ${formatTenge(summary.total_planned)}`;
+      }
+      text += '\n';
+
+      if (summary.total_planned > 0 && summary.total_remaining > 0) {
+        text += `✅ Остаток: ${formatTenge(summary.total_remaining)}\n`;
+      } else if (summary.total_planned > 0 && summary.total_remaining < 0) {
+        text += `🔴 Перерасход: ${formatTenge(Math.abs(summary.total_remaining))}\n`;
+      }
+
+      if (summary.total_income > 0) {
+        const balance = summary.total_income - summary.total_actual;
+        text += `💰 Баланс: ${balance >= 0 ? '+' : ''}${formatTenge(balance)}\n`;
+      }
+
+      text += '\n';
+      for (const c of activeCats) {
+        const cat = c as { category: { emoji: string; name: string }; actual: number; planned: number; percentage: number; remaining: number };
+        text += `${cat.category.emoji} ${cat.category.name}: ${formatTenge(cat.actual)}`;
+        if (cat.planned > 0) {
+          text += ` / ${formatTenge(cat.planned)} (${cat.percentage}%)`;
+        }
+        text += '\n';
+      }
+
+      return text.trim();
     }
 
     case 'get_recent_transactions': {
