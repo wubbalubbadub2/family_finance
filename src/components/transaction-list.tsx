@@ -61,6 +61,8 @@ export default function TransactionList({ items: initialItems }: { items: Transa
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       alert(`Ошибка удаления: ${msg}`);
+    } finally {
+      // Always reset — was stuck on success, blocking subsequent deletes
       setDeletingId(null);
     }
   };

@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { revalidatePath } from 'next/cache';
 import {
   getMonthTransactions,
   softDeleteTransaction,
@@ -29,6 +30,11 @@ export async function DELETE(req: NextRequest) {
 
     await softDeleteTransaction(id);
     console.log(`[DELETE] transaction ${id} soft-deleted`);
+
+    // Invalidate server-rendered pages that show transactions
+    revalidatePath('/');
+    revalidatePath('/transactions');
+
     return NextResponse.json({ ok: true });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
