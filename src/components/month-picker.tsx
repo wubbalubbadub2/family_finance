@@ -24,30 +24,36 @@ export default function MonthPicker() {
     let newYear = year;
     if (newMonth < 1) { newMonth = 12; newYear--; }
     if (newMonth > 12) { newMonth = 1; newYear++; }
-    // Don't go past max (2 months ahead for planning)
     if (newYear > maxYear || (newYear === maxYear && newMonth > maxMonth)) return;
     router.push(`${pathname}?year=${newYear}&month=${newMonth}`);
   }
 
   return (
-    <div className="flex items-center justify-center gap-4 py-3">
+    <div className="flex items-center justify-center gap-3 py-4 px-5">
       <button
         onClick={() => navigate(-1)}
-        className="w-8 h-8 flex items-center justify-center rounded-full text-gray-400 hover:bg-gray-100 hover:text-gray-600 transition-colors"
+        className="w-8 h-8 flex items-center justify-center rounded-full transition-all hover:scale-105 active:scale-95"
+        style={{ color: 'var(--text-tertiary)' }}
       >
-        <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M10 12L6 8l4-4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
+        <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
+          <path d="M11 14L6 9l5-5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+        </svg>
       </button>
-      <span className="text-sm font-semibold text-gray-700 min-w-[140px] text-center">
+      <span
+        className="text-[13px] font-semibold min-w-[140px] text-center tabular"
+        style={{ color: 'var(--text-primary)' }}
+      >
         {monthNameRu(month)} {year}
       </span>
       <button
         onClick={() => navigate(1)}
         disabled={isAtMax}
-        className={`w-8 h-8 flex items-center justify-center rounded-full transition-colors ${
-          isAtMax ? 'text-gray-200 cursor-not-allowed' : 'text-gray-400 hover:bg-gray-100 hover:text-gray-600'
-        }`}
+        className="w-8 h-8 flex items-center justify-center rounded-full transition-all hover:scale-105 active:scale-95 disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:scale-100"
+        style={{ color: 'var(--text-tertiary)' }}
       >
-        <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M6 4l4 4-4 4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
+        <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
+          <path d="M7 4l5 5-5 5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+        </svg>
       </button>
     </div>
   );

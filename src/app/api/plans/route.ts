@@ -1,5 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getMonthlyPlans, upsertMonthlyPlan, getCategories } from '@/lib/db/queries';
+import { getMonthlyPlans, upsertMonthlyPlan, getCategories, getUsers } from '@/lib/db/queries';
+
+export const dynamic = 'force-dynamic';
 
 export async function GET(req: NextRequest) {
   const { searchParams } = req.nextUrl;
@@ -29,11 +31,19 @@ export async function GET(req: NextRequest) {
 
 export async function POST(req: NextRequest) {
   const body = await req.json();
-  const { year, month, plans, user_id } = body;
+  const { year, month, plans } = body;
 
-  if (!year || !month || !plans || !user_id) {
-    return NextResponse.json({ error: 'year, month, plans, user_id required' }, { status: 400 });
+  if (!year || !month || !plans) {
+    return NextResponse.json({ error: 'year, month, plans required' }, { status: 400 });
   }
+
+  // The family plan is shared — created_by is just for audit trail.
+  // Use the first user from the DB as the owner.
+  const users = await getUsers();
+  if (users.length === 0) {
+    return NextResponse.json({ error: 'No users in system' }, { status: 500 });
+  }
+  const createdBy = users[0].id;
 
   for (const plan of plans) {
     if (plan.amount > 0) {
@@ -43,7 +53,7 @@ export async function POST(req: NextRequest) {
         category_id: plan.category_id,
         plan_type: 'expense',
         amount: plan.amount,
-        created_by: user_id,
+        created_by: createdBy,
       });
     }
   }

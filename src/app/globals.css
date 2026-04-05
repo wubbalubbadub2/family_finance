@@ -3,15 +3,47 @@
 @tailwind utilities;
 
 :root {
-  --background: #fafafa;
-  --foreground: #171717;
+  /* Background layers (light mode, Linear-inspired) */
+  --bg-base: #fafafa;        /* page background */
+  --bg-surface: #ffffff;     /* cards, elevated surfaces */
+  --bg-subtle: #f3f4f6;      /* hover, subtle surfaces */
+  --bg-muted: #f9fafb;       /* input backgrounds */
+
+  /* Text (Linear-inspired, cool grays) */
+  --text-primary: #0f1011;
+  --text-secondary: #3f4146;
+  --text-tertiary: #62666d;
+  --text-quaternary: #8a8f98;
+
+  /* Borders (semi-transparent, Linear style) */
+  --border-subtle: rgba(15, 16, 17, 0.06);
+  --border-standard: rgba(15, 16, 17, 0.1);
+
+  /* Accents (single color family — indigo, reserved for primary actions) */
+  --accent: #111827;
+  --accent-hover: #1f2937;
+
+  /* Status */
+  --success: #10b981;
+  --warning: #f59e0b;
+  --danger: #ef4444;
+
+  /* Shadows */
+  --shadow-xs: 0 1px 2px 0 rgba(15, 16, 17, 0.04);
+  --shadow-sm: 0 1px 3px 0 rgba(15, 16, 17, 0.06), 0 1px 2px -1px rgba(15, 16, 17, 0.04);
+}
+
+html {
+  font-feature-settings: "cv01", "cv11", "ss01", "ss03";
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
 body {
-  color: var(--foreground);
-  background: var(--background);
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
+  color: var(--text-primary);
+  background: var(--bg-base);
+  font-family: var(--font-inter), -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-feature-settings: "cv01", "cv11", "ss01", "ss03";
 }
 
 /* Smooth scrolling */
@@ -27,4 +59,18 @@ html {
 /* Safe area for bottom nav on iPhone */
 .safe-area-pb {
   padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+/* Linear-style subtle number formatting */
+.tabular {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
+}
+
+/* Negative letter-spacing at display sizes (Linear signature) */
+.tracking-display {
+  letter-spacing: -0.032em;
+}
+.tracking-tight-more {
+  letter-spacing: -0.022em;
 }
