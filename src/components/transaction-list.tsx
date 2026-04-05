@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useTransition } from 'react';
 import { useRouter } from 'next/navigation';
 import { formatTenge } from '@/lib/utils';
 
@@ -35,12 +35,14 @@ function formatDateLong(dateStr: string): string {
 
 export default function TransactionList({ items: initialItems }: { items: TransactionItem[] }) {
   const router = useRouter();
+  const [, startTransition] = useTransition();
   const [items, setItems] = useState(initialItems);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [deleting, setDeleting] = useState(false);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
 
   const handleDelete = async (id: string) => {
-    setDeleting(true);
+    if (deletingId) return;
+    setDeletingId(id);
+    // Optimistic removal after short delay (feels responsive)
     try {
       await fetch('/api/transactions', {
         method: 'DELETE',
@@ -48,12 +50,11 @@ export default function TransactionList({ items: initialItems }: { items: Transa
         body: JSON.stringify({ id }),
       });
       setItems(prev => prev.filter(t => t.id !== id));
-      setSelectedId(null);
-      router.refresh();
+      startTransition(() => router.refresh());
     } catch (e) {
       console.error('Delete error:', e);
+      setDeletingId(null);
     }
-    setDeleting(false);
   };
 
   // Group by date
@@ -108,49 +109,40 @@ export default function TransactionList({ items: initialItems }: { items: Transa
               <div className="space-y-0.5">
                 {txns.map(tx => {
                   const isIncome = tx.type === 'income';
-                  const isSelected = selectedId === tx.id;
+                  const isDeleting = deletingId === tx.id;
                   return (
-                    <div key={tx.id}>
+                    <div
+                      key={tx.id}
+                      className={`group flex items-center gap-3 py-2.5 border-b border-gray-50 last:border-0 transition-all ${
+                        isDeleting ? 'opacity-40' : ''
+                      }`}
+                    >
+                      <span className="text-lg w-7 text-center flex-shrink-0">
+                        {isIncome ? '📥' : (tx.category_emoji ?? '❓')}
+                      </span>
+                      <div className="flex-1 min-w-0">
+                        <p className="text-sm font-medium text-gray-800 truncate">
+                          {isIncome ? 'Доход' : (tx.category_name ?? 'Без категории')}
+                          {tx.comment && <span className="text-gray-400 font-normal"> — {tx.comment}</span>}
+                        </p>
+                        <div className="flex items-center gap-2 mt-0.5">
+                          {tx.user_name && <span className="text-[10px] text-gray-300">{tx.user_name}</span>}
+                          <span className="text-[10px] text-gray-300">{SOURCE_LABELS[tx.source] ?? tx.source}</span>
+                        </div>
+                      </div>
+                      <span className={`text-sm font-semibold tabular-nums ${isIncome ? 'text-emerald-600' : 'text-gray-900'}`}>
+                        {isIncome ? '+' : ''}{formatTenge(tx.amount)}
+                      </span>
                       <button
-                        onClick={() => setSelectedId(isSelected ? null : tx.id)}
-                        className="w-full flex items-center gap-3 py-2.5 border-b border-gray-50 last:border-0 text-left hover:bg-gray-50 transition-colors -mx-2 px-2 rounded-lg"
+                        onClick={() => handleDelete(tx.id)}
+                        disabled={isDeleting}
+                        aria-label="Удалить"
+                        className="flex-shrink-0 w-7 h-7 flex items-center justify-center rounded-full text-gray-300 hover:bg-red-50 hover:text-red-500 transition-colors"
                       >
-                        <span className="text-lg w-7 text-center flex-shrink-0">
-                          {isIncome ? '📥' : (tx.category_emoji ?? '❓')}
-                        </span>
-                        <div className="flex-1 min-w-0">
-                          <p className="text-sm font-medium text-gray-800 truncate">
-                            {isIncome ? 'Доход' : (tx.category_name ?? 'Без категории')}
-                            {tx.comment && <span className="text-gray-400 font-normal"> — {tx.comment}</span>}
-                          </p>
-                          <div className="flex items-center gap-2 mt-0.5">
-                            {tx.user_name && <span className="text-[10px] text-gray-300">{tx.user_name}</span>}
-                            <span className="text-[10px] text-gray-300">{SOURCE_LABELS[tx.source] ?? tx.source}</span>
-                          </div>
-                        </div>
-                        <span className={`text-sm font-semibold tabular-nums ${isIncome ? 'text-emerald-600' : 'text-gray-900'}`}>
-                          {isIncome ? '+' : ''}{formatTenge(tx.amount)}
-                        </span>
+                        <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+                          <path d="M2 4h10M5 4V2.5A.5.5 0 0 1 5.5 2h3a.5.5 0 0 1 .5.5V4m1.5 0v7.5a.5.5 0 0 1-.5.5h-5a.5.5 0 0 1-.5-.5V4h6zM6 6.5v4M8 6.5v4" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round"/>
+                        </svg>
                       </button>
-
-                      {/* Action panel for selected transaction */}
-                      {isSelected && (
-                        <div className="flex gap-2 py-2 animate-in fade-in slide-in-from-top-1 duration-150">
-                          <button
-                            onClick={() => handleDelete(tx.id)}
-                            disabled={deleting}
-                            className="flex-1 py-2 px-3 rounded-lg bg-red-50 text-red-600 text-xs font-medium hover:bg-red-100 transition-colors disabled:opacity-50"
-                          >
-                            {deleting ? 'Удаляю...' : '🗑 Удалить'}
-                          </button>
-                          <button
-                            onClick={() => setSelectedId(null)}
-                            className="flex-1 py-2 px-3 rounded-lg bg-gray-100 text-gray-500 text-xs font-medium hover:bg-gray-200 transition-colors"
-                          >
-                            Отмена
-                          </button>
-                        </div>
-                      )}
                     </div>
                   );
                 })}
