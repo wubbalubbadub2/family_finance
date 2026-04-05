@@ -1,5 +1,5 @@
 import { supabase } from './supabase';
-import { currentMonthAlmaty, todayAlmaty } from '@/lib/utils';
+import { currentMonthAlmaty, todayAlmaty, lastDayOfMonth, daysInMonth as daysInMonthUtil } from '@/lib/utils';
 import type {
   Transaction,
   User,
@@ -93,17 +93,24 @@ export async function getLastTransaction(userId: string): Promise<Transaction | 
   return data;
 }
 
-export async function getLastNTransactions(userId: string, n: number, familyWide = false): Promise<Transaction[]> {
-  let query = supabase
+export async function getLastNTransactionsByUser(userId: string, n: number): Promise<Transaction[]> {
+  const { data } = await supabase
+    .from('transactions')
+    .select('*')
+    .eq('user_id', userId)
+    .is('deleted_at', null)
+    .order('created_at', { ascending: false })
+    .limit(n);
+  return data ?? [];
+}
+
+export async function getLastNTransactionsFamily(n: number): Promise<Transaction[]> {
+  const { data } = await supabase
     .from('transactions')
     .select('*')
     .is('deleted_at', null)
     .order('created_at', { ascending: false })
     .limit(n);
-
-  if (!familyWide) query = query.eq('user_id', userId);
-
-  const { data } = await query;
   return data ?? [];
 }
 
@@ -131,7 +138,7 @@ export async function getMonthTransactions(
   month: number
 ): Promise<Transaction[]> {
   const startDate = `${year}-${String(month).padStart(2, '0')}-01`;
-  const endDate = new Date(year, month, 0).toISOString().split('T')[0]; // last day of month
+  const endDate = lastDayOfMonth(year, month);
   return getTransactionsByDateRange(startDate, endDate);
 }
 
@@ -286,7 +293,7 @@ export async function getMonthSummary(year: number, month: number) {
   // Fix: use Almaty timezone for days elapsed (Vercel runs in UTC)
   const { year: almatyYear, month: almatyMonth } = currentMonthAlmaty();
   const almatyDay = parseInt(todayAlmaty().split('-')[2], 10);
-  const daysInMonth = new Date(year, month, 0).getDate();
+  const daysInMonth = daysInMonthUtil(year, month);
   const daysElapsed = year === almatyYear && month === almatyMonth
     ? almatyDay
     : daysInMonth;

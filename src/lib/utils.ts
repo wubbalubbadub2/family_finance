@@ -1,4 +1,20 @@
 /**
+ * Get the last day of a given year/month as YYYY-MM-DD string.
+ * Uses UTC arithmetic so server timezone doesn't matter.
+ */
+export function lastDayOfMonth(year: number, month: number): string {
+  const day = new Date(Date.UTC(year, month, 0)).getUTCDate();
+  return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+}
+
+/**
+ * Number of days in a given year/month (calendar only, timezone-independent).
+ */
+export function daysInMonth(year: number, month: number): number {
+  return new Date(Date.UTC(year, month, 0)).getUTCDate();
+}
+
+/**
  * Format amount in Kazakh convention: "15 000 ₸"
  */
 export function formatTenge(amount: number): string {

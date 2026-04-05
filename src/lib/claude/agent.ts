@@ -7,7 +7,7 @@ import {
   insertTransaction,
   softDeleteTransaction,
   getLastTransaction,
-  getLastNTransactions,
+  getLastNTransactionsFamily,
   getMonthSummary,
   upsertMonthlyPlan,
   getRecentMessages,
@@ -16,6 +16,7 @@ import {
 import { todayAlmaty, currentMonthAlmaty, monthNameRu, formatTenge } from '@/lib/utils';
 
 const client = new Anthropic();
+const MODEL = process.env.CLAUDE_MODEL || 'claude-haiku-4-5-20251001';
 
 const VALID_SLUGS: CategorySlug[] = [
   'home', 'food', 'transport', 'cafe', 'baby',
@@ -82,6 +83,18 @@ const TOOLS: Anthropic.Tool[] = [
       required: ['category_slug', 'amount', 'year', 'month'],
     },
   },
+  {
+    name: 'record_income',
+    description: 'Record income (salary, bonus, refund, gift received, debt returned). Use when user mentions receiving money.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        amount: { type: 'number', description: 'Income amount in tenge' },
+        comment: { type: 'string', description: 'Source of income (зарплата, бонус, etc.)' },
+      },
+      required: ['amount'],
+    },
+  },
 ];
 
 function buildSystemPrompt(): string {
@@ -111,8 +124,9 @@ function buildSystemPrompt(): string {
 4. Когда просят показать транзакции — используй get_recent_transactions
 5. Когда просят удалить/отменить — используй undo_last
 6. Когда просят установить план/бюджет — используй set_plan
-7. Отвечай кратко, используй emoji. Суммы всегда в тенге.
-8. Если непонятно что хочет пользователь — переспроси, не гадай.
+7. Когда пользователь пишет про доход (напр. "зарплата 500000", "вернули долг 10000", "премия 50000") — используй record_income
+8. Отвечай кратко, используй emoji. Суммы всегда в тенге.
+9. Если непонятно что хочет пользователь — переспроси, не гадай.
 8. Ты можешь вызвать несколько tools за один ход если нужно (напр. записать расход и показать итог).`;
 }
 
@@ -131,6 +145,13 @@ async function executeTool(
       const slug = input.category_slug as CategorySlug;
       const amount = Math.round(input.amount as number);
       const comment = (input.comment as string) || undefined;
+
+      if (!Number.isFinite(amount) || amount <= 0) {
+        return JSON.stringify({
+          error: 'invalid_amount',
+          message: 'Сумма должна быть положительным числом. Попроси пользователя уточнить.',
+        });
+      }
 
       const category = await getCategoryBySlug(slug);
       if (!category) return JSON.stringify({ error: 'Category not found' });
@@ -212,7 +233,7 @@ async function executeTool(
 
     case 'get_recent_transactions': {
       const count = Math.min((input.count as number) || 10, 20);
-      const txns = await getLastNTransactions(userId, count, true);
+      const txns = await getLastNTransactionsFamily(count);
       const categories = await getCategories();
       const catMap = new Map(categories.map(c => [c.id, c]));
 
@@ -252,6 +273,10 @@ async function executeTool(
       const year = input.year as number;
       const mo = input.month as number;
 
+      if (!Number.isFinite(amount) || amount < 0) {
+        return JSON.stringify({ error: 'invalid_amount', message: 'Бюджет не может быть отрицательным.' });
+      }
+
       const category = await getCategoryBySlug(slug);
       if (!category) return JSON.stringify({ error: 'Category not found' });
 
@@ -274,6 +299,39 @@ async function executeTool(
       });
     }
 
+    case 'record_income': {
+      const amount = Math.round(input.amount as number);
+      const comment = (input.comment as string) || undefined;
+
+      if (!Number.isFinite(amount) || amount <= 0) {
+        return JSON.stringify({
+          error: 'invalid_amount',
+          message: 'Сумма дохода должна быть положительной.',
+        });
+      }
+
+      await insertTransaction({
+        user_id: userId,
+        category_id: null,
+        type: 'income',
+        amount,
+        comment,
+        source: 'telegram',
+        transaction_date: todayAlmaty(),
+      });
+
+      const { year, month } = currentMonthAlmaty();
+      const summary = await getMonthSummary(year, month);
+      const balance = summary.total_income - summary.total_actual;
+
+      let response = `💰 Доход записан: ${formatTenge(amount)}`;
+      if (comment) response += ` (${comment})`;
+      response += `\n\n📥 Доход за ${monthNameRu(month)}: ${formatTenge(summary.total_income)}`;
+      response += `\n📤 Расходы: ${formatTenge(summary.total_actual)}`;
+      response += `\n💼 Баланс: ${balance >= 0 ? '+' : ''}${formatTenge(balance)}`;
+      return response;
+    }
+
     default:
       return JSON.stringify({ error: 'Unknown tool' });
   }
@@ -288,7 +346,7 @@ export async function chat(
   const user = await getUserByTelegramId(telegramId);
   if (!user) return '⛔ Пользователь не найден в системе.';
 
-  // Load conversation history (gracefully handle missing table)
+  // Load conversation history (clean text pairs only)
   let history: { role: string; content: string }[] = [];
   try {
     history = await getRecentMessages(chatId, 10);
@@ -296,32 +354,31 @@ export async function chat(
     // Table may not exist yet — continue without history
   }
 
+  // Build messages array from history, dropping any dangling trailing user message
+  // (happens if previous turn errored before the assistant reply was saved)
   const messages: Anthropic.MessageParam[] = [];
-
-  // Add previous messages, ensuring proper alternation (user/assistant/user/...)
-  let lastRole = '';
   for (const msg of history) {
-    if (msg.role === lastRole) continue; // skip duplicates to maintain alternation
-    if (messages.length === 0 && msg.role === 'assistant') continue; // must start with user
+    // Skip if messages would start with assistant
+    if (messages.length === 0 && msg.role === 'assistant') continue;
+    // Skip duplicates to maintain alternation
+    if (messages.length > 0 && messages[messages.length - 1].role === msg.role) continue;
     messages.push({ role: msg.role as 'user' | 'assistant', content: msg.content });
-    lastRole = msg.role;
+  }
+  // Drop dangling trailing user message (no assistant reply saved for it)
+  if (messages.length > 0 && messages[messages.length - 1].role === 'user') {
+    messages.pop();
   }
 
-  // If last message in history is 'user', add a placeholder assistant to maintain alternation
-  if (lastRole === 'user') {
-    messages.push({ role: 'assistant', content: 'Понял, продолжаем.' });
-  }
-
-  // Add current message
+  // Add current user message
   messages.push({ role: 'user', content: `[${userName}]: ${userMessage}` });
-
-  // Save user message to memory (ignore errors)
   try { await saveMessage(chatId, 'user', `[${userName}]: ${userMessage}`); } catch { /* */ }
 
-  // Loop: Claude may call multiple tools before giving final answer
+  // Tool-use loop: track final reply across iterations, save ONCE at the end
+  let finalReply = '';
+
   for (let i = 0; i < 5; i++) {
     const response = await client.messages.create({
-      model: 'claude-haiku-4-5-20251001',
+      model: MODEL,
       max_tokens: 1024,
       system: buildSystemPrompt(),
       tools: TOOLS,
@@ -330,15 +387,14 @@ export async function chat(
 
     const toolUses = response.content.filter(b => b.type === 'tool_use');
     const textBlocks = response.content.filter(b => b.type === 'text');
+    const turnText = textBlocks.map(b => b.type === 'text' ? b.text : '').join('\n').trim();
+    if (turnText) finalReply = turnText;
 
-    // If no tool calls, return and save the text response
-    if (toolUses.length === 0) {
-      const reply = textBlocks.map(b => b.type === 'text' ? b.text : '').join('\n').trim() || '🤔';
-      try { await saveMessage(chatId, 'assistant', reply); } catch { /* */ }
-      return reply;
-    }
+    // No tool calls — Claude is done
+    if (toolUses.length === 0) break;
 
-    // Execute all tool calls
+    // Push assistant turn + tool results for next iteration (in-memory only)
+    messages.push({ role: 'assistant', content: response.content });
     const toolResults: ToolResult[] = [];
     for (const block of toolUses) {
       if (block.type === 'tool_use') {
@@ -346,9 +402,6 @@ export async function chat(
         toolResults.push({ tool_use_id: block.id, content: result });
       }
     }
-
-    // Add assistant response + tool results to conversation
-    messages.push({ role: 'assistant', content: response.content });
     messages.push({
       role: 'user',
       content: toolResults.map(r => ({
@@ -358,14 +411,12 @@ export async function chat(
       })),
     });
 
-    if (response.stop_reason === 'end_turn') {
-      const text = textBlocks.map(b => b.type === 'text' ? b.text : '').join('\n').trim();
-      if (text) {
-        try { await saveMessage(chatId, 'assistant', text); } catch { /* */ }
-        return text;
-      }
-    }
+    if (response.stop_reason === 'end_turn') break;
   }
 
-  return '⏳ Слишком сложный запрос, попробуйте проще.';
+  if (!finalReply) finalReply = '🤔';
+
+  // Save ONLY the final text reply (no tool_use blocks ever persisted)
+  try { await saveMessage(chatId, 'assistant', finalReply); } catch { /* */ }
+  return finalReply;
 }

@@ -1,10 +1,24 @@
-import { createClient } from '@supabase/supabase-js';
+import { createClient, SupabaseClient } from '@supabase/supabase-js';
 
-if (!process.env.SUPABASE_URL) throw new Error('Missing SUPABASE_URL');
-if (!process.env.SUPABASE_SERVICE_KEY) throw new Error('Missing SUPABASE_SERVICE_KEY');
+let client: SupabaseClient | null = null;
 
-// Service role client — used by bot and API routes (bypasses RLS)
-export const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_KEY
-);
+function getClient(): SupabaseClient {
+  if (client) return client;
+
+  const url = process.env.SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_KEY;
+  if (!url) throw new Error('Missing SUPABASE_URL');
+  if (!key) throw new Error('Missing SUPABASE_SERVICE_KEY');
+
+  client = createClient(url, key);
+  return client;
+}
+
+// Lazy proxy: methods are resolved on first call, not on import
+export const supabase = new Proxy({} as SupabaseClient, {
+  get(_target, prop: string | symbol) {
+    const c = getClient() as unknown as Record<string | symbol, unknown>;
+    const value = c[prop];
+    return typeof value === 'function' ? value.bind(c) : value;
+  },
+});

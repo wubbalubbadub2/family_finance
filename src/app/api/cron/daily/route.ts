@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getActiveRecurring, insertTransaction, getMonthTransactions, getMonthSummary } from '@/lib/db/queries';
-import { todayAlmaty, currentMonthAlmaty, formatTenge } from '@/lib/utils';
+import { todayAlmaty, currentMonthAlmaty, formatTenge, daysInMonth } from '@/lib/utils';
 import { sendTelegramMessage } from '@/lib/bot/send-message';
 
 function verifyCron(req: NextRequest): boolean {
@@ -20,11 +20,19 @@ export async function GET(req: NextRequest) {
 
   // 1. Process recurring transactions
   const recurring = await getActiveRecurring();
-  const todayRecurring = recurring.filter(r => r.day_of_month === dayOfMonth);
+  const monthDays = daysInMonth(year, month);
+  // Fire recurring if (a) day matches exactly, or
+  // (b) day_of_month > days_in_month AND today is the last day (handles day=31 in Feb/Apr/etc.)
+  const todayRecurring = recurring.filter(r =>
+    r.day_of_month === dayOfMonth ||
+    (r.day_of_month > monthDays && dayOfMonth === monthDays)
+  );
+
+  // Fetch month transactions ONCE before the loop (was O(n) before)
+  const monthTxns = todayRecurring.length > 0 ? await getMonthTransactions(year, month) : [];
 
   const created: string[] = [];
   for (const rt of todayRecurring) {
-    const monthTxns = await getMonthTransactions(year, month);
     const alreadyExists = monthTxns.some(
       t => t.source === 'recurring' &&
         t.category_id === rt.category_id &&

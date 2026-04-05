@@ -12,56 +12,19 @@ export function createBot(): Bot {
 
   const bot = new Bot(token);
 
-  // Cache bot info to avoid repeated API calls
-  let botId: number | null = null;
-  let botUsername: string | null = null;
-
   // Handle all text messages (DM + group)
   bot.on('message:text', async (ctx) => {
     const telegramId = ctx.from?.id;
-    const chatType = ctx.chat.type;
-    const chatId = ctx.chat.id;
+    if (!telegramId || !ALLOWED_IDS.includes(telegramId)) return;
+
     const text = ctx.message.text.trim();
-
-    console.log(`[BOT] msg from ${telegramId} in ${chatType} ${chatId}: "${text.slice(0, 50)}"`);
-
-    if (!telegramId || !ALLOWED_IDS.includes(telegramId)) {
-      console.log(`[BOT] rejected: user ${telegramId} not in whitelist ${ALLOWED_IDS.join(',')}`);
-      return;
-    }
-
     if (!text) return;
 
-    // Cache bot info on first call
-    if (!botId) {
-      try {
-        const me = await bot.api.getMe();
-        botId = me.id;
-        botUsername = me.username ?? '';
-      } catch {
-        botId = 0;
-        botUsername = '';
-      }
-    }
-
-    // In groups: respond to mentions, replies to bot, commands, or messages with numbers
-    const isGroup = chatType === 'group' || chatType === 'supergroup';
-    if (isGroup) {
-      const isMentioned = botUsername ? text.toLowerCase().includes(`@${botUsername.toLowerCase()}`) : false;
-      const isReply = ctx.message.reply_to_message?.from?.id === botId;
-      const isCommand = text.startsWith('/');
-      const hasAmount = /\d{2,}/.test(text);
-
-      console.log(`[BOT] group filter: mentioned=${isMentioned}, reply=${isReply}, cmd=${isCommand}, amount=${hasAmount}`);
-
-      if (!isMentioned && !isReply && !isCommand && !hasAmount) {
-        console.log(`[BOT] group message ignored (no trigger)`);
-        return;
-      }
-    }
-
-    // Strip bot mention from text
-    const cleanText = text.replace(/@\w+/g, '').replace(/^\/\w+\s*/, '').trim();
+    // Strip bot @mentions and /command prefix for clean input to Claude
+    const cleanText = text
+      .replace(/@\w+/g, '')
+      .replace(/^\/\w+\s*/, '')
+      .trim();
     if (!cleanText) return;
 
     try {
@@ -69,7 +32,6 @@ export function createBot(): Bot {
       const userName = ctx.from.first_name || 'User';
       const response = await chat(cleanText, telegramId, userName, ctx.chat.id);
 
-      // Send reply — try Markdown first, fall back to plain text
       const send = async (msg: string) => {
         try {
           await ctx.reply(msg, { parse_mode: 'Markdown' });
@@ -85,7 +47,7 @@ export function createBot(): Bot {
       }
     } catch (error) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      console.error('Bot error:', errMsg, error);
+      console.error('Bot error:', errMsg);
       await ctx.reply(`😔 Ошибка: ${errMsg.slice(0, 200)}`);
     }
   });

@@ -12,15 +12,20 @@ export default function MonthPicker() {
   const year = parseInt(searchParams.get('year') ?? '') || nowYear;
   const month = parseInt(searchParams.get('month') ?? '') || nowMonth;
 
-  const isCurrent = year === nowYear && month === nowMonth;
+  // Max month = current month + 2 (planning ahead)
+  const maxTotalMonths = nowYear * 12 + (nowMonth - 1) + 2;
+  const maxYear = Math.floor(maxTotalMonths / 12);
+  const maxMonth = (maxTotalMonths % 12) + 1;
+
+  const isAtMax = year === maxYear && month === maxMonth;
 
   function navigate(dir: -1 | 1) {
     let newMonth = month + dir;
     let newYear = year;
     if (newMonth < 1) { newMonth = 12; newYear--; }
     if (newMonth > 12) { newMonth = 1; newYear++; }
-    // Don't go to future months
-    if (newYear > nowYear || (newYear === nowYear && newMonth > nowMonth)) return;
+    // Don't go past max (2 months ahead for planning)
+    if (newYear > maxYear || (newYear === maxYear && newMonth > maxMonth)) return;
     router.push(`${pathname}?year=${newYear}&month=${newMonth}`);
   }
 
@@ -37,9 +42,9 @@ export default function MonthPicker() {
       </span>
       <button
         onClick={() => navigate(1)}
-        disabled={isCurrent}
+        disabled={isAtMax}
         className={`w-8 h-8 flex items-center justify-center rounded-full transition-colors ${
-          isCurrent ? 'text-gray-200 cursor-not-allowed' : 'text-gray-400 hover:bg-gray-100 hover:text-gray-600'
+          isAtMax ? 'text-gray-200 cursor-not-allowed' : 'text-gray-400 hover:bg-gray-100 hover:text-gray-600'
         }`}
       >
         <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M6 4l4 4-4 4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
