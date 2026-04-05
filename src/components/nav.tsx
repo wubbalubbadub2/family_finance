@@ -37,8 +37,8 @@ export default function Nav() {
     <nav
       className="fixed bottom-0 left-0 right-0 z-50 safe-area-pb backdrop-blur-xl"
       style={{
-        backgroundColor: 'rgba(250, 250, 250, 0.85)',
-        borderTop: '1px solid var(--border-subtle)',
+        backgroundColor: 'rgba(255, 255, 255, 0.85)',
+        borderTop: '1px solid var(--ink-6)',
       }}
     >
       <div className="max-w-lg mx-auto flex">
@@ -48,10 +48,8 @@ export default function Nav() {
             <Link
               key={tab.href}
               href={`${tab.href}${suffix}`}
-              className="flex-1 flex flex-col items-center py-2.5 pb-3 transition-colors"
-              style={{
-                color: isActive ? 'var(--text-primary)' : 'var(--text-quaternary)',
-              }}
+              className="flex-1 flex flex-col items-center py-3 transition-colors"
+              style={{ color: isActive ? 'var(--ink-1)' : 'var(--ink-4)' }}
             >
               <svg
                 className="w-[20px] h-[20px]"
@@ -62,7 +60,7 @@ export default function Nav() {
               >
                 {tab.icon}
               </svg>
-              <span className="text-[10px] mt-0.5 font-medium tracking-tight">{tab.label}</span>
+              <span className="text-[10px] mt-1 font-medium tracking-tight">{tab.label}</span>
             </Link>
           );
         })}

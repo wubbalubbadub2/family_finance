@@ -77,9 +77,9 @@ export default function TransactionList({ items: initialItems }: { items: Transa
 
   if (items.length === 0) {
     return (
-      <div className="text-center py-20">
-        <p className="text-[32px] mb-3">📭</p>
-        <p className="text-[13px]" style={{ color: 'var(--text-tertiary)' }}>
+      <div className="text-center py-24 px-8">
+        <p className="text-[32px] mb-4">📭</p>
+        <p className="text-[14px]" style={{ color: 'var(--ink-3)' }}>
           Нет транзакций за этот месяц
         </p>
       </div>
@@ -88,85 +88,81 @@ export default function TransactionList({ items: initialItems }: { items: Transa
 
   return (
     <>
-      {/* Summary header */}
-      <div className="px-5 mb-4">
-        <div className="flex items-baseline gap-2">
-          <p className="text-[28px] font-semibold tabular tracking-tight-more" style={{ color: 'var(--text-primary)' }}>
-            {formatTenge(totalExpenses)}
-          </p>
-          {totalIncome > 0 && (
-            <p className="text-[14px] font-semibold tabular" style={{ color: 'var(--success)' }}>
-              +{formatTenge(totalIncome)}
-            </p>
-          )}
-        </div>
-        <p className="text-[11px] uppercase tracking-[0.08em] font-medium mt-0.5" style={{ color: 'var(--text-quaternary)' }}>
+      {/* Hero summary */}
+      <header className="px-6 pt-4 pb-10">
+        <p className="overline mb-3">
           {items.length} {items.length === 1 ? 'запись' : items.length < 5 ? 'записи' : 'записей'}
         </p>
-      </div>
+        <h1 className="display-lg text-[56px]" style={{ color: 'var(--ink-1)' }}>
+          {formatTenge(totalExpenses)}
+        </h1>
+        {totalIncome > 0 && (
+          <p className="text-[14px] font-semibold tabular mt-3" style={{ color: 'var(--green)' }}>
+            +{formatTenge(totalIncome)} доход
+          </p>
+        )}
+      </header>
 
       {/* Grouped list */}
-      <div className="px-5">
+      <div>
         {Array.from(grouped.entries()).map(([date, txns]) => {
           const dayTotal = txns.filter(t => t.type === 'expense').reduce((s, t) => s + t.amount, 0);
           return (
-            <div key={date} className="mb-5">
-              <div className="flex items-center justify-between mb-2 px-1">
-                <span className="text-[10px] font-semibold uppercase tracking-[0.08em]" style={{ color: 'var(--text-quaternary)' }}>
-                  {formatDateLong(date)}
-                </span>
+            <div key={date}>
+              <div
+                className="flex items-center justify-between px-6 py-3"
+                style={{
+                  backgroundColor: 'var(--bg-alt)',
+                  borderTop: '1px solid var(--ink-6)',
+                  borderBottom: '1px solid var(--ink-6)',
+                }}
+              >
+                <span className="overline">{formatDateLong(date)}</span>
                 {dayTotal > 0 && (
-                  <span className="text-[10px] font-semibold tabular" style={{ color: 'var(--text-quaternary)' }}>
+                  <span className="text-[11px] font-semibold tabular" style={{ color: 'var(--ink-3)' }}>
                     {formatTenge(dayTotal)}
                   </span>
                 )}
               </div>
-              <div
-                className="rounded-[10px] overflow-hidden"
-                style={{
-                  backgroundColor: 'var(--bg-surface)',
-                  border: '1px solid var(--border-subtle)',
-                }}
-              >
+              <div>
                 {txns.map((tx, idx) => {
                   const isIncome = tx.type === 'income';
                   const isDeleting = deletingId === tx.id;
-                  const isLast = idx === txns.length - 1;
                   return (
                     <div
                       key={tx.id}
-                      className={`group flex items-center gap-3 px-4 py-3 transition-all ${isDeleting ? 'opacity-40' : ''}`}
+                      className={`group flex items-center gap-4 px-6 py-4 transition-all ${isDeleting ? 'opacity-40' : ''}`}
                       style={{
-                        borderBottom: isLast ? 'none' : '1px solid var(--border-subtle)',
+                        borderBottom: idx === txns.length - 1 ? 'none' : '1px solid var(--ink-6)',
                       }}
                     >
-                      <span className="text-[18px] w-7 text-center flex-shrink-0 leading-none">
+                      <span className="text-[20px] leading-none flex-shrink-0 w-7 text-center">
                         {isIncome ? '📥' : (tx.category_emoji ?? '❓')}
                       </span>
                       <div className="flex-1 min-w-0">
-                        <p className="text-[13px] font-medium truncate" style={{ color: 'var(--text-primary)' }}>
+                        <p className="text-[14px] font-medium truncate" style={{ color: 'var(--ink-2)' }}>
                           {isIncome ? 'Доход' : (tx.category_name ?? 'Без категории')}
                           {tx.comment && (
-                            <span className="font-normal" style={{ color: 'var(--text-tertiary)' }}>
+                            <span className="font-normal" style={{ color: 'var(--ink-3)' }}>
                               {' '}— {tx.comment}
                             </span>
                           )}
                         </p>
                         <div className="flex items-center gap-1.5 mt-0.5">
                           {tx.user_name && (
-                            <span className="text-[10px]" style={{ color: 'var(--text-quaternary)' }}>
+                            <span className="text-[10px]" style={{ color: 'var(--ink-4)' }}>
                               {tx.user_name}
                             </span>
                           )}
-                          <span style={{ color: 'var(--text-quaternary)' }}>·</span>
-                          <span className="text-[10px]" style={{ color: 'var(--text-quaternary)' }}>
+                          <span style={{ color: 'var(--ink-5)' }}>·</span>
+                          <span className="text-[10px]" style={{ color: 'var(--ink-4)' }}>
                             {SOURCE_LABELS[tx.source] ?? tx.source}
                           </span>
                         </div>
                       </div>
                       <span
-                        className="text-[13px] font-semibold tabular"
-                        style={{ color: isIncome ? 'var(--success)' : 'var(--text-primary)' }}
+                        className="text-[14px] font-semibold tabular"
+                        style={{ color: isIncome ? 'var(--green)' : 'var(--ink-1)' }}
                       >
                         {isIncome ? '+' : ''}{formatTenge(tx.amount)}
                       </span>
@@ -175,7 +171,7 @@ export default function TransactionList({ items: initialItems }: { items: Transa
                         disabled={isDeleting}
                         aria-label="Удалить"
                         className="flex-shrink-0 w-7 h-7 flex items-center justify-center rounded-full transition-colors hover:bg-red-50"
-                        style={{ color: 'var(--text-quaternary)' }}
+                        style={{ color: 'var(--ink-4)' }}
                       >
                         <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
                           <path d="M2 4h10M5 4V2.5A.5.5 0 0 1 5.5 2h3a.5.5 0 0 1 .5.5V4m1.5 0v7.5a.5.5 0 0 1-.5.5h-5a.5.5 0 0 1-.5-.5V4h6zM6 6.5v4M8 6.5v4" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round"/>

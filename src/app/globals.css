@@ -3,74 +3,81 @@
 @tailwind utilities;
 
 :root {
-  /* Background layers (light mode, Linear-inspired) */
-  --bg-base: #fafafa;        /* page background */
-  --bg-surface: #ffffff;     /* cards, elevated surfaces */
-  --bg-subtle: #f3f4f6;      /* hover, subtle surfaces */
-  --bg-muted: #f9fafb;       /* input backgrounds */
+  /* Backgrounds */
+  --bg: #ffffff;
+  --bg-alt: #f8f8f7;
+  --bg-hover: #f2f2f1;
 
-  /* Text (Linear-inspired, cool grays) */
-  --text-primary: #0f1011;
-  --text-secondary: #3f4146;
-  --text-tertiary: #62666d;
-  --text-quaternary: #8a8f98;
+  /* Ink (warmer blacks, editorial feel) */
+  --ink-1: #0a0a0a;       /* primary text, display numbers */
+  --ink-2: #2a2a2a;       /* body text */
+  --ink-3: #6b6b6b;       /* secondary text */
+  --ink-4: #a8a8a8;       /* tertiary, labels */
+  --ink-5: #d4d4d4;       /* dividers, borders */
+  --ink-6: #ededed;       /* subtle dividers */
 
-  /* Borders (semi-transparent, Linear style) */
-  --border-subtle: rgba(15, 16, 17, 0.06);
-  --border-standard: rgba(15, 16, 17, 0.1);
-
-  /* Accents (single color family — indigo, reserved for primary actions) */
-  --accent: #111827;
-  --accent-hover: #1f2937;
-
-  /* Status */
-  --success: #10b981;
-  --warning: #f59e0b;
-  --danger: #ef4444;
-
-  /* Shadows */
-  --shadow-xs: 0 1px 2px 0 rgba(15, 16, 17, 0.04);
-  --shadow-sm: 0 1px 3px 0 rgba(15, 16, 17, 0.06), 0 1px 2px -1px rgba(15, 16, 17, 0.04);
+  /* Semantic (used sparingly) */
+  --green: #0e8a4a;       /* gain, success, positive */
+  --green-tint: rgba(14, 138, 74, 0.08);
+  --amber: #b45309;       /* warning, approaching limit */
+  --amber-tint: rgba(180, 83, 9, 0.08);
+  --red: #b42318;         /* loss, overbudget */
+  --red-tint: rgba(180, 35, 24, 0.08);
 }
 
 html {
-  font-feature-settings: "cv01", "cv11", "ss01", "ss03";
+  font-feature-settings: "cv11", "ss01", "ss03", "tnum" 0;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
 body {
-  color: var(--text-primary);
-  background: var(--bg-base);
-  font-family: var(--font-inter), -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  font-feature-settings: "cv01", "cv11", "ss01", "ss03";
+  color: var(--ink-1);
+  background: var(--bg);
+  font-family: var(--font-inter), -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+  font-feature-settings: "cv11", "ss01", "ss03";
+  text-rendering: optimizeLegibility;
 }
 
-/* Smooth scrolling */
-html {
-  scroll-behavior: smooth;
-}
-
-/* Remove tap highlight on mobile */
 * {
   -webkit-tap-highlight-color: transparent;
 }
 
-/* Safe area for bottom nav on iPhone */
+html {
+  scroll-behavior: smooth;
+}
+
 .safe-area-pb {
   padding-bottom: env(safe-area-inset-bottom, 0px);
 }
 
-/* Linear-style subtle number formatting */
+/* Tabular numbers for financial figures */
 .tabular {
   font-variant-numeric: tabular-nums;
-  font-feature-settings: "tnum";
+  font-feature-settings: "tnum" 1, "cv11";
 }
 
-/* Negative letter-spacing at display sizes (Linear signature) */
-.tracking-display {
-  letter-spacing: -0.032em;
+/* Display typography — big headlines, tight tracking */
+.display {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1, "cv11", "ss03";
+  letter-spacing: -0.035em;
+  font-weight: 600;
+  line-height: 1;
 }
-.tracking-tight-more {
-  letter-spacing: -0.022em;
+.display-lg {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1, "cv11", "ss03";
+  letter-spacing: -0.045em;
+  font-weight: 600;
+  line-height: 0.95;
+}
+
+/* Overline labels — small, uppercase, wide tracking */
+.overline {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--ink-4);
 }

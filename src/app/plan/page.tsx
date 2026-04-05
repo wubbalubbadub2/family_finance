@@ -30,10 +30,7 @@ function PlanForm() {
     setSaved(false);
     fetch(`/api/plans?year=${year}&month=${month}`)
       .then(r => r.json())
-      .then(data => {
-        setPlans(data);
-        setLoading(false);
-      })
+      .then(data => { setPlans(data); setLoading(false); })
       .catch(() => setLoading(false));
   }, [year, month]);
 
@@ -66,85 +63,87 @@ function PlanForm() {
 
   if (loading) {
     return (
-      <div className="flex items-center justify-center py-20">
-        <div className="text-[13px] text-[--text-quaternary]" style={{ color: 'var(--text-quaternary)' }}>
-          Загрузка...
-        </div>
+      <div className="py-24 text-center text-[13px]" style={{ color: 'var(--ink-4)' }}>
+        Загрузка...
       </div>
     );
   }
 
   return (
     <>
-      {/* Total */}
-      <div className="flex items-end justify-between mb-6 px-1">
-        <div>
-          <p className="text-[11px] font-medium uppercase tracking-[0.08em]" style={{ color: 'var(--text-quaternary)' }}>
-            Бюджет на {monthNameRu(month).toLowerCase()}
-          </p>
-          <p className="text-[28px] font-semibold mt-0.5 tabular tracking-tight-more" style={{ color: 'var(--text-primary)' }}>
-            {formatTenge(total)}
-          </p>
-        </div>
-      </div>
+      {/* Hero: total + label */}
+      <header className="px-6 pt-8 pb-12">
+        <p className="overline mb-3">Бюджет · {monthNameRu(month).toLowerCase()}</p>
+        <h1 className="display-lg text-[56px]" style={{ color: 'var(--ink-1)' }}>
+          {formatTenge(total)}
+        </h1>
+      </header>
 
-      {/* Category inputs */}
-      <div className="space-y-1.5">
+      {/* Category list — no cards, clean dividers */}
+      <div className="border-t" style={{ borderColor: 'var(--ink-6)' }}>
         {plans.map((plan, idx) => (
-          <div
+          <label
             key={plan.slug}
-            className="flex items-center gap-3 rounded-[10px] px-4 py-3.5 transition-colors"
+            className="flex items-center gap-4 px-6 py-5 cursor-text transition-colors hover:bg-[--bg-alt]"
             style={{
-              backgroundColor: 'var(--bg-surface)',
-              border: '1px solid var(--border-subtle)',
+              borderBottom: idx === plans.length - 1 ? 'none' : '1px solid var(--ink-6)',
             }}
           >
-            <span className="text-[22px] w-9 text-center flex-shrink-0 leading-none">{plan.emoji}</span>
-            <div className="flex-1 min-w-0">
-              <p className="text-[14px] font-medium" style={{ color: 'var(--text-primary)' }}>
-                {plan.name}
-              </p>
-            </div>
-            <div className="relative">
+            <span className="text-[22px] leading-none flex-shrink-0 w-7 text-center">
+              {plan.emoji}
+            </span>
+            <span
+              className="flex-1 text-[15px] font-medium"
+              style={{ color: 'var(--ink-2)' }}
+            >
+              {plan.name}
+            </span>
+            <div className="relative flex items-baseline">
               <input
                 type="text"
                 inputMode="numeric"
                 value={plan.amount > 0 ? plan.amount.toLocaleString('ru-RU') : ''}
                 onChange={(e) => updateAmount(idx, e.target.value)}
                 placeholder="0"
-                className="w-[110px] text-right text-[14px] font-semibold tabular rounded-[8px] px-3 py-2 pr-7 focus:outline-none transition-all"
-                style={{
-                  backgroundColor: 'var(--bg-muted)',
-                  border: '1px solid var(--border-subtle)',
-                  color: 'var(--text-primary)',
-                }}
+                className="w-[120px] text-right text-[17px] font-semibold tabular bg-transparent border-0 focus:outline-none focus:ring-0 placeholder:text-[--ink-5]"
+                style={{ color: 'var(--ink-1)' }}
               />
               <span
-                className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[11px] pointer-events-none"
-                style={{ color: 'var(--text-quaternary)' }}
+                className="text-[13px] ml-1"
+                style={{ color: 'var(--ink-4)' }}
               >
                 ₸
               </span>
             </div>
-          </div>
+          </label>
         ))}
       </div>
 
-      {/* Save button */}
-      <div className="sticky bottom-[88px] mt-6 pb-2 bg-gradient-to-t" style={{
-        background: `linear-gradient(to top, var(--bg-base) 60%, transparent)`,
-      }}>
-        <button
-          onClick={savePlans}
-          disabled={saving}
-          className="w-full py-3.5 rounded-[10px] text-[14px] font-semibold transition-all duration-200 active:scale-[0.98] disabled:opacity-40"
+      {/* Bottom spacer for floating button */}
+      <div className="h-32" />
+
+      {/* Floating save button — fixed above the nav bar */}
+      <div
+        className="fixed left-0 right-0 z-40 pointer-events-none"
+        style={{ bottom: '72px' }}
+      >
+        <div className="max-w-lg mx-auto px-6 pb-3 pt-6 pointer-events-auto"
           style={{
-            backgroundColor: saved ? 'var(--success)' : 'var(--accent)',
-            color: '#ffffff',
+            background: 'linear-gradient(to top, var(--bg) 40%, transparent)',
           }}
         >
-          {saving ? 'Сохраняю...' : saved ? '✓ Сохранено' : 'Сохранить план'}
-        </button>
+          <button
+            onClick={savePlans}
+            disabled={saving}
+            className="w-full py-4 rounded-full text-[14px] font-semibold transition-all active:scale-[0.98] disabled:opacity-40"
+            style={{
+              backgroundColor: saved ? 'var(--green)' : 'var(--ink-1)',
+              color: '#ffffff',
+            }}
+          >
+            {saving ? 'Сохраняю...' : saved ? 'Сохранено ✓' : 'Сохранить план'}
+          </button>
+        </div>
       </div>
     </>
   );
@@ -152,16 +151,20 @@ function PlanForm() {
 
 export default function PlanPage() {
   return (
-    <main className="min-h-screen pb-20" style={{ backgroundColor: 'var(--bg-base)' }}>
+    <main className="min-h-screen pb-20" style={{ backgroundColor: 'var(--bg)' }}>
       <div className="max-w-lg mx-auto">
         <Suspense>
           <MonthPicker />
         </Suspense>
-        <div className="px-5 pb-6">
-          <Suspense fallback={<div className="py-20 text-center text-[13px]" style={{ color: 'var(--text-quaternary)' }}>Загрузка...</div>}>
-            <PlanForm />
-          </Suspense>
-        </div>
+        <Suspense
+          fallback={
+            <div className="py-24 text-center text-[13px]" style={{ color: 'var(--ink-4)' }}>
+              Загрузка...
+            </div>
+          }
+        >
+          <PlanForm />
+        </Suspense>
       </div>
       <Suspense><Nav /></Suspense>
     </main>
