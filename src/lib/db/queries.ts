@@ -72,11 +72,13 @@ export async function insertTransaction(tx: {
 }
 
 export async function softDeleteTransaction(id: string): Promise<void> {
-  const { error } = await supabase
+  const { data, error } = await supabase
     .from('transactions')
     .update({ deleted_at: new Date().toISOString() })
-    .eq('id', id);
-  if (error) throw error;
+    .eq('id', id)
+    .select();
+  if (error) throw new Error(`Supabase update failed: ${error.message}`);
+  if (!data || data.length === 0) throw new Error(`No transaction found with id ${id}`);
 }
 
 export async function getLastTransaction(userId: string): Promise<Transaction | null> {

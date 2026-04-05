@@ -39,20 +39,28 @@ export default function TransactionList({ items: initialItems }: { items: Transa
   const [items, setItems] = useState(initialItems);
   const [deletingId, setDeletingId] = useState<string | null>(null);
 
-  const handleDelete = async (id: string) => {
+  const handleDelete = async (tx: TransactionItem) => {
     if (deletingId) return;
-    setDeletingId(id);
-    // Optimistic removal after short delay (feels responsive)
+
+    const label = tx.category_name ? `${tx.category_emoji} ${tx.category_name}` : 'эту запись';
+    if (!confirm(`Удалить ${label} — ${formatTenge(tx.amount)}?`)) return;
+
+    setDeletingId(tx.id);
     try {
-      await fetch('/api/transactions', {
+      const res = await fetch('/api/transactions', {
         method: 'DELETE',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id }),
+        body: JSON.stringify({ id: tx.id }),
       });
-      setItems(prev => prev.filter(t => t.id !== id));
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ error: 'unknown' }));
+        throw new Error(err.error || `HTTP ${res.status}`);
+      }
+      setItems(prev => prev.filter(t => t.id !== tx.id));
       startTransition(() => router.refresh());
     } catch (e) {
-      console.error('Delete error:', e);
+      const msg = e instanceof Error ? e.message : String(e);
+      alert(`Ошибка удаления: ${msg}`);
       setDeletingId(null);
     }
   };
@@ -134,7 +142,7 @@ export default function TransactionList({ items: initialItems }: { items: Transa
                         {isIncome ? '+' : ''}{formatTenge(tx.amount)}
                       </span>
                       <button
-                        onClick={() => handleDelete(tx.id)}
+                        onClick={() => handleDelete(tx)}
                         disabled={isDeleting}
                         aria-label="Удалить"
                         className="flex-shrink-0 w-7 h-7 flex items-center justify-center rounded-full text-gray-300 hover:bg-red-50 hover:text-red-500 transition-colors"
