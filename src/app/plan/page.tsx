@@ -2,7 +2,7 @@
 
 import { Suspense, useState, useEffect } from 'react';
 import { useSearchParams } from 'next/navigation';
-import { formatTenge, currentMonthAlmaty, monthNameRu } from '@/lib/utils';
+import { formatTenge, currentMonthAlmaty } from '@/lib/utils';
 import MonthPicker from '@/components/month-picker';
 import Nav from '@/components/nav';
 
@@ -72,11 +72,15 @@ function PlanForm() {
   return (
     <>
       {/* Hero: total + label */}
-      <header className="px-6 pt-8 pb-12">
-        <p className="overline mb-3">Бюджет · {monthNameRu(month).toLowerCase()}</p>
-        <h1 className="display-lg text-[56px]" style={{ color: 'var(--ink-1)' }}>
-          {formatTenge(total)}
-        </h1>
+      <header className="px-6 pt-2 pb-6">
+        <div className="flex items-end justify-between">
+          <div>
+            <p className="overline mb-1">Бюджет</p>
+            <h1 className="display text-[36px]" style={{ color: 'var(--ink-1)' }}>
+              {formatTenge(total)}
+            </h1>
+          </div>
+        </div>
       </header>
 
       {/* Category list — no cards, clean dividers */}
@@ -84,7 +88,7 @@ function PlanForm() {
         {plans.map((plan, idx) => (
           <label
             key={plan.slug}
-            className="flex items-center gap-4 px-6 py-5 cursor-text transition-colors hover:bg-[--bg-alt]"
+            className="flex items-center gap-4 px-6 py-4 cursor-text transition-colors hover:bg-[--bg-alt]"
             style={{
               borderBottom: idx === plans.length - 1 ? 'none' : '1px solid var(--ink-6)',
             }}
@@ -120,7 +124,7 @@ function PlanForm() {
       </div>
 
       {/* Bottom spacer for floating button */}
-      <div className="h-32" />
+      <div className="h-24" />
 
       {/* Floating save button — fixed above the nav bar */}
       <div

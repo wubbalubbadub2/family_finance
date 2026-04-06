@@ -88,19 +88,23 @@ export default function TransactionList({ items: initialItems }: { items: Transa
 
   return (
     <>
-      {/* Hero summary */}
-      <header className="px-6 pt-4 pb-10">
-        <p className="overline mb-3">
-          {items.length} {items.length === 1 ? 'запись' : items.length < 5 ? 'записи' : 'записей'}
-        </p>
-        <h1 className="display-lg text-[56px]" style={{ color: 'var(--ink-1)' }}>
-          {formatTenge(totalExpenses)}
-        </h1>
-        {totalIncome > 0 && (
-          <p className="text-[14px] font-semibold tabular mt-3" style={{ color: 'var(--green)' }}>
-            +{formatTenge(totalIncome)} доход
-          </p>
-        )}
+      {/* Compact summary */}
+      <header className="px-6 pt-1 pb-5">
+        <div className="flex items-end justify-between">
+          <div>
+            <p className="overline mb-1">
+              {items.length} {items.length === 1 ? 'запись' : items.length < 5 ? 'записи' : 'записей'}
+            </p>
+            <h1 className="display text-[36px]" style={{ color: 'var(--ink-1)' }}>
+              {formatTenge(totalExpenses)}
+            </h1>
+          </div>
+          {totalIncome > 0 && (
+            <p className="text-[14px] font-semibold tabular pb-0.5" style={{ color: 'var(--green)' }}>
+              +{formatTenge(totalIncome)}
+            </p>
+          )}
+        </div>
       </header>
 
       {/* Grouped list */}

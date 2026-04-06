@@ -1,5 +1,5 @@
 import { Suspense } from 'react';
-import { currentMonthAlmaty, formatTenge, monthNameRu } from '@/lib/utils';
+import { currentMonthAlmaty, formatTenge } from '@/lib/utils';
 import { getMonthSummary } from '@/lib/db/queries';
 import type { CategorySummary } from '@/types';
 import Link from 'next/link';
@@ -38,8 +38,7 @@ export default async function Dashboard({ searchParams }: PageProps) {
     return (
       <main className="min-h-screen flex items-center justify-center pb-20" style={{ backgroundColor: 'var(--bg)' }}>
         <div className="text-center p-8">
-          <div className="text-4xl mb-4">🔌</div>
-          <p className="text-[14px]" style={{ color: 'var(--ink-3)' }}>Нет подключения к БД</p>
+          <p className="text-[14px]" style={{ color: 'var(--ink-3)' }}>🔌 Нет подключения к БД</p>
         </div>
         <Suspense><Nav /></Suspense>
       </main>
@@ -57,15 +56,14 @@ export default async function Dashboard({ searchParams }: PageProps) {
   const activeCats = categories.filter((c: CategorySummary) => c.actual > 0 || c.planned > 0);
   const balance = total_income - total_actual;
 
-  // Pace insight
   let paceLine = '';
   let paceOver = false;
   if (hasPlan && days_elapsed > 0) {
     if (daily_actual > daily_budget) {
       paceOver = true;
-      paceLine = `Темп ${formatTenge(daily_actual)} в день — выше плана`;
+      paceLine = `${formatTenge(daily_actual)}/день — выше плана`;
     } else if (safe_daily_remaining > 0) {
-      paceLine = `${formatTenge(safe_daily_remaining)} в день до конца месяца`;
+      paceLine = `${formatTenge(safe_daily_remaining)}/день до конца месяца`;
     }
   }
 
@@ -74,69 +72,53 @@ export default async function Dashboard({ searchParams }: PageProps) {
       <div className="max-w-lg mx-auto">
         <Suspense><MonthPicker /></Suspense>
 
-        {/* ── Editorial hero ── */}
-        <header className="px-6 pt-4 pb-10">
-          <p className="overline mb-3">
-            {monthNameRu(month)} · день {days_elapsed} из {days_in_month}
-          </p>
-          <h1 className="display-lg text-[56px]" style={{ color: 'var(--ink-1)' }}>
-            {formatTenge(total_actual)}
-          </h1>
-          {hasPlan ? (
-            <div className="flex items-baseline gap-3 mt-3">
-              <span className="text-[14px]" style={{ color: 'var(--ink-3)' }}>
-                из {formatTenge(total_planned)}
-              </span>
-              <span
-                className="text-[13px] font-semibold tabular"
-                style={{
-                  color:
-                    budgetPct >= 100 ? 'var(--red)' :
-                    budgetPct >= 80 ? 'var(--amber)' :
-                    'var(--green)',
-                }}
-              >
-                {budgetPct}%
-              </span>
+        {/* ── Compact hero ── */}
+        <header className="px-6 pt-1 pb-6">
+          <div className="flex items-end justify-between">
+            <div>
+              <p className="overline mb-1">Расходы</p>
+              <h1 className="display text-[36px]" style={{ color: 'var(--ink-1)' }}>
+                {formatTenge(total_actual)}
+              </h1>
             </div>
-          ) : (
-            <p className="text-[14px] mt-3" style={{ color: 'var(--ink-3)' }}>
-              расходы за месяц
-            </p>
-          )}
-
-          {/* Single thin progress bar */}
-          {hasPlan && (
-            <div className="mt-5">
-              <Bar percentage={budgetPct} />
+            <div className="text-right pb-0.5">
+              <p className="text-[11px]" style={{ color: 'var(--ink-4)' }}>
+                день {days_elapsed}/{days_in_month}
+              </p>
+              {hasPlan && (
+                <p
+                  className="text-[13px] font-semibold tabular mt-0.5"
+                  style={{
+                    color:
+                      budgetPct >= 100 ? 'var(--red)' :
+                      budgetPct >= 80 ? 'var(--amber)' :
+                      'var(--green)',
+                  }}
+                >
+                  {budgetPct}% из {formatTenge(total_planned)}
+                </p>
+              )}
             </div>
-          )}
+          </div>
 
-          {/* Pace insight */}
+          {hasPlan && <div className="mt-3"><Bar percentage={budgetPct} /></div>}
+
           {paceLine && (
-            <p
-              className="text-[12px] mt-4"
-              style={{ color: paceOver ? 'var(--red)' : 'var(--ink-3)' }}
-            >
+            <p className="text-[11px] mt-2" style={{ color: paceOver ? 'var(--red)' : 'var(--ink-3)' }}>
               {paceLine}
             </p>
           )}
 
-          {/* Income line */}
+          {/* Income row */}
           {total_income > 0 && (
-            <div className="flex items-baseline gap-4 mt-5 pt-5" style={{ borderTop: '1px solid var(--ink-6)' }}>
-              <div className="flex-1">
-                <p className="overline mb-1">Доход</p>
-                <p className="text-[15px] font-semibold tabular" style={{ color: 'var(--ink-1)' }}>
-                  {formatTenge(total_income)}
-                </p>
+            <div className="flex gap-6 mt-4 pt-3" style={{ borderTop: '1px solid var(--ink-6)' }}>
+              <div>
+                <p className="overline mb-0.5">Доход</p>
+                <p className="text-[14px] font-semibold tabular">{formatTenge(total_income)}</p>
               </div>
-              <div className="flex-1">
-                <p className="overline mb-1">Баланс</p>
-                <p
-                  className="text-[15px] font-semibold tabular"
-                  style={{ color: balance >= 0 ? 'var(--green)' : 'var(--red)' }}
-                >
+              <div>
+                <p className="overline mb-0.5">Баланс</p>
+                <p className="text-[14px] font-semibold tabular" style={{ color: balance >= 0 ? 'var(--green)' : 'var(--red)' }}>
                   {balance >= 0 ? '+' : ''}{formatTenge(balance)}
                 </p>
               </div>
@@ -144,81 +126,67 @@ export default async function Dashboard({ searchParams }: PageProps) {
           )}
         </header>
 
-        {/* ── Category list ── */}
+        {/* ── Categories ── */}
         {activeCats.length > 0 ? (
           <>
-            <div className="px-6 pb-3 flex items-center justify-between">
+            <div className="px-6 pb-2 flex items-center justify-between">
               <h2 className="overline">Статьи</h2>
               <Link
                 href={`/plan?year=${year}&month=${month}`}
-                className="text-[11px] font-medium transition-opacity hover:opacity-60"
+                className="text-[11px] font-medium hover:opacity-60 transition-opacity"
                 style={{ color: 'var(--ink-3)' }}
               >
-                {hasPlan ? 'Изменить план' : 'Установить план'} →
+                {hasPlan ? 'Изменить план →' : 'Установить план →'}
               </Link>
             </div>
-
             <div style={{ borderTop: '1px solid var(--ink-6)' }}>
-              {activeCats.map((c: CategorySummary, idx: number) => (
-                <div
-                  key={c.category.slug}
-                  className="flex items-center gap-4 px-6 py-4"
-                  style={{
-                    borderBottom: idx === activeCats.length - 1 ? 'none' : '1px solid var(--ink-6)',
-                  }}
-                >
-                  <span className="text-[20px] leading-none flex-shrink-0 w-7 text-center">
-                    {c.category.emoji}
-                  </span>
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-baseline justify-between mb-1.5">
-                      <span className="text-[14px] font-medium" style={{ color: 'var(--ink-2)' }}>
-                        {c.category.name}
-                      </span>
-                      <span className="text-[14px] font-semibold tabular" style={{ color: 'var(--ink-1)' }}>
-                        {formatTenge(c.actual)}
-                      </span>
+              {activeCats.map((c: CategorySummary, idx: number) => {
+                const share = total_actual > 0 ? Math.round((c.actual / total_actual) * 100) : 0;
+                return (
+                  <div
+                    key={c.category.slug}
+                    className="flex items-center gap-3 px-6 py-3"
+                    style={{ borderBottom: idx === activeCats.length - 1 ? 'none' : '1px solid var(--ink-6)' }}
+                  >
+                    <span className="text-[18px] leading-none flex-shrink-0 w-6 text-center">{c.category.emoji}</span>
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-baseline justify-between mb-1">
+                        <span className="text-[13px] font-medium" style={{ color: 'var(--ink-2)' }}>
+                          {c.category.name}
+                          <span className="ml-1.5 font-normal text-[11px]" style={{ color: 'var(--ink-4)' }}>
+                            {share}%
+                          </span>
+                        </span>
+                        <span className="text-[13px] font-semibold tabular" style={{ color: 'var(--ink-1)' }}>
+                          {formatTenge(c.actual)}
+                        </span>
+                      </div>
+                      {c.planned > 0 ? (
+                        <>
+                          <Bar percentage={c.percentage} />
+                          <div className="flex items-center justify-between mt-1">
+                            <span className="text-[10px]" style={{ color: 'var(--ink-4)' }}>
+                              {c.remaining > 0 ? `ост. ${formatTenge(c.remaining)}` : c.remaining < 0 ? `+${formatTenge(Math.abs(c.remaining))} сверх` : ''}
+                            </span>
+                            <span
+                              className="text-[10px] font-medium tabular"
+                              style={{ color: c.percentage >= 100 ? 'var(--red)' : c.percentage >= 80 ? 'var(--amber)' : 'var(--ink-4)' }}
+                            >
+                              {c.percentage}% плана
+                            </span>
+                          </div>
+                        </>
+                      ) : null}
                     </div>
-                    {c.planned > 0 ? (
-                      <>
-                        <Bar percentage={c.percentage} />
-                        <div className="flex items-center justify-between mt-1.5">
-                          <span className="text-[11px]" style={{ color: 'var(--ink-4)' }}>
-                            {c.remaining > 0
-                              ? `осталось ${formatTenge(c.remaining)}`
-                              : c.remaining < 0
-                                ? `+${formatTenge(Math.abs(c.remaining))} сверх`
-                                : 'в точку'}
-                          </span>
-                          <span
-                            className="text-[11px] font-medium tabular"
-                            style={{
-                              color:
-                                c.percentage >= 100 ? 'var(--red)' :
-                                c.percentage >= 80 ? 'var(--amber)' :
-                                'var(--ink-4)',
-                            }}
-                          >
-                            {c.percentage}%
-                          </span>
-                        </div>
-                      </>
-                    ) : (
-                      <p className="text-[11px]" style={{ color: 'var(--ink-4)' }}>без плана</p>
-                    )}
                   </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           </>
         ) : (
-          <div className="text-center py-20 px-8">
-            <p className="text-[32px] mb-4">💬</p>
-            <p className="text-[14px] mb-1" style={{ color: 'var(--ink-3)' }}>
-              Отправьте расход в Telegram
-            </p>
-            <p className="text-[14px] font-semibold" style={{ color: 'var(--ink-1)' }}>
-              кофе 1200
+          <div className="text-center py-16 px-8">
+            <p className="text-[14px]" style={{ color: 'var(--ink-3)' }}>
+              Отправьте расход в бот: <span className="font-semibold" style={{ color: 'var(--ink-1)' }}>кофе 1200</span>
             </p>
           </div>
         )}

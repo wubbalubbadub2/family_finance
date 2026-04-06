@@ -28,7 +28,7 @@ export default function MonthPicker() {
   }
 
   return (
-    <div className="flex items-center justify-between px-6 pt-6 pb-2">
+    <div className="flex items-center justify-between px-6 pt-4 pb-1">
       <button
         onClick={() => navigate(-1)}
         className="w-9 h-9 -ml-2 flex items-center justify-center rounded-full transition-all hover:bg-[--bg-alt] active:scale-95"

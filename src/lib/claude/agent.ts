@@ -191,41 +191,35 @@ async function executeTool(
       const mo = input.month as number;
       const summary = await getMonthSummary(year, mo);
 
-      // Build pre-formatted summary so Claude just passes it through
       const activeCats = summary.categories.filter(
         (c: { actual: number; planned: number }) => c.actual > 0 || c.planned > 0
       );
 
-      let text = `📊 ${monthNameRu(mo)} ${year} (день ${summary.days_elapsed}/${summary.days_in_month})\n\n`;
+      const total = summary.total_actual;
 
-      if (summary.total_income > 0) {
-        text += `📥 Доход: ${formatTenge(summary.total_income)}\n`;
-      }
-      text += `📤 Расходы: ${formatTenge(summary.total_actual)}`;
+      // Compact format: month + total on ONE line
+      let text = `📊 ${monthNameRu(mo)} — ${formatTenge(total)}`;
       if (summary.total_planned > 0) {
-        text += ` из ${formatTenge(summary.total_planned)}`;
+        const pct = Math.round((total / summary.total_planned) * 100);
+        text += ` из ${formatTenge(summary.total_planned)} (${pct}%)`;
       }
       text += '\n';
 
-      if (summary.total_planned > 0 && summary.total_remaining > 0) {
-        text += `✅ Остаток: ${formatTenge(summary.total_remaining)}\n`;
-      } else if (summary.total_planned > 0 && summary.total_remaining < 0) {
-        text += `🔴 Перерасход: ${formatTenge(Math.abs(summary.total_remaining))}\n`;
-      }
-
-      if (summary.total_income > 0) {
-        const balance = summary.total_income - summary.total_actual;
-        text += `💰 Баланс: ${balance >= 0 ? '+' : ''}${formatTenge(balance)}\n`;
-      }
-
-      text += '\n';
+      // Each category with % of total
       for (const c of activeCats) {
-        const cat = c as { category: { emoji: string; name: string }; actual: number; planned: number; percentage: number; remaining: number };
-        text += `${cat.category.emoji} ${cat.category.name}: ${formatTenge(cat.actual)}`;
+        const cat = c as { category: { emoji: string; name: string }; actual: number; planned: number; percentage: number };
+        const share = total > 0 ? Math.round((cat.actual / total) * 100) : 0;
+        text += `${cat.category.emoji} ${cat.category.name}: ${formatTenge(cat.actual)} · ${share}%`;
         if (cat.planned > 0) {
-          text += ` / ${formatTenge(cat.planned)} (${cat.percentage}%)`;
+          text += ` (${cat.percentage}% плана)`;
         }
         text += '\n';
+      }
+
+      // Income/balance if present
+      if (summary.total_income > 0) {
+        const balance = summary.total_income - total;
+        text += `\n📥 ${formatTenge(summary.total_income)} доход · ${balance >= 0 ? '+' : ''}${formatTenge(balance)} баланс`;
       }
 
       return text.trim();
