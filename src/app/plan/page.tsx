@@ -75,7 +75,7 @@ function PlanForm() {
       <header className="px-6 pt-2 pb-6">
         <div className="flex items-end justify-between">
           <div>
-            <p className="overline mb-1">Бюджет</p>
+            <p className="label-sm mb-1">Бюджет</p>
             <h1 className="display text-[36px]" style={{ color: 'var(--ink-1)' }}>
               {formatTenge(total)}
             </h1>
@@ -84,7 +84,7 @@ function PlanForm() {
       </header>
 
       {/* Category list — no cards, clean dividers */}
-      <div className="border-t" style={{ borderColor: 'var(--ink-6)' }}>
+      <div>
         {plans.map((plan, idx) => (
           <label
             key={plan.slug}

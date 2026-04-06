@@ -92,7 +92,7 @@ export default function TransactionList({ items: initialItems }: { items: Transa
       <header className="px-6 pt-1 pb-5">
         <div className="flex items-end justify-between">
           <div>
-            <p className="overline mb-1">
+            <p className="label-sm mb-1">
               {items.length} {items.length === 1 ? 'запись' : items.length < 5 ? 'записи' : 'записей'}
             </p>
             <h1 className="display text-[36px]" style={{ color: 'var(--ink-1)' }}>
@@ -117,11 +117,9 @@ export default function TransactionList({ items: initialItems }: { items: Transa
                 className="flex items-center justify-between px-6 py-3"
                 style={{
                   backgroundColor: 'var(--bg-alt)',
-                  borderTop: '1px solid var(--ink-6)',
-                  borderBottom: '1px solid var(--ink-6)',
                 }}
               >
-                <span className="overline">{formatDateLong(date)}</span>
+                <span className="label-sm">{formatDateLong(date)}</span>
                 {dayTotal > 0 && (
                   <span className="text-[11px] font-semibold tabular" style={{ color: 'var(--ink-3)' }}>
                     {formatTenge(dayTotal)}

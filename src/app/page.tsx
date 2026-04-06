@@ -76,7 +76,7 @@ export default async function Dashboard({ searchParams }: PageProps) {
         <header className="px-6 pt-1 pb-6">
           <div className="flex items-end justify-between">
             <div>
-              <p className="overline mb-1">Расходы</p>
+              <p className="label-sm mb-1">Расходы</p>
               <h1 className="display text-[36px]" style={{ color: 'var(--ink-1)' }}>
                 {formatTenge(total_actual)}
               </h1>
@@ -111,13 +111,13 @@ export default async function Dashboard({ searchParams }: PageProps) {
 
           {/* Income row */}
           {total_income > 0 && (
-            <div className="flex gap-6 mt-4 pt-3" style={{ borderTop: '1px solid var(--ink-6)' }}>
+            <div className="flex gap-6 mt-4 pt-3">
               <div>
-                <p className="overline mb-0.5">Доход</p>
+                <p className="label-sm mb-0.5">Доход</p>
                 <p className="text-[14px] font-semibold tabular">{formatTenge(total_income)}</p>
               </div>
               <div>
-                <p className="overline mb-0.5">Баланс</p>
+                <p className="label-sm mb-0.5">Баланс</p>
                 <p className="text-[14px] font-semibold tabular" style={{ color: balance >= 0 ? 'var(--green)' : 'var(--red)' }}>
                   {balance >= 0 ? '+' : ''}{formatTenge(balance)}
                 </p>
@@ -130,7 +130,7 @@ export default async function Dashboard({ searchParams }: PageProps) {
         {activeCats.length > 0 ? (
           <>
             <div className="px-6 pb-2 flex items-center justify-between">
-              <h2 className="overline">Статьи</h2>
+              <h2 className="label-sm">Статьи</h2>
               <Link
                 href={`/plan?year=${year}&month=${month}`}
                 className="text-[11px] font-medium hover:opacity-60 transition-opacity"
@@ -139,7 +139,7 @@ export default async function Dashboard({ searchParams }: PageProps) {
                 {hasPlan ? 'Изменить план →' : 'Установить план →'}
               </Link>
             </div>
-            <div style={{ borderTop: '1px solid var(--ink-6)' }}>
+            <div>
               {activeCats.map((c: CategorySummary, idx: number) => {
                 const share = total_actual > 0 ? Math.round((c.actual / total_actual) * 100) : 0;
                 return (

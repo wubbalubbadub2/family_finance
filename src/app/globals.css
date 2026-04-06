@@ -74,10 +74,11 @@ html {
 }
 
 /* Overline labels — small, uppercase, wide tracking */
-.overline {
+.label-sm {
   font-size: 10px;
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.1em;
   color: var(--ink-4);
+  text-decoration: none;
 }
