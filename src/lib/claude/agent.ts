@@ -12,6 +12,9 @@ import {
   upsertMonthlyPlan,
   getRecentMessages,
   saveMessage,
+  addDebt,
+  payDebt,
+  getActiveDebts,
 } from '@/lib/db/queries';
 import { todayAlmaty, currentMonthAlmaty, monthNameRu, formatTenge } from '@/lib/utils';
 
@@ -85,7 +88,7 @@ const TOOLS: Anthropic.Tool[] = [
   },
   {
     name: 'record_income',
-    description: 'Record income (salary, bonus, refund, gift received, debt returned). Use when user mentions receiving money.',
+    description: 'Record income (salary, bonus, refund, gift received). Use when user mentions EARNING money, getting paid. NOT for loans/debts.',
     input_schema: {
       type: 'object' as const,
       properties: {
@@ -93,6 +96,27 @@ const TOOLS: Anthropic.Tool[] = [
         comment: { type: 'string', description: 'Source of income (зарплата, бонус, etc.)' },
       },
       required: ['amount'],
+    },
+  },
+  {
+    name: 'record_debt',
+    description: 'Record taking on debt / borrowing money. Use when user says "взял в долг", "одолжил", "занял". NOT income — this is borrowed money that must be paid back.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        amount: { type: 'number', description: 'Amount borrowed in tenge' },
+        name: { type: 'string', description: 'Who the debt is from (person or bank name)' },
+      },
+      required: ['amount', 'name'],
+    },
+  },
+  {
+    name: 'get_debts',
+    description: 'Show active debts. Use when user asks about debts, how much they owe, долги.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {},
+      required: [],
     },
   },
 ];
@@ -120,13 +144,16 @@ function buildSystemPrompt(): string {
 КРИТИЧЕСКИ ВАЖНО: результаты tools содержат ГОТОВЫЙ текст для пользователя. Твоя задача — вывести этот текст ДОСЛОВНО, ОДИН В ОДИН, без изменений. ЗАПРЕЩЕНО: переписывать, перефразировать, менять формат, добавлять маркеры "-", менять порядок строк, добавлять "Итог" или другие заголовки. Просто скопируй текст из tool result как есть.
 
 Правила:
-1. Расход (напр. "такси 2500") — вызови record_expense + get_month_summary в одном ходе. Выведи оба результата подряд.
-2. Вопрос про бюджет/расходы/план — вызови get_month_summary. Выведи результат как есть.
+1. Расход (напр. "такси 2500") — вызови record_expense + get_month_summary. Выведи оба результата подряд.
+2. Вопрос про бюджет/расходы/план — вызови get_month_summary.
 3. Показать транзакции — используй get_recent_transactions
 4. Удалить/отменить — используй undo_last
 5. Установить план/бюджет — используй set_plan
-6. Доход (напр. "зарплата 500000") — используй record_income
-7. Если непонятно — переспроси.
+6. Доход (напр. "зарплата 500000") — используй record_income. Доход = заработанные деньги.
+7. Долг (напр. "взял в долг 100000 Дудар", "занял 50000") — используй record_debt. Долг ≠ доход.
+8. Оплата кредита (напр. "кредит дудар 30000") — record_expense в категории credit. Имя кредитора пиши в comment — долг автоматически уменьшится.
+9. Спросить про долги — используй get_debts.
+10. Если непонятно — переспроси.
 8. Ты можешь вызвать несколько tools за один ход если нужно (напр. записать расход и показать итог).`;
 }
 
@@ -166,13 +193,24 @@ async function executeTool(
         transaction_date: todayAlmaty(),
       });
 
+      // If category is 'credit' and comment has a name, auto-reduce that debt
+      let debtNote = '';
+      if (slug === 'credit' && comment) {
+        const debt = await payDebt(comment, amount);
+        if (debt) {
+          debtNote = debt.remaining_amount > 0
+            ? `\n📉 Долг ${debt.name}: осталось ${formatTenge(debt.remaining_amount)}`
+            : `\n🎉 Долг ${debt.name} полностью погашен!`;
+        }
+      }
+
       const { year, month } = currentMonthAlmaty();
       const summary = await getMonthSummary(year, month);
       const catSummary = summary.categories.find((c: { category: { id: number } }) => c.category.id === category.id);
 
-      // Build pre-formatted response so Claude doesn't recalculate
       let response = `✅ ${category.emoji} ${category.name} — ${formatTenge(amount)}`;
       if (comment) response += ` (${comment})`;
+      response += debtNote;
 
       if (catSummary && catSummary.planned > 0) {
         response += `\nПо статье: ${formatTenge(catSummary.actual)} из ${formatTenge(catSummary.planned)} (${catSummary.percentage}%)`;
@@ -327,6 +365,51 @@ async function executeTool(
       response += `\n\n📥 Доход за ${monthNameRu(month)}: ${formatTenge(summary.total_income)}`;
       response += `\n📤 Расходы: ${formatTenge(summary.total_actual)}`;
       response += `\n💼 Баланс: ${balance >= 0 ? '+' : ''}${formatTenge(balance)}`;
+      return response;
+    }
+
+    case 'record_debt': {
+      const amount = Math.round(input.amount as number);
+      const name = (input.name as string);
+
+      if (!Number.isFinite(amount) || amount <= 0) {
+        return JSON.stringify({ error: 'invalid_amount', message: 'Сумма долга должна быть положительной.' });
+      }
+      if (!name) {
+        return JSON.stringify({ error: 'missing_name', message: 'Укажи имя кредитора.' });
+      }
+
+      const debt = await addDebt(name, amount);
+      const allDebts = await getActiveDebts();
+      const totalDebt = allDebts.reduce((s, d) => s + d.remaining_amount, 0);
+
+      let response = `📝 Долг записан: ${formatTenge(amount)} (${debt.name})`;
+      response += `\nОстаток по этому долгу: ${formatTenge(debt.remaining_amount)}`;
+      response += `\n\n💳 Всего долгов: ${formatTenge(totalDebt)}`;
+      for (const d of allDebts) {
+        response += `\n- ${d.name}: ${formatTenge(d.remaining_amount)}`;
+      }
+      return response;
+    }
+
+    case 'get_debts': {
+      const debts = await getActiveDebts();
+      if (debts.length === 0) {
+        return '🎉 Нет активных долгов!';
+      }
+
+      const totalDebt = debts.reduce((s, d) => s + d.remaining_amount, 0);
+      const totalOriginal = debts.reduce((s, d) => s + d.original_amount, 0);
+      const paidOff = totalOriginal - totalDebt;
+      const pct = totalOriginal > 0 ? Math.round((paidOff / totalOriginal) * 100) : 0;
+
+      let response = `💳 Долги — ${formatTenge(totalDebt)} осталось`;
+      response += `\n📊 Погашено ${formatTenge(paidOff)} из ${formatTenge(totalOriginal)} (${pct}%)`;
+      response += '\n';
+      for (const d of debts) {
+        const dPct = d.original_amount > 0 ? Math.round(((d.original_amount - d.remaining_amount) / d.original_amount) * 100) : 0;
+        response += `\n- ${d.name}: ${formatTenge(d.remaining_amount)} ост. (${dPct}% погашено)`;
+      }
       return response;
     }
 

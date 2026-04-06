@@ -1,6 +1,6 @@
 import { Suspense } from 'react';
 import { currentMonthAlmaty, formatTenge } from '@/lib/utils';
-import { getMonthSummary } from '@/lib/db/queries';
+import { getMonthSummary, getActiveDebts } from '@/lib/db/queries';
 import type { CategorySummary } from '@/types';
 import Link from 'next/link';
 import MonthPicker from '@/components/month-picker';
@@ -55,6 +55,10 @@ export default async function Dashboard({ searchParams }: PageProps) {
   const budgetPct = hasPlan ? Math.round((total_actual / total_planned) * 100) : 0;
   const activeCats = categories.filter((c: CategorySummary) => c.actual > 0 || c.planned > 0);
   const balance = total_income - total_actual;
+
+  // Fetch debts
+  let debts: { id: string; name: string; original_amount: number; remaining_amount: number }[] = [];
+  try { debts = await getActiveDebts(); } catch { /* table may not exist */ }
 
   let paceLine = '';
   let paceOver = false;
@@ -189,6 +193,45 @@ export default async function Dashboard({ searchParams }: PageProps) {
               Отправьте расход в бот: <span className="font-semibold" style={{ color: 'var(--ink-1)' }}>кофе 1200</span>
             </p>
           </div>
+        )}
+        {/* ── Debts section ── */}
+        {debts.length > 0 && (
+          <section className="px-6 pt-6 pb-4">
+            <h2 className="label-sm mb-3">Долги</h2>
+            {(() => {
+              const totalDebt = debts.reduce((s, d) => s + d.remaining_amount, 0);
+              const totalOriginal = debts.reduce((s, d) => s + d.original_amount, 0);
+              const paidOff = totalOriginal - totalDebt;
+              const pct = totalOriginal > 0 ? Math.round((paidOff / totalOriginal) * 100) : 0;
+              return (
+                <>
+                  <div className="flex items-baseline justify-between mb-2">
+                    <span className="text-[20px] font-semibold tabular display" style={{ color: 'var(--red)' }}>
+                      {formatTenge(totalDebt)}
+                    </span>
+                    <span className="text-[11px]" style={{ color: 'var(--ink-4)' }}>
+                      погашено {pct}%
+                    </span>
+                  </div>
+                  <div className="w-full h-[2px] overflow-hidden mb-3" style={{ backgroundColor: 'var(--ink-6)' }}>
+                    <div className="h-full transition-all duration-700" style={{ width: `${pct}%`, backgroundColor: 'var(--green)' }} />
+                  </div>
+                  {debts.map((d, idx) => (
+                    <div
+                      key={d.id}
+                      className="flex items-center justify-between py-2"
+                      style={{ borderBottom: idx === debts.length - 1 ? 'none' : '1px solid var(--ink-6)' }}
+                    >
+                      <span className="text-[13px]" style={{ color: 'var(--ink-2)' }}>{d.name}</span>
+                      <span className="text-[13px] font-semibold tabular" style={{ color: 'var(--ink-1)' }}>
+                        {formatTenge(d.remaining_amount)}
+                      </span>
+                    </div>
+                  ))}
+                </>
+              );
+            })()}
+          </section>
         )}
       </div>
       <Suspense><Nav /></Suspense>

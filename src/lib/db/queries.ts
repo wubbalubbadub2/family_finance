@@ -223,6 +223,95 @@ export async function upsertMerchantCategory(
   if (error) throw error;
 }
 
+// ── Debts ──
+
+export interface Debt {
+  id: string;
+  name: string;
+  original_amount: number;
+  remaining_amount: number;
+  note: string | null;
+  created_at: string;
+  paid_off_at: string | null;
+}
+
+export async function getActiveDebts(): Promise<Debt[]> {
+  const { data } = await supabase
+    .from('debts')
+    .select('*')
+    .is('paid_off_at', null)
+    .order('remaining_amount', { ascending: false });
+  return data ?? [];
+}
+
+export async function getAllDebts(): Promise<Debt[]> {
+  const { data } = await supabase
+    .from('debts')
+    .select('*')
+    .order('created_at', { ascending: false });
+  return data ?? [];
+}
+
+export async function addDebt(name: string, amount: number, note?: string): Promise<Debt> {
+  // Check if debt with same name already exists (active)
+  const { data: existing } = await supabase
+    .from('debts')
+    .select('*')
+    .eq('name', name.toLowerCase())
+    .is('paid_off_at', null)
+    .single();
+
+  if (existing) {
+    // Add to existing debt
+    const newRemaining = existing.remaining_amount + amount;
+    const newOriginal = existing.original_amount + amount;
+    const { data, error } = await supabase
+      .from('debts')
+      .update({ remaining_amount: newRemaining, original_amount: newOriginal })
+      .eq('id', existing.id)
+      .select()
+      .single();
+    if (error) throw error;
+    return data;
+  }
+
+  const { data, error } = await supabase
+    .from('debts')
+    .insert({
+      name: name.toLowerCase(),
+      original_amount: amount,
+      remaining_amount: amount,
+      note,
+    })
+    .select()
+    .single();
+  if (error) throw error;
+  return data;
+}
+
+export async function payDebt(name: string, amount: number): Promise<Debt | null> {
+  const { data: debt } = await supabase
+    .from('debts')
+    .select('*')
+    .eq('name', name.toLowerCase())
+    .is('paid_off_at', null)
+    .single();
+
+  if (!debt) return null;
+
+  const newRemaining = Math.max(0, debt.remaining_amount - amount);
+  const paidOff = newRemaining === 0 ? new Date().toISOString() : null;
+
+  const { data, error } = await supabase
+    .from('debts')
+    .update({ remaining_amount: newRemaining, paid_off_at: paidOff })
+    .eq('id', debt.id)
+    .select()
+    .single();
+  if (error) throw error;
+  return data;
+}
+
 // ── Conversation Memory ──
 
 export async function getRecentMessages(chatId: number, limit = 10): Promise<{ role: string; content: string }[]> {
