@@ -1,5 +1,5 @@
 import { Suspense } from 'react';
-import { currentMonthAlmaty, formatTenge } from '@/lib/utils';
+import { currentMonthAlmaty, formatTenge, monthNameRu } from '@/lib/utils';
 import { getMonthSummary, getActiveDebts } from '@/lib/db/queries';
 import type { CategorySummary } from '@/types';
 import Link from 'next/link';
@@ -12,12 +12,8 @@ interface PageProps {
   searchParams: Promise<{ year?: string; month?: string }>;
 }
 
-function Bar({ percentage }: { percentage: number }) {
+function Bar({ percentage, color = 'var(--ink-1)' }: { percentage: number; color?: string }) {
   const p = Math.min(percentage, 100);
-  const color =
-    percentage >= 100 ? 'var(--red)' :
-    percentage >= 80 ? 'var(--amber)' :
-    'var(--ink-1)';
   return (
     <div className="w-full h-[2px] overflow-hidden" style={{ backgroundColor: 'var(--ink-6)' }}>
       <div className="h-full transition-all duration-700" style={{ width: `${p}%`, backgroundColor: color }} />
@@ -37,9 +33,7 @@ export default async function Dashboard({ searchParams }: PageProps) {
   } catch {
     return (
       <main className="min-h-screen flex items-center justify-center pb-20" style={{ backgroundColor: 'var(--bg)' }}>
-        <div className="text-center p-8">
-          <p className="text-[14px]" style={{ color: 'var(--ink-3)' }}>🔌 Нет подключения к БД</p>
-        </div>
+        <p className="text-[14px]" style={{ color: 'var(--ink-3)' }}>🔌 Нет подключения к БД</p>
         <Suspense><Nav /></Suspense>
       </main>
     );
@@ -56,10 +50,6 @@ export default async function Dashboard({ searchParams }: PageProps) {
   const activeCats = categories.filter((c: CategorySummary) => c.actual > 0 || c.planned > 0);
   const balance = total_income - total_actual;
 
-  // Fetch debts
-  let debts: { id: string; name: string; original_amount: number; remaining_amount: number }[] = [];
-  try { debts = await getActiveDebts(); } catch { /* table may not exist */ }
-
   let paceLine = '';
   let paceOver = false;
   if (hasPlan && days_elapsed > 0) {
@@ -71,70 +61,100 @@ export default async function Dashboard({ searchParams }: PageProps) {
     }
   }
 
+  let debts: { id: string; name: string; original_amount: number; remaining_amount: number }[] = [];
+  try { debts = await getActiveDebts(); } catch { /* table may not exist */ }
+  const totalDebt = debts.reduce((s, d) => s + d.remaining_amount, 0);
+
   return (
     <main className="min-h-screen pb-20" style={{ backgroundColor: 'var(--bg)' }}>
       <div className="max-w-lg mx-auto">
         <Suspense><MonthPicker /></Suspense>
 
-        {/* ── Compact hero ── */}
-        <header className="px-6 pt-1 pb-6">
-          <div className="flex items-end justify-between">
-            <div>
-              <p className="label-sm mb-1">Расходы</p>
-              <h1 className="display text-[36px]" style={{ color: 'var(--ink-1)' }}>
-                {formatTenge(total_actual)}
-              </h1>
-            </div>
-            <div className="text-right pb-0.5">
-              <p className="text-[11px]" style={{ color: 'var(--ink-4)' }}>
-                день {days_elapsed}/{days_in_month}
+        {/* ── Summary grid ── */}
+        <section className="px-6 pt-1 pb-4">
+          <p className="label-sm mb-3">{monthNameRu(month)} {year} · день {days_elapsed}/{days_in_month}</p>
+
+          {/* 2x2 grid: income, expenses, balance, debts */}
+          <div className="grid grid-cols-2 gap-x-6 gap-y-4">
+            {/* Income */}
+            <Link href={`/income?year=${year}&month=${month}`} className="block">
+              <p className="text-[10px] font-medium uppercase tracking-[0.08em] mb-0.5" style={{ color: 'var(--ink-4)' }}>
+                Доходы
               </p>
-              {hasPlan && (
-                <p
-                  className="text-[13px] font-semibold tabular mt-0.5"
-                  style={{
-                    color:
-                      budgetPct >= 100 ? 'var(--red)' :
-                      budgetPct >= 80 ? 'var(--amber)' :
-                      'var(--green)',
-                  }}
-                >
-                  {budgetPct}% из {formatTenge(total_planned)}
+              <p className="text-[22px] font-semibold tabular" style={{ color: total_income > 0 ? 'var(--green)' : 'var(--ink-4)', letterSpacing: '-0.02em' }}>
+                {total_income > 0 ? formatTenge(total_income) : '—'}
+              </p>
+            </Link>
+
+            {/* Expenses */}
+            <Link href={`/transactions?year=${year}&month=${month}`} className="block">
+              <p className="text-[10px] font-medium uppercase tracking-[0.08em] mb-0.5" style={{ color: 'var(--ink-4)' }}>
+                Расходы
+              </p>
+              <p className="text-[22px] font-semibold tabular" style={{ color: 'var(--ink-1)', letterSpacing: '-0.02em' }}>
+                {formatTenge(total_actual)}
+              </p>
+            </Link>
+
+            {/* Balance */}
+            {total_income > 0 && (
+              <div>
+                <p className="text-[10px] font-medium uppercase tracking-[0.08em] mb-0.5" style={{ color: 'var(--ink-4)' }}>
+                  Баланс
                 </p>
-              )}
-            </div>
-          </div>
-
-          {hasPlan && <div className="mt-3"><Bar percentage={budgetPct} /></div>}
-
-          {paceLine && (
-            <p className="text-[11px] mt-2" style={{ color: paceOver ? 'var(--red)' : 'var(--ink-3)' }}>
-              {paceLine}
-            </p>
-          )}
-
-          {/* Income row */}
-          {total_income > 0 && (
-            <div className="flex gap-6 mt-4 pt-3">
-              <div>
-                <p className="label-sm mb-0.5">Доход</p>
-                <p className="text-[14px] font-semibold tabular">{formatTenge(total_income)}</p>
-              </div>
-              <div>
-                <p className="label-sm mb-0.5">Баланс</p>
-                <p className="text-[14px] font-semibold tabular" style={{ color: balance >= 0 ? 'var(--green)' : 'var(--red)' }}>
+                <p className="text-[22px] font-semibold tabular" style={{ color: balance >= 0 ? 'var(--green)' : 'var(--red)', letterSpacing: '-0.02em' }}>
                   {balance >= 0 ? '+' : ''}{formatTenge(balance)}
                 </p>
               </div>
-            </div>
-          )}
-        </header>
+            )}
 
-        {/* ── Categories ── */}
+            {/* Debts */}
+            {totalDebt > 0 && (
+              <Link href="/debts" className="block">
+                <p className="text-[10px] font-medium uppercase tracking-[0.08em] mb-0.5" style={{ color: 'var(--ink-4)' }}>
+                  Долги
+                </p>
+                <p className="text-[22px] font-semibold tabular" style={{ color: 'var(--red)', letterSpacing: '-0.02em' }}>
+                  {formatTenge(totalDebt)}
+                </p>
+              </Link>
+            )}
+          </div>
+        </section>
+
+        {/* ── Budget progress ── */}
+        {hasPlan && (
+          <section className="px-6 pb-4">
+            <div className="flex items-center justify-between mb-1">
+              <span className="text-[11px]" style={{ color: 'var(--ink-4)' }}>
+                Бюджет: {formatTenge(total_actual)} из {formatTenge(total_planned)}
+              </span>
+              <span
+                className="text-[11px] font-semibold tabular"
+                style={{
+                  color: budgetPct >= 100 ? 'var(--red)' : budgetPct >= 80 ? 'var(--amber)' : 'var(--green)',
+                }}
+              >
+                {budgetPct}%
+              </span>
+            </div>
+            <Bar
+              percentage={budgetPct}
+              color={budgetPct >= 100 ? 'var(--red)' : budgetPct >= 80 ? 'var(--amber)' : 'var(--ink-1)'}
+            />
+            {paceLine && (
+              <p className="text-[11px] mt-1.5" style={{ color: paceOver ? 'var(--red)' : 'var(--ink-3)' }}>
+                {paceLine}
+              </p>
+            )}
+          </section>
+        )}
+
+        {/* ── Category breakdown ── */}
         {activeCats.length > 0 ? (
-          <>
+          <section className="pt-2">
             <div className="px-6 pb-2 flex items-center justify-between">
-              <h2 className="label-sm">Статьи</h2>
+              <h2 className="label-sm">Расходы по статьям</h2>
               <Link
                 href={`/plan?year=${year}&month=${month}`}
                 className="text-[11px] font-medium hover:opacity-60 transition-opacity"
@@ -165,9 +185,12 @@ export default async function Dashboard({ searchParams }: PageProps) {
                           {formatTenge(c.actual)}
                         </span>
                       </div>
-                      {c.planned > 0 ? (
+                      {c.planned > 0 && (
                         <>
-                          <Bar percentage={c.percentage} />
+                          <Bar
+                            percentage={c.percentage}
+                            color={c.percentage >= 100 ? 'var(--red)' : c.percentage >= 80 ? 'var(--amber)' : 'var(--ink-1)'}
+                          />
                           <div className="flex items-center justify-between mt-1">
                             <span className="text-[10px]" style={{ color: 'var(--ink-4)' }}>
                               {c.remaining > 0 ? `ост. ${formatTenge(c.remaining)}` : c.remaining < 0 ? `+${formatTenge(Math.abs(c.remaining))} сверх` : ''}
@@ -180,58 +203,19 @@ export default async function Dashboard({ searchParams }: PageProps) {
                             </span>
                           </div>
                         </>
-                      ) : null}
+                      )}
                     </div>
                   </div>
                 );
               })}
             </div>
-          </>
+          </section>
         ) : (
-          <div className="text-center py-16 px-8">
+          <div className="text-center py-12 px-8">
             <p className="text-[14px]" style={{ color: 'var(--ink-3)' }}>
               Отправьте расход в бот: <span className="font-semibold" style={{ color: 'var(--ink-1)' }}>кофе 1200</span>
             </p>
           </div>
-        )}
-        {/* ── Debts section ── */}
-        {debts.length > 0 && (
-          <section className="px-6 pt-6 pb-4">
-            <h2 className="label-sm mb-3">Долги</h2>
-            {(() => {
-              const totalDebt = debts.reduce((s, d) => s + d.remaining_amount, 0);
-              const totalOriginal = debts.reduce((s, d) => s + d.original_amount, 0);
-              const paidOff = totalOriginal - totalDebt;
-              const pct = totalOriginal > 0 ? Math.round((paidOff / totalOriginal) * 100) : 0;
-              return (
-                <>
-                  <div className="flex items-baseline justify-between mb-2">
-                    <span className="text-[20px] font-semibold tabular display" style={{ color: 'var(--red)' }}>
-                      {formatTenge(totalDebt)}
-                    </span>
-                    <span className="text-[11px]" style={{ color: 'var(--ink-4)' }}>
-                      погашено {pct}%
-                    </span>
-                  </div>
-                  <div className="w-full h-[2px] overflow-hidden mb-3" style={{ backgroundColor: 'var(--ink-6)' }}>
-                    <div className="h-full transition-all duration-700" style={{ width: `${pct}%`, backgroundColor: 'var(--green)' }} />
-                  </div>
-                  {debts.map((d, idx) => (
-                    <div
-                      key={d.id}
-                      className="flex items-center justify-between py-2"
-                      style={{ borderBottom: idx === debts.length - 1 ? 'none' : '1px solid var(--ink-6)' }}
-                    >
-                      <span className="text-[13px]" style={{ color: 'var(--ink-2)' }}>{d.name}</span>
-                      <span className="text-[13px] font-semibold tabular" style={{ color: 'var(--ink-1)' }}>
-                        {formatTenge(d.remaining_amount)}
-                      </span>
-                    </div>
-                  ))}
-                </>
-              );
-            })()}
-          </section>
         )}
       </div>
       <Suspense><Nav /></Suspense>
