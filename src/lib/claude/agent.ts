@@ -197,21 +197,25 @@ async function executeTool(
 
       const total = summary.total_actual;
 
-      // Compact format: month + total on ONE line
-      let text = `📊 ${monthNameRu(mo)} — ${formatTenge(total)}`;
-      if (summary.total_planned > 0) {
-        const pct = Math.round((total / summary.total_planned) * 100);
-        text += ` из ${formatTenge(summary.total_planned)} (${pct}%)`;
-      }
-      text += '\n';
+      // Sort categories by amount descending
+      const sorted = [...activeCats].sort(
+        (a: { actual: number }, b: { actual: number }) => b.actual - a.actual
+      );
 
-      // Each category with % of total
-      for (const c of activeCats) {
+      // Header line
+      let text = `📊 ${monthNameRu(mo)} ${year} — Всего: ${formatTenge(total)}`;
+      if (summary.total_planned > 0) {
+        text += ` из ${formatTenge(summary.total_planned)}`;
+      }
+      text += '\n\n';
+
+      // Each category: dash prefix, sorted by amount, % in parentheses
+      for (const c of sorted) {
         const cat = c as { category: { emoji: string; name: string }; actual: number; planned: number; percentage: number };
         const share = total > 0 ? Math.round((cat.actual / total) * 100) : 0;
-        text += `${cat.category.emoji} ${cat.category.name}: ${formatTenge(cat.actual)} · ${share}%`;
+        text += `- ${cat.category.emoji} ${cat.category.name}: ${formatTenge(cat.actual)} (${share}%)`;
         if (cat.planned > 0) {
-          text += ` (${cat.percentage}% плана)`;
+          text += ` · ${cat.percentage}% плана`;
         }
         text += '\n';
       }
@@ -219,7 +223,7 @@ async function executeTool(
       // Income/balance if present
       if (summary.total_income > 0) {
         const balance = summary.total_income - total;
-        text += `\n📥 ${formatTenge(summary.total_income)} доход · ${balance >= 0 ? '+' : ''}${formatTenge(balance)} баланс`;
+        text += `\n📥 Доход: ${formatTenge(summary.total_income)} · Баланс: ${balance >= 0 ? '+' : ''}${formatTenge(balance)}`;
       }
 
       return text.trim();
