@@ -3,7 +3,7 @@ import { currentMonthAlmaty, formatTenge, monthNameRu } from '@/lib/utils';
 import { getMonthSummary, getActiveDebts } from '@/lib/db/queries';
 import type { CategorySummary } from '@/types';
 import Link from 'next/link';
-import MonthPicker from '@/components/month-picker';
+import MonthPickerWrapper from '@/components/month-picker-wrapper';
 import Nav from '@/components/nav';
 
 
@@ -70,7 +70,7 @@ export default async function Dashboard({ searchParams }: PageProps) {
     <main className="min-h-screen pb-20" style={{ backgroundColor: 'var(--bg)' }}>
       <div className="max-w-lg mx-auto">
 
-        <Suspense><MonthPicker /></Suspense>
+        <MonthPickerWrapper />
 
         {/* ── Summary grid ── */}
         <section className="px-6 pt-1 pb-4">

@@ -1,7 +1,7 @@
 import { Suspense } from 'react';
 import { currentMonthAlmaty, formatTenge } from '@/lib/utils';
 import { getMonthlyPlans, getCategories } from '@/lib/db/queries';
-import MonthPicker from '@/components/month-picker';
+import MonthPickerWrapper from '@/components/month-picker-wrapper';
 import Nav from '@/components/nav';
 import PlanForm from '@/components/plan-form';
 
@@ -38,7 +38,7 @@ export default async function PlanPage({ searchParams }: PageProps) {
   return (
     <main className="min-h-screen pb-20" style={{ backgroundColor: 'var(--bg)' }}>
       <div className="max-w-lg mx-auto">
-        <Suspense><MonthPicker /></Suspense>
+        <MonthPickerWrapper />
 
         <header className="px-6 pt-2 pb-6">
           <div className="flex items-end justify-between">
