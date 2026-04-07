@@ -4,6 +4,7 @@ import { getMonthTransactions, getCategories, getUsers } from '@/lib/db/queries'
 import MonthPicker from '@/components/month-picker';
 import Nav from '@/components/nav';
 import TransactionList from '@/components/transaction-list';
+import RefreshOnMount from '@/components/refresh-on-mount';
 
 export const dynamic = 'force-dynamic';
 
@@ -44,8 +45,9 @@ export default async function TransactionsPage({ searchParams }: PageProps) {
   });
 
   return (
-    <main className="min-h-screen pb-20" style={{ backgroundColor: 'var(--bg-base)' }}>
+    <main className="min-h-screen pb-20" style={{ backgroundColor: 'var(--bg)' }}>
       <div className="max-w-lg mx-auto">
+        <RefreshOnMount />
         <Suspense><MonthPicker /></Suspense>
         <TransactionList items={items} />
       </div>

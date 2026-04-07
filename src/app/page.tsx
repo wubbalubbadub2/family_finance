@@ -5,6 +5,7 @@ import type { CategorySummary } from '@/types';
 import Link from 'next/link';
 import MonthPicker from '@/components/month-picker';
 import Nav from '@/components/nav';
+import RefreshOnMount from '@/components/refresh-on-mount';
 
 export const dynamic = 'force-dynamic';
 
@@ -68,6 +69,7 @@ export default async function Dashboard({ searchParams }: PageProps) {
   return (
     <main className="min-h-screen pb-20" style={{ backgroundColor: 'var(--bg)' }}>
       <div className="max-w-lg mx-auto">
+        <RefreshOnMount />
         <Suspense><MonthPicker /></Suspense>
 
         {/* ── Summary grid ── */}
