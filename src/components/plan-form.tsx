@@ -80,16 +80,21 @@ export default function PlanForm({
 
       <div className="h-24" />
 
-      <div className="fixed left-0 right-0 z-40 pointer-events-none" style={{ bottom: '72px' }}>
+      <div className="fixed left-0 right-0 z-40 pointer-events-none" style={{ bottom: '56px' }}>
         <div
-          className="max-w-lg mx-auto px-6 pb-3 pt-6 pointer-events-auto"
-          style={{ background: 'linear-gradient(to top, var(--bg) 40%, transparent)' }}
+          className="max-w-lg mx-auto px-6 pb-3 pt-8 pointer-events-auto"
+          style={{ background: 'linear-gradient(to top, var(--bg) 50%, transparent)' }}
         >
           <button
             onClick={savePlans}
             disabled={saving}
-            className="w-full py-4 rounded-full text-[14px] font-semibold transition-all active:scale-[0.98] disabled:opacity-40"
-            style={{ backgroundColor: saved ? 'var(--green)' : 'var(--ink-1)', color: '#ffffff' }}
+            className="w-full py-3 text-[13px] font-semibold transition-all active:scale-[0.98] disabled:opacity-40"
+            style={{
+              backgroundColor: saved ? 'var(--green)' : 'var(--bg)',
+              color: saved ? '#fff' : 'var(--ink-1)',
+              border: saved ? 'none' : '1px solid var(--ink-5)',
+              borderRadius: '8px',
+            }}
           >
             {saving ? 'Сохраняю...' : saved ? 'Сохранено ✓' : 'Сохранить план'}
           </button>
