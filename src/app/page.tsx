@@ -1,10 +1,8 @@
-import { Suspense } from 'react';
 import { currentMonthAlmaty, formatTenge, monthNameRu } from '@/lib/utils';
 import { getMonthSummary, getActiveDebts } from '@/lib/db/queries';
 import type { CategorySummary } from '@/types';
 import Link from 'next/link';
 import MonthPickerWrapper from '@/components/month-picker-wrapper';
-import Nav from '@/components/nav';
 
 
 export const dynamic = 'force-dynamic';
@@ -35,7 +33,6 @@ export default async function Dashboard({ searchParams }: PageProps) {
     return (
       <main className="min-h-screen flex items-center justify-center pb-20" style={{ backgroundColor: 'var(--bg)' }}>
         <p className="text-[14px]" style={{ color: 'var(--ink-3)' }}>🔌 Нет подключения к БД</p>
-        <Suspense><Nav /></Suspense>
       </main>
     );
   }
@@ -220,7 +217,6 @@ export default async function Dashboard({ searchParams }: PageProps) {
           </div>
         )}
       </div>
-      <Suspense><Nav /></Suspense>
     </main>
   );
 }

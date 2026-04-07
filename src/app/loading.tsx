@@ -1,6 +1,3 @@
-import { Suspense } from 'react';
-import Nav from '@/components/nav';
-
 export default function Loading() {
   return (
     <main className="min-h-screen pb-20 animate-pulse" style={{ backgroundColor: 'var(--bg)' }}>
@@ -23,7 +20,6 @@ export default function Loading() {
           </div>
         </div>
       </div>
-      <Suspense><Nav /></Suspense>
     </main>
   );
 }

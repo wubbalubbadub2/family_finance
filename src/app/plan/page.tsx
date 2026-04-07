@@ -1,8 +1,6 @@
-import { Suspense } from 'react';
 import { currentMonthAlmaty, formatTenge } from '@/lib/utils';
 import { getMonthlyPlans, getCategories } from '@/lib/db/queries';
 import MonthPickerWrapper from '@/components/month-picker-wrapper';
-import Nav from '@/components/nav';
 import PlanForm from '@/components/plan-form';
 
 export const dynamic = 'force-dynamic';
@@ -53,7 +51,6 @@ export default async function PlanPage({ searchParams }: PageProps) {
 
         <PlanForm initialPlans={items} year={year} month={month} />
       </div>
-      <Suspense><Nav /></Suspense>
     </main>
   );
 }

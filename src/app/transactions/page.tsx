@@ -1,8 +1,6 @@
-import { Suspense } from 'react';
 import { currentMonthAlmaty } from '@/lib/utils';
 import { getMonthTransactions, getCategories, getUsers } from '@/lib/db/queries';
 import MonthPickerWrapper from '@/components/month-picker-wrapper';
-import Nav from '@/components/nav';
 import TransactionList from '@/components/transaction-list';
 
 
@@ -51,7 +49,6 @@ export default async function TransactionsPage({ searchParams }: PageProps) {
         <MonthPickerWrapper />
         <TransactionList items={items} />
       </div>
-      <Suspense><Nav /></Suspense>
     </main>
   );
 }

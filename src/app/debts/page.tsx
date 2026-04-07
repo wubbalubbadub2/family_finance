@@ -1,7 +1,5 @@
-import { Suspense } from 'react';
 import { formatTenge } from '@/lib/utils';
 import { getActiveDebts } from '@/lib/db/queries';
-import Nav from '@/components/nav';
 import DebtList from '@/components/debt-list';
 
 
@@ -52,7 +50,6 @@ export default async function DebtsPage() {
           <DebtList initialDebts={debts} />
         )}
       </div>
-      <Suspense><Nav /></Suspense>
     </main>
   );
 }

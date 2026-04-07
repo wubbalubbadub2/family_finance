@@ -1,5 +1,7 @@
 import type { Metadata, Viewport } from "next";
+import { Suspense } from "react";
 import { Inter } from "next/font/google";
+import Nav from "@/components/nav";
 import "./globals.css";
 
 const inter = Inter({
@@ -34,6 +36,7 @@ export default function RootLayout({
     <html lang="ru">
       <body className={`${inter.variable} font-sans antialiased`}>
         {children}
+        <Suspense><Nav /></Suspense>
       </body>
     </html>
   );

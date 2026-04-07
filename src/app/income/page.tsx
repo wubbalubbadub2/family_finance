@@ -1,8 +1,6 @@
-import { Suspense } from 'react';
 import { currentMonthAlmaty, formatTenge } from '@/lib/utils';
 import { getMonthTransactions, getUsers } from '@/lib/db/queries';
 import MonthPickerWrapper from '@/components/month-picker-wrapper';
-import Nav from '@/components/nav';
 
 
 export const dynamic = 'force-dynamic';
@@ -86,7 +84,6 @@ export default async function IncomePage({ searchParams }: PageProps) {
           </div>
         )}
       </div>
-      <Suspense><Nav /></Suspense>
     </main>
   );
 }
