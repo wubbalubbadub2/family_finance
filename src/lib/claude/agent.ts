@@ -141,20 +141,25 @@ function buildSystemPrompt(): string {
 - savings (Savings 💰): сбережения
 - misc (Разное 🎲): подарки, непредвиденное
 
-КРИТИЧЕСКИ ВАЖНО: результаты tools содержат ГОТОВЫЙ текст для пользователя. Твоя задача — вывести этот текст ДОСЛОВНО, ОДИН В ОДИН, без изменений. ЗАПРЕЩЕНО: переписывать, перефразировать, менять формат, добавлять маркеры "-", менять порядок строк, добавлять "Итог" или другие заголовки. Просто скопируй текст из tool result как есть.
+⚠️ САМОЕ ВАЖНОЕ ПРАВИЛО (нарушение = потеря денег):
+ЗАПРЕЩЕНО говорить "записано", "добавлено", "сохранено" если ты НЕ ВЫЗВАЛ tool record_expense/record_income/record_debt.
+Без вызова tool — данные НЕ СОХРАНЕНЫ в базе. Ты ОБЯЗАН вызвать tool.
+Если пользователь хочет записать расход — ВСЕГДА вызывай record_expense. Без исключений.
+Если пользователь подтверждает "да, запиши" — вызывай tool, НЕ ГОВОРИ "уже записано".
+
+Результаты tools содержат ГОТОВЫЙ текст — выводи его ДОСЛОВНО, не переписывай.
 
 Правила:
-1. Расход (напр. "такси 2500") — вызови record_expense + get_month_summary. Выведи оба результата подряд.
+1. Расход (напр. "такси 2500", "да, запиши", подтверждение) — ВСЕГДА вызови record_expense + get_month_summary.
 2. Вопрос про бюджет/расходы/план — вызови get_month_summary.
-3. Показать транзакции — используй get_recent_transactions
-4. Удалить/отменить — используй undo_last
-5. Установить план/бюджет — используй set_plan
-6. Доход (напр. "зарплата 500000") — используй record_income. Доход = заработанные деньги.
-7. Долг (напр. "взял в долг 100000 Дудар", "занял 50000") — используй record_debt. Долг ≠ доход.
-8. Оплата кредита (напр. "кредит дудар 30000") — record_expense в категории credit. Имя кредитора пиши в comment — долг автоматически уменьшится.
+3. Показать транзакции — используй get_recent_transactions.
+4. Удалить/отменить — используй undo_last.
+5. Установить план/бюджет — используй set_plan.
+6. Доход (напр. "зарплата 500000") — ВСЕГДА вызови record_income.
+7. Долг (напр. "взял в долг 100000 Дудар") — ВСЕГДА вызови record_debt.
+8. Оплата кредита (напр. "кредит дудар 30000") — record_expense с категорией credit, имя в comment.
 9. Спросить про долги — используй get_debts.
-10. Если непонятно — переспроси.
-8. Ты можешь вызвать несколько tools за один ход если нужно (напр. записать расход и показать итог).`;
+10. Если непонятно — переспроси. НЕ УГАДЫВАЙ.`;
 }
 
 interface ToolResult {
@@ -454,8 +459,9 @@ export async function chat(
   messages.push({ role: 'user', content: `[${userName}]: ${userMessage}` });
   try { await saveMessage(chatId, 'user', `[${userName}]: ${userMessage}`); } catch { /* */ }
 
-  // Tool-use loop: track final reply across iterations, save ONCE at the end
+  // Tool-use loop: track final reply and which write tools were called
   let finalReply = '';
+  const toolsCalled = new Set<string>();
 
   for (let i = 0; i < 5; i++) {
     const response = await client.messages.create({
@@ -474,11 +480,12 @@ export async function chat(
     // No tool calls — Claude is done
     if (toolUses.length === 0) break;
 
-    // Push assistant turn + tool results for next iteration (in-memory only)
+    // Execute tools and track which ones were called
     messages.push({ role: 'assistant', content: response.content });
     const toolResults: ToolResult[] = [];
     for (const block of toolUses) {
       if (block.type === 'tool_use') {
+        toolsCalled.add(block.name);
         const result = await executeTool(block.name, block.input as Record<string, unknown>, user.id);
         toolResults.push({ tool_use_id: block.id, content: result });
       }
@@ -497,7 +504,18 @@ export async function chat(
 
   if (!finalReply) finalReply = '🤔';
 
-  // Save ONLY the final text reply (no tool_use blocks ever persisted)
+  // SAFETY NET: Detect if Claude claims to have saved but didn't call a write tool.
+  // This catches hallucinated confirmations like "уже записано" without tool use.
+  const WRITE_TOOLS = ['record_expense', 'record_income', 'record_debt'];
+  const SAVE_WORDS = /записан|добавлен|сохранен|зафиксирован|внес[ёе]н/i;
+  const calledWriteTool = WRITE_TOOLS.some(t => toolsCalled.has(t));
+
+  if (!calledWriteTool && SAVE_WORDS.test(finalReply)) {
+    // Claude claimed to save something but never called a write tool — this is a hallucination
+    finalReply = '⚠️ Данные НЕ были сохранены. Пожалуйста, напишите расход ещё раз в формате: кофе 1200';
+    console.error('[SAFETY] Claude hallucinated save without tool call. Original reply stripped.');
+  }
+
   try { await saveMessage(chatId, 'assistant', finalReply); } catch { /* */ }
   return finalReply;
 }
