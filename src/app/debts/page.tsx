@@ -3,7 +3,7 @@ import { formatTenge } from '@/lib/utils';
 import { getActiveDebts } from '@/lib/db/queries';
 import Nav from '@/components/nav';
 import DebtList from '@/components/debt-list';
-import RefreshOnMount from '@/components/refresh-on-mount';
+
 
 export const dynamic = 'force-dynamic';
 
@@ -19,7 +19,7 @@ export default async function DebtsPage() {
   return (
     <main className="min-h-screen pb-20" style={{ backgroundColor: 'var(--bg)' }}>
       <div className="max-w-lg mx-auto">
-        <RefreshOnMount />
+
         <header className="px-6 pt-8 pb-6">
           <p className="label-sm mb-1">Долги</p>
           {debts.length > 0 ? (

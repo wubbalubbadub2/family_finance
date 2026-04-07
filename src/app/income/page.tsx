@@ -3,7 +3,7 @@ import { currentMonthAlmaty, formatTenge } from '@/lib/utils';
 import { getMonthTransactions, getUsers } from '@/lib/db/queries';
 import MonthPicker from '@/components/month-picker';
 import Nav from '@/components/nav';
-import RefreshOnMount from '@/components/refresh-on-mount';
+
 
 export const dynamic = 'force-dynamic';
 
@@ -38,7 +38,7 @@ export default async function IncomePage({ searchParams }: PageProps) {
   return (
     <main className="min-h-screen pb-20" style={{ backgroundColor: 'var(--bg)' }}>
       <div className="max-w-lg mx-auto">
-        <RefreshOnMount />
+
         <Suspense><MonthPicker /></Suspense>
 
         <header className="px-6 pt-1 pb-6">
