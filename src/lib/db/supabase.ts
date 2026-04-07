@@ -10,7 +10,14 @@ function getClient(): SupabaseClient {
   if (!url) throw new Error('Missing SUPABASE_URL');
   if (!key) throw new Error('Missing SUPABASE_SERVICE_KEY');
 
-  client = createClient(url, key);
+  client = createClient(url, key, {
+    global: {
+      // CRITICAL: Tell Next.js to NEVER cache Supabase fetch calls.
+      // Without this, Next.js Data Cache returns stale query results
+      // even after new transactions are inserted.
+      fetch: (input, init) => fetch(input, { ...init, cache: 'no-store' }),
+    },
+  });
   return client;
 }
 
