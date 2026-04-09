@@ -435,6 +435,141 @@ async function executeTool(
   }
 }
 
+/**
+ * Record expenses directly — deterministic, no hallucination possible.
+ * Uses Claude ONLY for categorization, not for the decision to insert.
+ */
+async function recordExpensesDirect(
+  expenses: { amount: number; description: string }[],
+  userId: string,
+  chatId: number,
+): Promise<string> {
+  const results: string[] = [];
+  const errors: string[] = [];
+
+  for (const exp of expenses) {
+    // Use Claude to categorize (small, focused call)
+    let categorySlug = 'misc';
+    try {
+      const catResponse = await client.messages.create({
+        model: MODEL,
+        max_tokens: 50,
+        system: `Определи категорию расхода. Верни ТОЛЬКО slug из списка: home, food, transport, cafe, baby, health, credit, personal, savings, misc. Ничего больше.`,
+        messages: [{ role: 'user', content: exp.description }],
+      });
+      const text = catResponse.content[0]?.type === 'text' ? catResponse.content[0].text.trim().toLowerCase() : '';
+      if (VALID_SLUGS.includes(text as CategorySlug)) {
+        categorySlug = text;
+      }
+    } catch {
+      // Fallback to misc if Claude fails
+    }
+
+    const category = await getCategoryBySlug(categorySlug);
+    if (!category) continue;
+
+    try {
+      await insertTransaction({
+        user_id: userId,
+        category_id: category.id,
+        type: 'expense',
+        amount: exp.amount,
+        comment: exp.description,
+        source: 'telegram',
+        transaction_date: todayAlmaty(),
+      });
+
+      // Auto-reduce debt if credit category
+      let debtNote = '';
+      if (categorySlug === 'credit') {
+        const debt = await payDebt(exp.description, exp.amount);
+        if (debt) {
+          debtNote = debt.remaining_amount > 0
+            ? ` · долг ${debt.name}: ост. ${formatTenge(debt.remaining_amount)}`
+            : ` · 🎉 долг ${debt.name} погашен!`;
+        }
+      }
+
+      results.push(`✅ ${category.emoji} ${category.name} — ${formatTenge(exp.amount)} (${exp.description})${debtNote}`);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      errors.push(`❌ ${exp.description} ${formatTenge(exp.amount)}: ${msg}`);
+    }
+  }
+
+  // Get month summary
+  const { year, month } = currentMonthAlmaty();
+  const summary = await getMonthSummary(year, month);
+  const total = summary.total_actual;
+  const activeCats = summary.categories.filter(
+    (c: { actual: number; planned: number }) => c.actual > 0 || c.planned > 0
+  );
+  const sorted = [...activeCats].sort(
+    (a: { actual: number }, b: { actual: number }) => b.actual - a.actual
+  );
+
+  let reply = results.join('\n');
+  if (errors.length > 0) reply += '\n' + errors.join('\n');
+
+  reply += `\n\n📊 ${monthNameRu(month)} ${year} — Всего: ${formatTenge(total)}`;
+  if (summary.total_planned > 0) {
+    reply += ` из ${formatTenge(summary.total_planned)}`;
+  }
+  reply += '\n\n';
+  for (const c of sorted) {
+    const cat = c as { category: { emoji: string; name: string }; actual: number; planned: number; percentage: number };
+    const share = total > 0 ? Math.round((cat.actual / total) * 100) : 0;
+    reply += `- ${cat.category.emoji} ${cat.category.name}: ${formatTenge(cat.actual)} (${share}%)`;
+    if (cat.planned > 0) reply += ` · ${cat.percentage}% плана`;
+    reply += '\n';
+  }
+
+  if (summary.total_income > 0) {
+    const balance = summary.total_income - total;
+    reply += `\n📥 Доход: ${formatTenge(summary.total_income)} · Баланс: ${balance >= 0 ? '+' : ''}${formatTenge(balance)}`;
+  }
+
+  try { await saveMessage(chatId, 'user', `[expense]: ${expenses.map(e => `${e.description} ${e.amount}`).join(', ')}`); } catch { /* */ }
+  try { await saveMessage(chatId, 'assistant', reply.trim()); } catch { /* */ }
+
+  return reply.trim();
+}
+
+/**
+ * Try to parse expense-like lines from a message.
+ * Returns parsed expenses or null if the message isn't clearly expense input.
+ * Handles multiple expenses in one message (one per line).
+ */
+function tryParseExpenses(text: string): { amount: number; description: string }[] | null {
+  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+  const results: { amount: number; description: string }[] = [];
+
+  for (const line of lines) {
+    // Pattern: "description amount" or "amount description"
+    const match1 = line.match(/^(.+?)\s+(\d[\d\s]*\d|\d+)\s*$/);  // "хлеб 200"
+    const match2 = line.match(/^(\d[\d\s]*\d|\d+)\s+(.+?)$/);      // "200 хлеб"
+
+    if (match1) {
+      const amount = parseInt(match1[2].replace(/\s/g, ''), 10);
+      if (amount > 0 && amount <= 10_000_000) {
+        results.push({ amount, description: match1[1].trim() });
+      }
+    } else if (match2) {
+      const amount = parseInt(match2[1].replace(/\s/g, ''), 10);
+      if (amount > 0 && amount <= 10_000_000) {
+        results.push({ amount, description: match2[2].trim() });
+      }
+    }
+  }
+
+  // Only return if ALL non-empty lines matched as expenses
+  const nonEmptyLines = lines.filter(l => !l.match(/^(вот|эти|тоже|не вижу|транзакции|расходы?)/i));
+  if (results.length > 0 && results.length >= nonEmptyLines.length * 0.5) {
+    return results;
+  }
+  return null;
+}
+
 export async function chat(
   userMessage: string,
   telegramId: number,
@@ -443,6 +578,12 @@ export async function chat(
 ): Promise<string> {
   const user = await getUserByTelegramId(telegramId);
   if (!user) return '⛔ Пользователь не найден в системе.';
+
+  // FAST PATH: If message looks like expense(s), record directly without Claude
+  const parsedExpenses = tryParseExpenses(userMessage);
+  if (parsedExpenses && parsedExpenses.length > 0) {
+    return await recordExpensesDirect(parsedExpenses, user.id, chatId);
+  }
 
   // Load conversation history (clean text pairs only)
   let history: { role: string; content: string }[] = [];
