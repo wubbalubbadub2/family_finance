@@ -9,7 +9,6 @@ import {
   getLastTransaction,
   getLastNTransactionsFamily,
   getMonthSummary,
-  upsertMonthlyPlan,
   getRecentMessages,
   saveMessage,
   addDebt,
@@ -26,447 +25,123 @@ const VALID_SLUGS: CategorySlug[] = [
   'health', 'credit', 'personal', 'savings', 'misc',
 ];
 
-const TOOLS: Anthropic.Tool[] = [
-  {
-    name: 'record_expense',
-    description: 'Record a new expense. Use when user mentions spending money.',
-    input_schema: {
-      type: 'object' as const,
-      properties: {
-        amount: { type: 'number', description: 'Amount in tenge' },
-        category_slug: { type: 'string', enum: VALID_SLUGS, description: 'Category' },
-        comment: { type: 'string', description: 'Brief description' },
-      },
-      required: ['amount', 'category_slug'],
-    },
-  },
-  {
-    name: 'get_month_summary',
-    description: 'Get current month budget summary with plan vs actual per category. Use when user asks about budget status, how much spent, remaining, etc.',
-    input_schema: {
-      type: 'object' as const,
-      properties: {
-        year: { type: 'number' },
-        month: { type: 'number' },
-      },
-      required: ['year', 'month'],
-    },
-  },
-  {
-    name: 'get_recent_transactions',
-    description: 'Get recent transactions. Use when user asks to see expenses, last purchases, etc.',
-    input_schema: {
-      type: 'object' as const,
-      properties: {
-        count: { type: 'number', description: 'Number of transactions to fetch (max 20)', default: 10 },
-      },
-      required: [],
-    },
-  },
-  {
-    name: 'undo_last',
-    description: 'Delete the last transaction. Use when user says undo, delete last, made a mistake, etc.',
-    input_schema: {
-      type: 'object' as const,
-      properties: {},
-      required: [],
-    },
-  },
-  {
-    name: 'set_plan',
-    description: 'Set the budget plan for a category for a given month. Use when user wants to set or change budget.',
-    input_schema: {
-      type: 'object' as const,
-      properties: {
-        category_slug: { type: 'string', enum: VALID_SLUGS },
-        amount: { type: 'number', description: 'Planned budget in tenge' },
-        year: { type: 'number' },
-        month: { type: 'number' },
-      },
-      required: ['category_slug', 'amount', 'year', 'month'],
-    },
-  },
-  {
-    name: 'record_income',
-    description: 'Record income (salary, bonus, refund, gift received). Use when user mentions EARNING money, getting paid. NOT for loans/debts.',
-    input_schema: {
-      type: 'object' as const,
-      properties: {
-        amount: { type: 'number', description: 'Income amount in tenge' },
-        comment: { type: 'string', description: 'Source of income (зарплата, бонус, etc.)' },
-      },
-      required: ['amount'],
-    },
-  },
-  {
-    name: 'record_debt',
-    description: 'Record taking on debt / borrowing money. Use when user says "взял в долг", "одолжил", "занял". NOT income — this is borrowed money that must be paid back.',
-    input_schema: {
-      type: 'object' as const,
-      properties: {
-        amount: { type: 'number', description: 'Amount borrowed in tenge' },
-        name: { type: 'string', description: 'Who the debt is from (person or bank name)' },
-      },
-      required: ['amount', 'name'],
-    },
-  },
-  {
-    name: 'get_debts',
-    description: 'Show active debts. Use when user asks about debts, how much they owe, долги.',
-    input_schema: {
-      type: 'object' as const,
-      properties: {},
-      required: [],
-    },
-  },
-];
+// ═══════════════════════════════════════════════════════════════
+// PATTERN DETECTION — determine user intent from text
+// ═══════════════════════════════════════════════════════════════
 
-function buildSystemPrompt(): string {
-  const { year, month } = currentMonthAlmaty();
-  const today = todayAlmaty();
+function tryParseExpenses(text: string): { amount: number; description: string }[] | null {
+  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+  const results: { amount: number; description: string }[] = [];
 
-  return `Ты — семейный финансовый ассистент бот. Общаешься на русском языке, кратко и по делу.
+  for (const line of lines) {
+    const match1 = line.match(/^(.+?)\s+(\d[\d\s]*\d|\d+)\s*$/);
+    const match2 = line.match(/^(\d[\d\s]*\d|\d+)\s+(.+?)$/);
 
-Сегодня: ${today}. Текущий месяц: ${monthNameRu(month)} ${year}.
-
-Категории расходов:
-- home (Жильё 🏠): квартира, коммуналка, аренда
-- food (Продукты 🛒): магазин, еда домой
-- transport (Транспорт 🚗): такси, бензин, автобус
-- cafe (Кафе & выход ☕): кофе, рестораны, обеды вне дома
-- baby (Балапанчик 👶): ребёнок, памперсы, педиатр
-- health (Здоровье 💊): аптека, врачи
-- credit (Кредиты 💳): платежи по кредитам
-- personal (Личное 🎯): стрижка, одежда, подписки
-- savings (Savings 💰): сбережения
-- misc (Разное 🎲): подарки, непредвиденное
-
-⚠️ САМОЕ ВАЖНОЕ ПРАВИЛО (нарушение = потеря денег):
-ЗАПРЕЩЕНО говорить "записано", "добавлено", "сохранено" если ты НЕ ВЫЗВАЛ tool record_expense/record_income/record_debt.
-Без вызова tool — данные НЕ СОХРАНЕНЫ в базе. Ты ОБЯЗАН вызвать tool.
-Если пользователь хочет записать расход — ВСЕГДА вызывай record_expense. Без исключений.
-Если пользователь подтверждает "да, запиши" — вызывай tool, НЕ ГОВОРИ "уже записано".
-
-Результаты tools содержат ГОТОВЫЙ текст — выводи его ДОСЛОВНО, не переписывай.
-
-Правила:
-1. Расход (напр. "такси 2500", "да, запиши", подтверждение) — ВСЕГДА вызови record_expense + get_month_summary.
-2. Вопрос про бюджет/расходы/план — вызови get_month_summary.
-3. Показать транзакции — используй get_recent_transactions.
-4. Удалить/отменить — используй undo_last.
-5. Установить план/бюджет — используй set_plan.
-6. Доход (напр. "зарплата 500000") — ВСЕГДА вызови record_income.
-7. Долг (напр. "взял в долг 100000 Дудар") — ВСЕГДА вызови record_debt.
-8. Оплата кредита (напр. "кредит дудар 30000") — record_expense с категорией credit, имя в comment.
-9. Спросить про долги — используй get_debts.
-10. Если непонятно — переспроси. НЕ УГАДЫВАЙ.`;
-}
-
-interface ToolResult {
-  tool_use_id: string;
-  content: string;
-}
-
-async function executeTool(
-  toolName: string,
-  input: Record<string, unknown>,
-  userId: string
-): Promise<string> {
-  switch (toolName) {
-    case 'record_expense': {
-      const slug = input.category_slug as CategorySlug;
-      const amount = Math.round(input.amount as number);
-      const comment = (input.comment as string) || undefined;
-
-      if (!Number.isFinite(amount) || amount <= 0) {
-        return JSON.stringify({
-          error: 'invalid_amount',
-          message: 'Сумма должна быть положительным числом. Попроси пользователя уточнить.',
-        });
-      }
-
-      const category = await getCategoryBySlug(slug);
-      if (!category) return JSON.stringify({ error: 'Category not found' });
-
-      try {
-        await insertTransaction({
-          user_id: userId,
-          category_id: category.id,
-          type: 'expense',
-          amount,
-          comment,
-          source: 'telegram',
-          transaction_date: todayAlmaty(),
-        });
-      } catch (insertErr) {
-        const msg = insertErr instanceof Error ? insertErr.message : String(insertErr);
-        console.error(`[TOOL] record_expense INSERT FAILED: ${msg}`);
-        return `❌ ОШИБКА: расход НЕ сохранён (${msg}). Попробуйте ещё раз.`;
-      }
-
-      // If category is 'credit' and comment has a name, auto-reduce that debt
-      let debtNote = '';
-      if (slug === 'credit' && comment) {
-        const debt = await payDebt(comment, amount);
-        if (debt) {
-          debtNote = debt.remaining_amount > 0
-            ? `\n📉 Долг ${debt.name}: осталось ${formatTenge(debt.remaining_amount)}`
-            : `\n🎉 Долг ${debt.name} полностью погашен!`;
-        }
-      }
-
-      const { year, month } = currentMonthAlmaty();
-      const summary = await getMonthSummary(year, month);
-      const catSummary = summary.categories.find((c: { category: { id: number } }) => c.category.id === category.id);
-
-      let response = `✅ ${category.emoji} ${category.name} — ${formatTenge(amount)}`;
-      if (comment) response += ` (${comment})`;
-      response += debtNote;
-
-      if (catSummary && catSummary.planned > 0) {
-        response += `\nПо статье: ${formatTenge(catSummary.actual)} из ${formatTenge(catSummary.planned)} (${catSummary.percentage}%)`;
-        if (catSummary.remaining > 0) {
-          response += ` — осталось ${formatTenge(catSummary.remaining)}`;
-        } else if (catSummary.remaining < 0) {
-          response += ` — перерасход ${formatTenge(Math.abs(catSummary.remaining))}`;
-        }
-      }
-
-      return response;
+    if (match1) {
+      const amount = parseInt(match1[2].replace(/\s/g, ''), 10);
+      if (amount > 0 && amount <= 10_000_000) results.push({ amount, description: match1[1].trim() });
+    } else if (match2) {
+      const amount = parseInt(match2[1].replace(/\s/g, ''), 10);
+      if (amount > 0 && amount <= 10_000_000) results.push({ amount, description: match2[2].trim() });
     }
-
-    case 'get_month_summary': {
-      const year = input.year as number;
-      const mo = input.month as number;
-      const summary = await getMonthSummary(year, mo);
-
-      const activeCats = summary.categories.filter(
-        (c: { actual: number; planned: number }) => c.actual > 0 || c.planned > 0
-      );
-
-      const total = summary.total_actual;
-
-      // Sort categories by amount descending
-      const sorted = [...activeCats].sort(
-        (a: { actual: number }, b: { actual: number }) => b.actual - a.actual
-      );
-
-      // Header line
-      let text = `📊 ${monthNameRu(mo)} ${year} — Всего: ${formatTenge(total)}`;
-      if (summary.total_planned > 0) {
-        text += ` из ${formatTenge(summary.total_planned)}`;
-      }
-      text += '\n\n';
-
-      // Each category: dash prefix, sorted by amount, % in parentheses
-      for (const c of sorted) {
-        const cat = c as { category: { emoji: string; name: string }; actual: number; planned: number; percentage: number };
-        const share = total > 0 ? Math.round((cat.actual / total) * 100) : 0;
-        text += `- ${cat.category.emoji} ${cat.category.name}: ${formatTenge(cat.actual)} (${share}%)`;
-        if (cat.planned > 0) {
-          text += ` · ${cat.percentage}% плана`;
-        }
-        text += '\n';
-      }
-
-      // Income/balance if present
-      if (summary.total_income > 0) {
-        const balance = summary.total_income - total;
-        text += `\n📥 Доход: ${formatTenge(summary.total_income)} · Баланс: ${balance >= 0 ? '+' : ''}${formatTenge(balance)}`;
-      }
-
-      return text.trim();
-    }
-
-    case 'get_recent_transactions': {
-      const count = Math.min((input.count as number) || 10, 20);
-      const txns = await getLastNTransactionsFamily(count);
-      const categories = await getCategories();
-      const catMap = new Map(categories.map(c => [c.id, c]));
-
-      const items = txns.map(t => {
-        const cat = t.category_id ? catMap.get(t.category_id) : null;
-        return {
-          date: t.transaction_date,
-          amount: t.amount,
-          category: cat ? `${cat.emoji} ${cat.name}` : '❓',
-          comment: t.comment,
-          type: t.type,
-        };
-      });
-
-      return JSON.stringify({ transactions: items, count: items.length });
-    }
-
-    case 'undo_last': {
-      const last = await getLastTransaction(userId);
-      if (!last) return JSON.stringify({ error: 'Нет транзакций для удаления' });
-
-      const categories = await getCategories();
-      const cat = categories.find(c => c.id === last.category_id);
-
-      await softDeleteTransaction(last.id);
-      return JSON.stringify({
-        deleted: true,
-        amount: last.amount,
-        category: cat ? `${cat.emoji} ${cat.name}` : '❓',
-        comment: last.comment,
-      });
-    }
-
-    case 'set_plan': {
-      const slug = input.category_slug as CategorySlug;
-      const amount = Math.round(input.amount as number);
-      const year = input.year as number;
-      const mo = input.month as number;
-
-      if (!Number.isFinite(amount) || amount < 0) {
-        return JSON.stringify({ error: 'invalid_amount', message: 'Бюджет не может быть отрицательным.' });
-      }
-
-      const category = await getCategoryBySlug(slug);
-      if (!category) return JSON.stringify({ error: 'Category not found' });
-
-      await upsertMonthlyPlan({
-        year,
-        month: mo,
-        category_id: category.id,
-        plan_type: 'expense',
-        amount,
-        created_by: userId,
-      });
-
-      return JSON.stringify({
-        success: true,
-        category_name: category.name,
-        category_emoji: category.emoji,
-        amount,
-        month: monthNameRu(mo),
-        year,
-      });
-    }
-
-    case 'record_income': {
-      const amount = Math.round(input.amount as number);
-      const comment = (input.comment as string) || undefined;
-
-      if (!Number.isFinite(amount) || amount <= 0) {
-        return JSON.stringify({
-          error: 'invalid_amount',
-          message: 'Сумма дохода должна быть положительной.',
-        });
-      }
-
-      try {
-        await insertTransaction({
-          user_id: userId,
-          category_id: null,
-          type: 'income',
-          amount,
-          comment,
-          source: 'telegram',
-          transaction_date: todayAlmaty(),
-        });
-      } catch (insertErr) {
-        const msg = insertErr instanceof Error ? insertErr.message : String(insertErr);
-        console.error(`[TOOL] record_income INSERT FAILED: ${msg}`);
-        return `❌ ОШИБКА: доход НЕ сохранён (${msg}). Попробуйте ещё раз.`;
-      }
-
-      const { year, month } = currentMonthAlmaty();
-      const summary = await getMonthSummary(year, month);
-      const balance = summary.total_income - summary.total_actual;
-
-      let response = `💰 Доход записан: ${formatTenge(amount)}`;
-      if (comment) response += ` (${comment})`;
-      response += `\n\n📥 Доход за ${monthNameRu(month)}: ${formatTenge(summary.total_income)}`;
-      response += `\n📤 Расходы: ${formatTenge(summary.total_actual)}`;
-      response += `\n💼 Баланс: ${balance >= 0 ? '+' : ''}${formatTenge(balance)}`;
-      return response;
-    }
-
-    case 'record_debt': {
-      const amount = Math.round(input.amount as number);
-      const name = (input.name as string);
-
-      if (!Number.isFinite(amount) || amount <= 0) {
-        return JSON.stringify({ error: 'invalid_amount', message: 'Сумма долга должна быть положительной.' });
-      }
-      if (!name) {
-        return JSON.stringify({ error: 'missing_name', message: 'Укажи имя кредитора.' });
-      }
-
-      const debt = await addDebt(name, amount);
-      const allDebts = await getActiveDebts();
-      const totalDebt = allDebts.reduce((s, d) => s + d.remaining_amount, 0);
-
-      let response = `📝 Долг записан: ${formatTenge(amount)} (${debt.name})`;
-      response += `\nОстаток по этому долгу: ${formatTenge(debt.remaining_amount)}`;
-      response += `\n\n💳 Всего долгов: ${formatTenge(totalDebt)}`;
-      for (const d of allDebts) {
-        response += `\n- ${d.name}: ${formatTenge(d.remaining_amount)}`;
-      }
-      return response;
-    }
-
-    case 'get_debts': {
-      const debts = await getActiveDebts();
-      if (debts.length === 0) {
-        return '🎉 Нет активных долгов!';
-      }
-
-      const totalDebt = debts.reduce((s, d) => s + d.remaining_amount, 0);
-      const totalOriginal = debts.reduce((s, d) => s + d.original_amount, 0);
-      const paidOff = totalOriginal - totalDebt;
-      const pct = totalOriginal > 0 ? Math.round((paidOff / totalOriginal) * 100) : 0;
-
-      let response = `💳 Долги — ${formatTenge(totalDebt)} осталось`;
-      response += `\n📊 Погашено ${formatTenge(paidOff)} из ${formatTenge(totalOriginal)} (${pct}%)`;
-      response += '\n';
-      for (const d of debts) {
-        const dPct = d.original_amount > 0 ? Math.round(((d.original_amount - d.remaining_amount) / d.original_amount) * 100) : 0;
-        response += `\n- ${d.name}: ${formatTenge(d.remaining_amount)} ост. (${dPct}% погашено)`;
-      }
-      return response;
-    }
-
-    default:
-      return JSON.stringify({ error: 'Unknown tool' });
   }
+
+  if (results.length > 0) return results;
+  return null;
 }
 
-/**
- * Record expenses directly — deterministic, no hallucination possible.
- * Uses Claude ONLY for categorization, not for the decision to insert.
- */
-async function recordExpensesDirect(
+function tryParseIncome(text: string): { amount: number; comment: string } | null {
+  const lower = text.toLowerCase();
+  const incomeWords = /зарплат|доход|получил|премия|бонус|фриланс|перевод|вернули/;
+  if (!incomeWords.test(lower)) return null;
+
+  const amountMatch = text.match(/(\d[\d\s]*\d|\d+)/);
+  if (!amountMatch) return null;
+  const amount = parseInt(amountMatch[1].replace(/\s/g, ''), 10);
+  if (amount <= 0) return null;
+
+  const comment = text.replace(amountMatch[0], '').replace(/тенге|тг|₸/gi, '').trim();
+  return { amount, comment: comment || 'доход' };
+}
+
+function tryParseDebt(text: string): { amount: number; name: string } | null {
+  const lower = text.toLowerCase();
+  if (!/взял в долг|занял|одолжил|кредит взял/i.test(lower)) return null;
+
+  const amountMatch = text.match(/(\d[\d\s]*\d|\d+)/);
+  if (!amountMatch) return null;
+  const amount = parseInt(amountMatch[1].replace(/\s/g, ''), 10);
+  if (amount <= 0) return null;
+
+  // Extract name: everything after the amount, or after "у"
+  let name = text.replace(amountMatch[0], '').replace(/взял в долг|занял|одолжил|кредит взял|тенге|тг|₸|у\s/gi, '').trim();
+  if (!name) name = 'без имени';
+  return { amount, name };
+}
+
+function isUndoRequest(text: string): boolean {
+  return /удали|отмени|undo|убери последн|верни назад|отмена/i.test(text);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// DETERMINISTIC DB HANDLERS — no hallucination possible
+// ═══════════════════════════════════════════════════════════════
+
+async function categorize(description: string): Promise<CategorySlug> {
+  try {
+    const res = await client.messages.create({
+      model: MODEL,
+      max_tokens: 50,
+      system: `Определи категорию расхода. Верни ТОЛЬКО slug: home, food, transport, cafe, baby, health, credit, personal, savings, misc`,
+      messages: [{ role: 'user', content: description }],
+    });
+    const text = res.content[0]?.type === 'text' ? res.content[0].text.trim().toLowerCase() : '';
+    if (VALID_SLUGS.includes(text as CategorySlug)) return text as CategorySlug;
+  } catch { /* fallback */ }
+  return 'misc';
+}
+
+function buildSummaryText(summary: ReturnType<typeof getMonthSummary> extends Promise<infer T> ? T : never): string {
+  const total = summary.total_actual;
+  const activeCats = summary.categories.filter(
+    (c: { actual: number; planned: number }) => c.actual > 0 || c.planned > 0
+  );
+  const sorted = [...activeCats].sort(
+    (a: { actual: number }, b: { actual: number }) => b.actual - a.actual
+  );
+
+  const { year, month } = currentMonthAlmaty();
+  let text = `📊 ${monthNameRu(month)} ${year} — Всего: ${formatTenge(total)}`;
+  if (summary.total_planned > 0) text += ` из ${formatTenge(summary.total_planned)}`;
+  text += '\n\n';
+
+  for (const c of sorted) {
+    const cat = c as { category: { emoji: string; name: string }; actual: number; planned: number; percentage: number };
+    const share = total > 0 ? Math.round((cat.actual / total) * 100) : 0;
+    text += `- ${cat.category.emoji} ${cat.category.name}: ${formatTenge(cat.actual)} (${share}%)`;
+    if (cat.planned > 0) text += ` · ${cat.percentage}% плана`;
+    text += '\n';
+  }
+
+  if (summary.total_income > 0) {
+    const balance = summary.total_income - total;
+    text += `\n📥 Доход: ${formatTenge(summary.total_income)} · Баланс: ${balance >= 0 ? '+' : ''}${formatTenge(balance)}`;
+  }
+
+  return text.trim();
+}
+
+async function handleExpenses(
   expenses: { amount: number; description: string }[],
   userId: string,
-  chatId: number,
 ): Promise<string> {
   const results: string[] = [];
   const errors: string[] = [];
 
   for (const exp of expenses) {
-    // Use Claude to categorize (small, focused call)
-    let categorySlug = 'misc';
-    try {
-      const catResponse = await client.messages.create({
-        model: MODEL,
-        max_tokens: 50,
-        system: `Определи категорию расхода. Верни ТОЛЬКО slug из списка: home, food, transport, cafe, baby, health, credit, personal, savings, misc. Ничего больше.`,
-        messages: [{ role: 'user', content: exp.description }],
-      });
-      const text = catResponse.content[0]?.type === 'text' ? catResponse.content[0].text.trim().toLowerCase() : '';
-      if (VALID_SLUGS.includes(text as CategorySlug)) {
-        categorySlug = text;
-      }
-    } catch {
-      // Fallback to misc if Claude fails
-    }
-
-    const category = await getCategoryBySlug(categorySlug);
-    if (!category) continue;
+    const slug = await categorize(exp.description);
+    const category = await getCategoryBySlug(slug);
+    if (!category) { errors.push(`❌ ${exp.description}: категория не найдена`); continue; }
 
     try {
       await insertTransaction({
@@ -479,96 +154,201 @@ async function recordExpensesDirect(
         transaction_date: todayAlmaty(),
       });
 
-      // Auto-reduce debt if credit category
-      let debtNote = '';
-      if (categorySlug === 'credit') {
+      let extra = '';
+      if (slug === 'credit') {
         const debt = await payDebt(exp.description, exp.amount);
         if (debt) {
-          debtNote = debt.remaining_amount > 0
+          extra = debt.remaining_amount > 0
             ? ` · долг ${debt.name}: ост. ${formatTenge(debt.remaining_amount)}`
             : ` · 🎉 долг ${debt.name} погашен!`;
         }
       }
 
-      results.push(`✅ ${category.emoji} ${category.name} — ${formatTenge(exp.amount)} (${exp.description})${debtNote}`);
+      results.push(`✅ ${category.emoji} ${category.name} — ${formatTenge(exp.amount)} (${exp.description})${extra}`);
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      errors.push(`❌ ${exp.description} ${formatTenge(exp.amount)}: ${msg}`);
+      errors.push(`❌ ${exp.description} ${formatTenge(exp.amount)}: ${e instanceof Error ? e.message : 'ошибка'}`);
     }
   }
 
-  // Get month summary
   const { year, month } = currentMonthAlmaty();
   const summary = await getMonthSummary(year, month);
-  const total = summary.total_actual;
-  const activeCats = summary.categories.filter(
-    (c: { actual: number; planned: number }) => c.actual > 0 || c.planned > 0
-  );
-  const sorted = [...activeCats].sort(
-    (a: { actual: number }, b: { actual: number }) => b.actual - a.actual
-  );
-
-  let reply = results.join('\n');
-  if (errors.length > 0) reply += '\n' + errors.join('\n');
-
-  reply += `\n\n📊 ${monthNameRu(month)} ${year} — Всего: ${formatTenge(total)}`;
-  if (summary.total_planned > 0) {
-    reply += ` из ${formatTenge(summary.total_planned)}`;
-  }
-  reply += '\n\n';
-  for (const c of sorted) {
-    const cat = c as { category: { emoji: string; name: string }; actual: number; planned: number; percentage: number };
-    const share = total > 0 ? Math.round((cat.actual / total) * 100) : 0;
-    reply += `- ${cat.category.emoji} ${cat.category.name}: ${formatTenge(cat.actual)} (${share}%)`;
-    if (cat.planned > 0) reply += ` · ${cat.percentage}% плана`;
-    reply += '\n';
-  }
-
-  if (summary.total_income > 0) {
-    const balance = summary.total_income - total;
-    reply += `\n📥 Доход: ${formatTenge(summary.total_income)} · Баланс: ${balance >= 0 ? '+' : ''}${formatTenge(balance)}`;
-  }
-
-  try { await saveMessage(chatId, 'user', `[expense]: ${expenses.map(e => `${e.description} ${e.amount}`).join(', ')}`); } catch { /* */ }
-  try { await saveMessage(chatId, 'assistant', reply.trim()); } catch { /* */ }
-
-  return reply.trim();
+  let reply = results.concat(errors).join('\n');
+  reply += '\n\n' + buildSummaryText(summary);
+  return reply;
 }
 
-/**
- * Try to parse expense-like lines from a message.
- * Returns parsed expenses or null if the message isn't clearly expense input.
- * Handles multiple expenses in one message (one per line).
- */
-function tryParseExpenses(text: string): { amount: number; description: string }[] | null {
-  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
-  const results: { amount: number; description: string }[] = [];
+async function handleIncome(income: { amount: number; comment: string }, userId: string): Promise<string> {
+  try {
+    await insertTransaction({
+      user_id: userId,
+      category_id: null,
+      type: 'income',
+      amount: income.amount,
+      comment: income.comment,
+      source: 'telegram',
+      transaction_date: todayAlmaty(),
+    });
+  } catch (e) {
+    return `❌ Доход НЕ сохранён: ${e instanceof Error ? e.message : 'ошибка'}`;
+  }
 
-  for (const line of lines) {
-    // Pattern: "description amount" or "amount description"
-    const match1 = line.match(/^(.+?)\s+(\d[\d\s]*\d|\d+)\s*$/);  // "хлеб 200"
-    const match2 = line.match(/^(\d[\d\s]*\d|\d+)\s+(.+?)$/);      // "200 хлеб"
+  const { year, month } = currentMonthAlmaty();
+  const summary = await getMonthSummary(year, month);
+  const balance = summary.total_income - summary.total_actual;
 
-    if (match1) {
-      const amount = parseInt(match1[2].replace(/\s/g, ''), 10);
-      if (amount > 0 && amount <= 10_000_000) {
-        results.push({ amount, description: match1[1].trim() });
-      }
-    } else if (match2) {
-      const amount = parseInt(match2[1].replace(/\s/g, ''), 10);
-      if (amount > 0 && amount <= 10_000_000) {
-        results.push({ amount, description: match2[2].trim() });
-      }
+  let reply = `💰 Доход записан: ${formatTenge(income.amount)} (${income.comment})`;
+  reply += `\n\n📥 Доход за ${monthNameRu(month)}: ${formatTenge(summary.total_income)}`;
+  reply += `\n📤 Расходы: ${formatTenge(summary.total_actual)}`;
+  reply += `\n💼 Баланс: ${balance >= 0 ? '+' : ''}${formatTenge(balance)}`;
+  return reply;
+}
+
+async function handleDebt(debt: { amount: number; name: string }): Promise<string> {
+  try {
+    const d = await addDebt(debt.name, debt.amount);
+    const allDebts = await getActiveDebts();
+    const totalDebt = allDebts.reduce((s, x) => s + x.remaining_amount, 0);
+
+    let reply = `📝 Долг записан: ${formatTenge(debt.amount)} (${d.name})`;
+    reply += `\nОстаток по этому долгу: ${formatTenge(d.remaining_amount)}`;
+    reply += `\n\n💳 Всего долгов: ${formatTenge(totalDebt)}`;
+    for (const x of allDebts) {
+      reply += `\n- ${x.name}: ${formatTenge(x.remaining_amount)}`;
     }
+    return reply;
+  } catch (e) {
+    return `❌ Долг НЕ записан: ${e instanceof Error ? e.message : 'ошибка'}`;
   }
-
-  // Only return if ALL non-empty lines matched as expenses
-  const nonEmptyLines = lines.filter(l => !l.match(/^(вот|эти|тоже|не вижу|транзакции|расходы?)/i));
-  if (results.length > 0 && results.length >= nonEmptyLines.length * 0.5) {
-    return results;
-  }
-  return null;
 }
+
+async function handleUndo(userId: string): Promise<string> {
+  const last = await getLastTransaction(userId);
+  if (!last) return '📭 Нет транзакций для удаления.';
+
+  const categories = await getCategories();
+  const cat = categories.find(c => c.id === last.category_id);
+
+  try {
+    await softDeleteTransaction(last.id);
+    return `🗑️ Удалено: ${cat?.emoji ?? ''} ${formatTenge(last.amount)}${last.comment ? ` — ${last.comment}` : ''}`;
+  } catch (e) {
+    return `❌ Не удалось удалить: ${e instanceof Error ? e.message : 'ошибка'}`;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// CLAUDE — read-only tools for questions and summaries
+// ═══════════════════════════════════════════════════════════════
+
+const READ_TOOLS: Anthropic.Tool[] = [
+  {
+    name: 'get_month_summary',
+    description: 'Get budget summary. Use when user asks about budget, expenses, remaining, plan.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        year: { type: 'number' },
+        month: { type: 'number' },
+      },
+      required: ['year', 'month'],
+    },
+  },
+  {
+    name: 'get_recent_transactions',
+    description: 'Get recent transactions. Use when user asks to see expenses list.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        count: { type: 'number', description: 'Max 20', default: 10 },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'get_debts',
+    description: 'Show active debts.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {},
+      required: [],
+    },
+  },
+];
+
+function buildSystemPrompt(): string {
+  const { year, month } = currentMonthAlmaty();
+  const today = todayAlmaty();
+
+  return `Ты — семейный финансовый ассистент. Кратко, на русском.
+
+Сегодня: ${today}. Месяц: ${monthNameRu(month)} ${year}.
+
+ВАЖНО: Ты НЕ МОЖЕШЬ записывать расходы, доходы или долги. У тебя нет tools для записи.
+Запись делает система автоматически. Ты только отвечаешь на вопросы и показываешь данные.
+
+Результаты tools — готовый текст. Выводи ДОСЛОВНО, не переформатируй.
+
+Если пользователь просит записать расход/доход/долг — скажи "Напишите в формате: кофе 1200"`;
+}
+
+interface ToolResult {
+  tool_use_id: string;
+  content: string;
+}
+
+async function executeReadTool(toolName: string, input: Record<string, unknown>): Promise<string> {
+  switch (toolName) {
+    case 'get_month_summary': {
+      const year = input.year as number;
+      const mo = input.month as number;
+      const summary = await getMonthSummary(year, mo);
+      return buildSummaryText(summary);
+    }
+
+    case 'get_recent_transactions': {
+      const count = Math.min((input.count as number) || 10, 20);
+      const txns = await getLastNTransactionsFamily(count);
+      const categories = await getCategories();
+      const catMap = new Map(categories.map(c => [c.id, c]));
+
+      if (txns.length === 0) return '📭 Нет транзакций.';
+
+      let text = `📋 Последние ${txns.length} записей:\n\n`;
+      for (const t of txns) {
+        const cat = t.category_id ? catMap.get(t.category_id) : null;
+        const icon = t.type === 'income' ? '📥' : (cat?.emoji ?? '❓');
+        text += `${t.transaction_date} | ${icon} ${formatTenge(t.amount)}`;
+        if (t.comment) text += ` — ${t.comment}`;
+        text += '\n';
+      }
+      return text.trim();
+    }
+
+    case 'get_debts': {
+      const debts = await getActiveDebts();
+      if (debts.length === 0) return '🎉 Нет активных долгов!';
+
+      const totalDebt = debts.reduce((s, d) => s + d.remaining_amount, 0);
+      const totalOriginal = debts.reduce((s, d) => s + d.original_amount, 0);
+      const paidOff = totalOriginal - totalDebt;
+      const pct = totalOriginal > 0 ? Math.round((paidOff / totalOriginal) * 100) : 0;
+
+      let text = `💳 Долги — ${formatTenge(totalDebt)} осталось`;
+      text += `\n📊 Погашено ${formatTenge(paidOff)} из ${formatTenge(totalOriginal)} (${pct}%)`;
+      for (const d of debts) {
+        text += `\n- ${d.name}: ${formatTenge(d.remaining_amount)}`;
+      }
+      return text;
+    }
+
+    default:
+      return 'Неизвестная команда.';
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// MAIN ENTRY POINT
+// ═══════════════════════════════════════════════════════════════
 
 export async function chat(
   userMessage: string,
@@ -579,49 +359,68 @@ export async function chat(
   const user = await getUserByTelegramId(telegramId);
   if (!user) return '⛔ Пользователь не найден в системе.';
 
-  // FAST PATH: If message looks like expense(s), record directly without Claude
-  const parsedExpenses = tryParseExpenses(userMessage);
-  if (parsedExpenses && parsedExpenses.length > 0) {
-    return await recordExpensesDirect(parsedExpenses, user.id, chatId);
+  const text = userMessage.trim();
+
+  // ── 1. Undo (deterministic) ──
+  if (isUndoRequest(text)) {
+    const reply = await handleUndo(user.id);
+    try { await saveMessage(chatId, 'user', `[${userName}]: ${text}`); } catch { /* */ }
+    try { await saveMessage(chatId, 'assistant', reply); } catch { /* */ }
+    return reply;
   }
 
-  // Load conversation history (clean text pairs only)
+  // ── 2. Debt (deterministic) ──
+  const debt = tryParseDebt(text);
+  if (debt) {
+    const reply = await handleDebt(debt);
+    try { await saveMessage(chatId, 'user', `[${userName}]: ${text}`); } catch { /* */ }
+    try { await saveMessage(chatId, 'assistant', reply); } catch { /* */ }
+    return reply;
+  }
+
+  // ── 3. Income (deterministic) ──
+  const income = tryParseIncome(text);
+  if (income) {
+    const reply = await handleIncome(income, user.id);
+    try { await saveMessage(chatId, 'user', `[${userName}]: ${text}`); } catch { /* */ }
+    try { await saveMessage(chatId, 'assistant', reply); } catch { /* */ }
+    return reply;
+  }
+
+  // ── 4. Expenses (deterministic) ──
+  const expenses = tryParseExpenses(text);
+  if (expenses) {
+    const reply = await handleExpenses(expenses, user.id);
+    try { await saveMessage(chatId, 'user', `[${userName}]: ${text}`); } catch { /* */ }
+    try { await saveMessage(chatId, 'assistant', reply); } catch { /* */ }
+    return reply;
+  }
+
+  // ── 5. Everything else → Claude (read-only tools) ──
   let history: { role: string; content: string }[] = [];
-  try {
-    history = await getRecentMessages(chatId, 10);
-  } catch {
-    // Table may not exist yet — continue without history
-  }
+  try { history = await getRecentMessages(chatId, 10); } catch { /* */ }
 
-  // Build messages array from history, dropping any dangling trailing user message
-  // (happens if previous turn errored before the assistant reply was saved)
   const messages: Anthropic.MessageParam[] = [];
   for (const msg of history) {
-    // Skip if messages would start with assistant
     if (messages.length === 0 && msg.role === 'assistant') continue;
-    // Skip duplicates to maintain alternation
     if (messages.length > 0 && messages[messages.length - 1].role === msg.role) continue;
     messages.push({ role: msg.role as 'user' | 'assistant', content: msg.content });
   }
-  // Drop dangling trailing user message (no assistant reply saved for it)
   if (messages.length > 0 && messages[messages.length - 1].role === 'user') {
     messages.pop();
   }
 
-  // Add current user message
-  messages.push({ role: 'user', content: `[${userName}]: ${userMessage}` });
-  try { await saveMessage(chatId, 'user', `[${userName}]: ${userMessage}`); } catch { /* */ }
+  messages.push({ role: 'user', content: `[${userName}]: ${text}` });
+  try { await saveMessage(chatId, 'user', `[${userName}]: ${text}`); } catch { /* */ }
 
-  // Tool-use loop: track final reply and which write tools were called
   let finalReply = '';
-  const toolsCalled = new Set<string>();
 
   for (let i = 0; i < 5; i++) {
     const response = await client.messages.create({
       model: MODEL,
       max_tokens: 1024,
       system: buildSystemPrompt(),
-      tools: TOOLS,
+      tools: READ_TOOLS,
       messages,
     });
 
@@ -630,16 +429,13 @@ export async function chat(
     const turnText = textBlocks.map(b => b.type === 'text' ? b.text : '').join('\n').trim();
     if (turnText) finalReply = turnText;
 
-    // No tool calls — Claude is done
     if (toolUses.length === 0) break;
 
-    // Execute tools and track which ones were called
     messages.push({ role: 'assistant', content: response.content });
     const toolResults: ToolResult[] = [];
     for (const block of toolUses) {
       if (block.type === 'tool_use') {
-        toolsCalled.add(block.name);
-        const result = await executeTool(block.name, block.input as Record<string, unknown>, user.id);
+        const result = await executeReadTool(block.name, block.input as Record<string, unknown>);
         toolResults.push({ tool_use_id: block.id, content: result });
       }
     }
@@ -656,18 +452,6 @@ export async function chat(
   }
 
   if (!finalReply) finalReply = '🤔';
-
-  // SAFETY NET: Detect if Claude claims to have saved but didn't call a write tool.
-  // Must match ALL Russian verb forms: записал/записала/записали/записано/записан,
-  // добавил/добавлено/добавлен, сохранил/сохранено, etc. Match root stems.
-  const WRITE_TOOLS = ['record_expense', 'record_income', 'record_debt'];
-  const SAVE_STEMS = /записа[лнвоие]|добави[лнвоие]|добавлен|сохрани[лнвоие]|сохранен|зафиксир|внес[ёел]|✅/i;
-  const calledWriteTool = WRITE_TOOLS.some(t => toolsCalled.has(t));
-
-  if (!calledWriteTool && SAVE_STEMS.test(finalReply)) {
-    console.error('[SAFETY] Hallucination caught. Tools called:', Array.from(toolsCalled), 'Reply had save words.');
-    finalReply = '⚠️ Данные НЕ были сохранены. Напишите каждый расход отдельным сообщением:\nкофе 1200';
-  }
 
   try { await saveMessage(chatId, 'assistant', finalReply); } catch { /* */ }
   return finalReply;
