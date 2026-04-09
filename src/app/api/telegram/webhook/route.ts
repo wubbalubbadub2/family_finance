@@ -2,6 +2,9 @@ import { NextRequest, NextResponse } from 'next/server';
 import { createBot } from '@/lib/bot/handlers';
 import { webhookCallback } from 'grammy';
 
+// Allow up to 60 seconds for bot processing (Claude API + DB writes)
+export const maxDuration = 60;
+
 // Create handler once (reused across invocations in the same lambda)
 let handler: ((req: Request) => Promise<Response>) | null = null;
 

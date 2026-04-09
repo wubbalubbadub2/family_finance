@@ -188,15 +188,21 @@ async function executeTool(
       const category = await getCategoryBySlug(slug);
       if (!category) return JSON.stringify({ error: 'Category not found' });
 
-      await insertTransaction({
-        user_id: userId,
-        category_id: category.id,
-        type: 'expense',
-        amount,
-        comment,
-        source: 'telegram',
-        transaction_date: todayAlmaty(),
-      });
+      try {
+        await insertTransaction({
+          user_id: userId,
+          category_id: category.id,
+          type: 'expense',
+          amount,
+          comment,
+          source: 'telegram',
+          transaction_date: todayAlmaty(),
+        });
+      } catch (insertErr) {
+        const msg = insertErr instanceof Error ? insertErr.message : String(insertErr);
+        console.error(`[TOOL] record_expense INSERT FAILED: ${msg}`);
+        return `❌ ОШИБКА: расход НЕ сохранён (${msg}). Попробуйте ещё раз.`;
+      }
 
       // If category is 'credit' and comment has a name, auto-reduce that debt
       let debtNote = '';
@@ -351,15 +357,21 @@ async function executeTool(
         });
       }
 
-      await insertTransaction({
-        user_id: userId,
-        category_id: null,
-        type: 'income',
-        amount,
-        comment,
-        source: 'telegram',
-        transaction_date: todayAlmaty(),
-      });
+      try {
+        await insertTransaction({
+          user_id: userId,
+          category_id: null,
+          type: 'income',
+          amount,
+          comment,
+          source: 'telegram',
+          transaction_date: todayAlmaty(),
+        });
+      } catch (insertErr) {
+        const msg = insertErr instanceof Error ? insertErr.message : String(insertErr);
+        console.error(`[TOOL] record_income INSERT FAILED: ${msg}`);
+        return `❌ ОШИБКА: доход НЕ сохранён (${msg}). Попробуйте ещё раз.`;
+      }
 
       const { year, month } = currentMonthAlmaty();
       const summary = await getMonthSummary(year, month);

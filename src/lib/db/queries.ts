@@ -67,7 +67,20 @@ export async function insertTransaction(tx: {
     .insert(tx)
     .select()
     .single();
-  if (error) throw error;
+  if (error) throw new Error(`INSERT failed: ${error.message}`);
+  if (!data) throw new Error('INSERT returned no data');
+
+  // Verify the row actually persisted by reading it back
+  const { data: verify, error: verifyErr } = await supabase
+    .from('transactions')
+    .select('id')
+    .eq('id', data.id)
+    .single();
+  if (verifyErr || !verify) {
+    throw new Error(`INSERT verification failed: row ${data.id} not found after insert`);
+  }
+
+  console.log(`[DB] INSERT transaction ${data.id}: ${tx.amount} ${tx.source}`);
   return data;
 }
 
