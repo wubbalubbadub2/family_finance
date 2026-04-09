@@ -517,15 +517,15 @@ export async function chat(
   if (!finalReply) finalReply = '🤔';
 
   // SAFETY NET: Detect if Claude claims to have saved but didn't call a write tool.
-  // This catches hallucinated confirmations like "уже записано" without tool use.
+  // Must match ALL Russian verb forms: записал/записала/записали/записано/записан,
+  // добавил/добавлено/добавлен, сохранил/сохранено, etc. Match root stems.
   const WRITE_TOOLS = ['record_expense', 'record_income', 'record_debt'];
-  const SAVE_WORDS = /записан|добавлен|сохранен|зафиксирован|внес[ёе]н/i;
+  const SAVE_STEMS = /записа[лнвоие]|добави[лнвоие]|добавлен|сохрани[лнвоие]|сохранен|зафиксир|внес[ёел]|✅/i;
   const calledWriteTool = WRITE_TOOLS.some(t => toolsCalled.has(t));
 
-  if (!calledWriteTool && SAVE_WORDS.test(finalReply)) {
-    // Claude claimed to save something but never called a write tool — this is a hallucination
-    finalReply = '⚠️ Данные НЕ были сохранены. Пожалуйста, напишите расход ещё раз в формате: кофе 1200';
-    console.error('[SAFETY] Claude hallucinated save without tool call. Original reply stripped.');
+  if (!calledWriteTool && SAVE_STEMS.test(finalReply)) {
+    console.error('[SAFETY] Hallucination caught. Tools called:', Array.from(toolsCalled), 'Reply had save words.');
+    finalReply = '⚠️ Данные НЕ были сохранены. Напишите каждый расход отдельным сообщением:\nкофе 1200';
   }
 
   try { await saveMessage(chatId, 'assistant', finalReply); } catch { /* */ }
