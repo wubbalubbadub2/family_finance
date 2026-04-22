@@ -1,5 +1,6 @@
 import { currentMonthAlmaty, formatTenge } from '@/lib/utils';
-import { getMonthTransactions, getUsers } from '@/lib/db/queries';
+import { getMonthTransactions, getUsersInFamily } from '@/lib/db/queries';
+import { DEFAULT_FAMILY_ID } from '@/lib/constants';
 import MonthPickerWrapper from '@/components/month-picker-wrapper';
 
 
@@ -22,8 +23,8 @@ export default async function IncomePage({ searchParams }: PageProps) {
   const month = parseInt(params.month ?? '') || nowMonth;
 
   const [transactions, users] = await Promise.all([
-    getMonthTransactions(year, month),
-    getUsers(),
+    getMonthTransactions(year, month, DEFAULT_FAMILY_ID),
+    getUsersInFamily(DEFAULT_FAMILY_ID),
   ]);
 
   const userMap = new Map(users.map(u => [u.id, u]));

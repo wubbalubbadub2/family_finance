@@ -4,6 +4,7 @@ import {
   getMonthTransactions,
   softDeleteTransaction,
 } from '@/lib/db/queries';
+import { DEFAULT_FAMILY_ID } from '@/lib/constants';
 
 export async function GET(req: NextRequest) {
   const { searchParams } = req.nextUrl;
@@ -14,7 +15,7 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: 'year and month required' }, { status: 400 });
   }
 
-  const transactions = await getMonthTransactions(year, month);
+  const transactions = await getMonthTransactions(year, month, DEFAULT_FAMILY_ID);
   // Filter out soft-deleted and internal transfers for the dashboard
   const visible = transactions.filter(t => !t.deleted_at && t.type !== 'internal');
 
@@ -28,7 +29,7 @@ export async function DELETE(req: NextRequest) {
       return NextResponse.json({ error: 'id required' }, { status: 400 });
     }
 
-    await softDeleteTransaction(id);
+    await softDeleteTransaction(id, DEFAULT_FAMILY_ID);
     console.log(`[DELETE] transaction ${id} soft-deleted`);
 
     // Invalidate server-rendered pages that show transactions

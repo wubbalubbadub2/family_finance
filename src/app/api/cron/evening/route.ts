@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getMonthSummary, getTransactionsByDateRange } from '@/lib/db/queries';
 import { todayAlmaty, currentMonthAlmaty, formatTenge } from '@/lib/utils';
 import { sendTelegramMessage } from '@/lib/bot/send-message';
+import { DEFAULT_FAMILY_ID } from '@/lib/constants';
 
 function verifyCron(req: NextRequest): boolean {
   const authHeader = req.headers.get('authorization');
@@ -20,13 +21,13 @@ export async function GET(req: NextRequest) {
   const { year, month } = currentMonthAlmaty();
 
   // Get today's transactions
-  const todayTxns = (await getTransactionsByDateRange(today, today))
+  const todayTxns = (await getTransactionsByDateRange(today, today, DEFAULT_FAMILY_ID))
     .filter(t => t.type === 'expense' && !t.deleted_at);
 
   const todayTotal = todayTxns.reduce((s, t) => s + t.amount, 0);
 
   // Get month summary for context
-  const summary = await getMonthSummary(year, month);
+  const summary = await getMonthSummary(year, month, DEFAULT_FAMILY_ID);
   const { total_actual, total_planned, safe_daily_remaining } = summary;
 
   let msg = '';

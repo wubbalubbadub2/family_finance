@@ -1,5 +1,6 @@
 import { currentMonthAlmaty, formatTenge } from '@/lib/utils';
-import { getMonthlyPlans, getCategories } from '@/lib/db/queries';
+import { getMonthlyPlans, getCategoriesForFamily } from '@/lib/db/queries';
+import { DEFAULT_FAMILY_ID } from '@/lib/constants';
 import MonthPickerWrapper from '@/components/month-picker-wrapper';
 import PlanForm from '@/components/plan-form';
 
@@ -16,8 +17,8 @@ export default async function PlanPage({ searchParams }: PageProps) {
   const month = parseInt(params.month ?? '') || nowMonth;
 
   const [plans, categories] = await Promise.all([
-    getMonthlyPlans(year, month),
-    getCategories(),
+    getMonthlyPlans(year, month, DEFAULT_FAMILY_ID),
+    getCategoriesForFamily(DEFAULT_FAMILY_ID),
   ]);
 
   const items = categories.map(cat => {

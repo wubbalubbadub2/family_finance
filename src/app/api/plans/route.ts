@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getMonthlyPlans, upsertMonthlyPlan, getCategories, getUsers } from '@/lib/db/queries';
+import { getMonthlyPlans, upsertMonthlyPlan, getCategoriesForFamily, getUsersInFamily } from '@/lib/db/queries';
+import { DEFAULT_FAMILY_ID } from '@/lib/constants';
 
 export const dynamic = 'force-dynamic';
 
@@ -12,8 +13,8 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: 'year and month required' }, { status: 400 });
   }
 
-  const plans = await getMonthlyPlans(year, month);
-  const categories = await getCategories();
+  const plans = await getMonthlyPlans(year, month, DEFAULT_FAMILY_ID);
+  const categories = await getCategoriesForFamily(DEFAULT_FAMILY_ID);
 
   const result = categories.map(cat => {
     const plan = plans.find(p => p.category_id === cat.id && p.plan_type === 'expense');
@@ -39,15 +40,16 @@ export async function POST(req: NextRequest) {
 
   // The family plan is shared — created_by is just for audit trail.
   // Use the first user from the DB as the owner.
-  const users = await getUsers();
+  const users = await getUsersInFamily(DEFAULT_FAMILY_ID);
   if (users.length === 0) {
-    return NextResponse.json({ error: 'No users in system' }, { status: 500 });
+    return NextResponse.json({ error: 'No users in family' }, { status: 500 });
   }
   const createdBy = users[0].id;
 
   for (const plan of plans) {
     if (plan.amount > 0) {
       await upsertMonthlyPlan({
+        family_id: DEFAULT_FAMILY_ID,
         year,
         month,
         category_id: plan.category_id,

@@ -1,5 +1,6 @@
 import { currentMonthAlmaty, formatTenge, monthNameRu } from '@/lib/utils';
 import { getMonthSummary, getActiveDebts } from '@/lib/db/queries';
+import { DEFAULT_FAMILY_ID } from '@/lib/constants';
 import type { CategorySummary } from '@/types';
 import Link from 'next/link';
 import MonthPickerWrapper from '@/components/month-picker-wrapper';
@@ -28,7 +29,7 @@ export default async function Dashboard({ searchParams }: PageProps) {
 
   let data;
   try {
-    data = await getMonthSummary(year, month);
+    data = await getMonthSummary(year, month, DEFAULT_FAMILY_ID);
   } catch {
     return (
       <main className="min-h-screen flex items-center justify-center pb-20" style={{ backgroundColor: 'var(--bg)' }}>
@@ -60,7 +61,7 @@ export default async function Dashboard({ searchParams }: PageProps) {
   }
 
   let debts: { id: string; name: string; original_amount: number; remaining_amount: number }[] = [];
-  try { debts = await getActiveDebts(); } catch { /* table may not exist */ }
+  try { debts = await getActiveDebts(DEFAULT_FAMILY_ID); } catch { /* table may not exist */ }
   const totalDebt = debts.reduce((s, d) => s + d.remaining_amount, 0);
 
   return (

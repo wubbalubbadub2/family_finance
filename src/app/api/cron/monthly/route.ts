@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getMonthlyPlans } from '@/lib/db/queries';
 import { currentMonthAlmaty, monthNameRu } from '@/lib/utils';
 import { sendTelegramMessage } from '@/lib/bot/send-message';
+import { DEFAULT_FAMILY_ID } from '@/lib/constants';
 
 function verifyCron(req: NextRequest): boolean {
   const authHeader = req.headers.get('authorization');
@@ -17,7 +18,7 @@ export async function GET(req: NextRequest) {
   if (!chatId) return NextResponse.json({ ok: true, skipped: 'no FAMILY_CHAT_ID' });
 
   const { year, month } = currentMonthAlmaty();
-  const plans = await getMonthlyPlans(year, month);
+  const plans = await getMonthlyPlans(year, month, DEFAULT_FAMILY_ID);
 
   if (plans.length === 0) {
     const appUrl = process.env.VERCEL_URL

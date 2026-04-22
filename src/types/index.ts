@@ -10,9 +10,14 @@ export interface User {
 
 export interface Category {
   id: number;
+  family_id: string;
   name: string;
   emoji: string;
-  slug: CategorySlug;
+  // Slug is any string post-migration 007 (families can create custom categories
+  // like "чипсы_снеки"). The CategorySlug union below is the set of DEFAULT
+  // slugs seeded for every family — useful for code that relies on canonical
+  // defaults (e.g., 'credit' → debt handling, 'misc' → fallback).
+  slug: string;
   sort_order: number;
   is_active: boolean;
 }

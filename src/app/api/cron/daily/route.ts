@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getActiveRecurring, insertTransaction, getMonthTransactions, getMonthSummary } from '@/lib/db/queries';
 import { todayAlmaty, currentMonthAlmaty, formatTenge, daysInMonth } from '@/lib/utils';
 import { sendTelegramMessage } from '@/lib/bot/send-message';
+import { DEFAULT_FAMILY_ID } from '@/lib/constants';
 
 function verifyCron(req: NextRequest): boolean {
   const authHeader = req.headers.get('authorization');
@@ -18,8 +19,9 @@ export async function GET(req: NextRequest) {
   const dayOfMonth = parseInt(today.split('-')[2], 10);
   const { year, month } = currentMonthAlmaty();
 
-  // 1. Process recurring transactions
-  const recurring = await getActiveRecurring();
+  // 1. Process recurring transactions (scoped to default family for now;
+  //    expand to iterate over all families when we onboard past n=2)
+  const recurring = await getActiveRecurring(DEFAULT_FAMILY_ID);
   const monthDays = daysInMonth(year, month);
   // Fire recurring if (a) day matches exactly, or
   // (b) day_of_month > days_in_month AND today is the last day (handles day=31 in Feb/Apr/etc.)
@@ -29,7 +31,7 @@ export async function GET(req: NextRequest) {
   );
 
   // Fetch month transactions ONCE before the loop (was O(n) before)
-  const monthTxns = todayRecurring.length > 0 ? await getMonthTransactions(year, month) : [];
+  const monthTxns = todayRecurring.length > 0 ? await getMonthTransactions(year, month, DEFAULT_FAMILY_ID) : [];
 
   const created: string[] = [];
   for (const rt of todayRecurring) {
@@ -42,6 +44,7 @@ export async function GET(req: NextRequest) {
 
     if (!alreadyExists) {
       await insertTransaction({
+        family_id: DEFAULT_FAMILY_ID,
         user_id: rt.created_by,
         category_id: rt.category_id,
         type: rt.type as 'expense' | 'income',
@@ -64,7 +67,7 @@ export async function GET(req: NextRequest) {
 
   // 3. Check budget thresholds and send alerts
   if (chatId) {
-    const summary = await getMonthSummary(year, month);
+    const summary = await getMonthSummary(year, month, DEFAULT_FAMILY_ID);
     const alerts: string[] = [];
     for (const cat of summary.categories) {
       if (cat.planned > 0) {

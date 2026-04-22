@@ -1,5 +1,6 @@
 import { currentMonthAlmaty } from '@/lib/utils';
-import { getMonthTransactions, getCategories, getUsers } from '@/lib/db/queries';
+import { getMonthTransactions, getCategoriesForFamily, getUsersInFamily } from '@/lib/db/queries';
+import { DEFAULT_FAMILY_ID } from '@/lib/constants';
 import MonthPickerWrapper from '@/components/month-picker-wrapper';
 import TransactionList from '@/components/transaction-list';
 
@@ -17,9 +18,9 @@ export default async function TransactionsPage({ searchParams }: PageProps) {
   const month = parseInt(params.month ?? '') || nowMonth;
 
   const [transactions, categories, users] = await Promise.all([
-    getMonthTransactions(year, month),
-    getCategories(),
-    getUsers(),
+    getMonthTransactions(year, month, DEFAULT_FAMILY_ID),
+    getCategoriesForFamily(DEFAULT_FAMILY_ID),
+    getUsersInFamily(DEFAULT_FAMILY_ID),
   ]);
 
   const visible = transactions

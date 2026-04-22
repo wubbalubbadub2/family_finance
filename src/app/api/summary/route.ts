@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getMonthSummary } from '@/lib/db/queries';
+import { DEFAULT_FAMILY_ID } from '@/lib/constants';
 
 export async function GET(req: NextRequest) {
   const { searchParams } = req.nextUrl;
@@ -10,6 +11,6 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: 'year and month required' }, { status: 400 });
   }
 
-  const summary = await getMonthSummary(year, month);
+  const summary = await getMonthSummary(year, month, DEFAULT_FAMILY_ID);
   return NextResponse.json(summary);
 }

@@ -1,5 +1,6 @@
 import { formatTenge } from '@/lib/utils';
 import { getActiveDebts } from '@/lib/db/queries';
+import { DEFAULT_FAMILY_ID } from '@/lib/constants';
 import DebtList from '@/components/debt-list';
 
 
@@ -7,7 +8,7 @@ export const dynamic = 'force-dynamic';
 
 export default async function DebtsPage() {
   let debts: { id: string; name: string; original_amount: number; remaining_amount: number }[] = [];
-  try { debts = await getActiveDebts(); } catch { /* table may not exist */ }
+  try { debts = await getActiveDebts(DEFAULT_FAMILY_ID); } catch { /* table may not exist */ }
 
   const totalRemaining = debts.reduce((s, d) => s + d.remaining_amount, 0);
   const totalOriginal = debts.reduce((s, d) => s + d.original_amount, 0);
