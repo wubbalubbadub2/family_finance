@@ -335,8 +335,30 @@ async function handleUndo(ctx: FamilyCtx): Promise<string> {
 
 const READ_TOOLS: Anthropic.Tool[] = [
   {
+    name: 'search_transactions_by_comment',
+    description:
+      'PRIMARY TOOL for keyword questions. Use this whenever the user mentions a specific word/item and wants ' +
+      'to know about it — totals, frequency, occurrences, history. Searches ALL transactions (not just last 20). ' +
+      'Examples that MUST route here: ' +
+      '"сколько на чипсы?" · "how much on taxi?" · "сколько раз мы покупали агушу?" (keyword="агуша") · ' +
+      '"когда последний раз покупали бензин?" · "показать все траты на кофе" · ' +
+      '"сколько мы потратили на кафе в апреле?" (keyword="кафе", period=April). ' +
+      'The keyword should be the NOUN the user asked about — strip question words like "сколько", "how much", "how many times". ' +
+      'Do NOT use list_recent_transactions for keyword questions — it only sees the last N rows and will miss older matches.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        keyword: { type: 'string', description: 'Noun the user asked about (e.g., "агуша", "чипсы", "кофе", "taxi"). Lowercased automatically.' },
+        period_start: { type: 'string', description: 'YYYY-MM-DD (inclusive). Omit for all time.' },
+        period_end: { type: 'string', description: 'YYYY-MM-DD (inclusive). Omit for all time.' },
+      },
+      required: ['keyword'],
+    },
+  },
+  {
     name: 'get_month_summary',
-    description: 'Get budget summary. Use when user asks about budget, expenses, remaining, plan.',
+    description: 'Get the current-month category-by-category budget summary. Use for "how is the budget?", ' +
+      '"что у нас с бюджетом", "show me the month". NOT for keyword-specific questions (use search instead).',
     input_schema: {
       type: 'object' as const,
       properties: {
@@ -347,23 +369,13 @@ const READ_TOOLS: Anthropic.Tool[] = [
     },
   },
   {
-    name: 'get_recent_transactions',
-    description: 'Legacy — use list_recent_transactions instead. Kept for backward compatibility.',
-    input_schema: {
-      type: 'object' as const,
-      properties: {
-        count: { type: 'number', description: 'Max 20', default: 10 },
-      },
-      required: [],
-    },
-  },
-  {
     name: 'list_recent_transactions',
     description:
-      'List recent transactions with pagination and optional date range. Use when user asks to see their expenses/transactions. ' +
-      'If user says "еще" (more), check if there is a stored pagination context and continue from previous offset. ' +
-      'If user specifies a period (e.g., "за апрель", "за неделю", "this month"), pass period_start and period_end in YYYY-MM-DD. ' +
-      'Hard cap 30 items per reply for Telegram message length safety.',
+      'List recent transactions, newest first, with pagination. Use ONLY when the user asks to SEE the list ' +
+      'without specifying a keyword — e.g., "покажи последние траты", "show me recent expenses", "what have we logged", ' +
+      '"последние 20 записей". If user says "ещё" (more), the stored offset continues automatically. ' +
+      'DO NOT use for keyword questions like "сколько на X" — use search_transactions_by_comment instead. ' +
+      'Hard cap 30 items per reply.',
     input_schema: {
       type: 'object' as const,
       properties: {
@@ -376,26 +388,8 @@ const READ_TOOLS: Anthropic.Tool[] = [
     },
   },
   {
-    name: 'search_transactions_by_comment',
-    description:
-      'Search expense comments for a keyword and return sum + count + sample. ' +
-      'Use when the user asks "how much did I/we spend on X?" or similar — e.g., ' +
-      '"сколько на чипсы?", "how much on taxi this month?". ' +
-      'Keyword is case-insensitive substring match on the comment field. ' +
-      'If user mentions a period (month, week, this year), pass period_start + period_end.',
-    input_schema: {
-      type: 'object' as const,
-      properties: {
-        keyword: { type: 'string', description: 'Substring to search in transaction comments. Lowercased automatically.' },
-        period_start: { type: 'string', description: 'YYYY-MM-DD (inclusive). Omit for all time.' },
-        period_end: { type: 'string', description: 'YYYY-MM-DD (inclusive). Omit for all time.' },
-      },
-      required: ['keyword'],
-    },
-  },
-  {
     name: 'get_debts',
-    description: 'Show active debts.',
+    description: 'Show active debts (deterministic list with totals + per-debt remaining).',
     input_schema: {
       type: 'object' as const,
       properties: {},
@@ -419,10 +413,26 @@ function buildSystemPrompt(): string {
 ТВОИ ИНСТРУМЕНТЫ:
 
 Чтение (используются сразу):
+- search_transactions_by_comment(keyword, period?) — *ГЛАВНЫЙ* инструмент для вопросов с ключевым словом
+- list_recent_transactions(limit?, offset?, period?) — список последних трат БЕЗ ключевого слова
 - get_month_summary(year, month) — итоги месяца
-- list_recent_transactions(limit?, offset?, period_start?, period_end?) — список трат
-- search_transactions_by_comment(keyword, period_start?, period_end?) — поиск по комментариям
 - get_debts — долги
+
+ПРАВИЛО РОУТИНГА (ОЧЕНЬ ВАЖНО):
+Если в вопросе есть существительное (например "чипсы", "агуша", "кофе", "бензин", "кафе",
+"продукты") И пользователь спрашивает ПРО это существительное — ВСЕГДА используй
+search_transactions_by_comment. НЕ list_recent_transactions.
+
+Примеры, где ОБЯЗАТЕЛЬНО search_transactions_by_comment:
+- "сколько на чипсы?" → search, keyword="чипсы"
+- "сколько раз мы покупали агушу и сколько в деньгах ушло?" → search, keyword="агуша"
+- "когда последний раз покупали бензин?" → search, keyword="бензин"
+- "сколько мы тратим на кофе обычно?" → search, keyword="кофе"
+
+Примеры для list_recent_transactions (БЕЗ ключевого слова):
+- "покажи последние траты" → list, limit=10
+- "что мы вчера тратили?" → list, period_start=вчера, period_end=вчера
+- "ещё" (после предыдущего списка) → list, offset подхватится
 
 Запись (пользователь подтверждает кнопкой ✅ Да перед исполнением):
 - propose_create_goal(name, target_amount, deadline) — создать цель накоплений
@@ -436,11 +446,13 @@ function buildSystemPrompt(): string {
 - propose_delete_category(slug, reassign_to_slug?) — удалить категорию (транзакции переносятся)
 - propose_merge_categories(from_slug, into_slug) — объединить категории
 
-КОГДА ИСКАТЬ vs. КОГДА СПИСОК:
-- "сколько на Х в апреле" / "how much on Х" → search_transactions_by_comment с keyword=Х
-- "покажи последние траты" / "покажи что было" → list_recent_transactions
-- "ещё" или "следующие 30" в контексте предыдущего списка → list_recent_transactions (offset автоматически подхватится)
-- Месяц из вопроса → period_start/period_end в YYYY-MM-DD (апрель 2026 = 2026-04-01..2026-04-30)
+ПЕРИОДЫ:
+Когда в вопросе упомянут месяц/неделя/диапазон, всегда передавай period_start и period_end
+в формате YYYY-MM-DD. Примеры:
+- "в апреле" → period_start=2026-04-01, period_end=2026-04-30
+- "на этой неделе" → period_start=<понедельник>, period_end=<воскресенье>
+- "в этом году" → period_start=2026-01-01, period_end=2026-12-31
+- без упоминания периода → не передавай, ищи за всё время
 
 КОГДА ПИСАТЬ:
 - "хочу накопить N к [даты]" или "создай цель" → propose_create_goal
