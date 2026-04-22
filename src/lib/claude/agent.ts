@@ -40,7 +40,7 @@ import {
   type PendingConfirm,
 } from '@/lib/db/queries';
 import { todayAlmaty, currentMonthAlmaty, monthNameRu, formatTenge } from '@/lib/utils';
-import { renderGoalProgress } from '@/lib/goals';
+import { renderGoalProgress, computeWeekBoundsAlmaty } from '@/lib/goals';
 
 const client = new Anthropic();
 const MODEL = process.env.CLAUDE_MODEL || 'claude-haiku-4-5-20251001';
@@ -101,6 +101,143 @@ function tryParseDebt(text: string): { amount: number; name: string } | null {
 
 function isUndoRequest(text: string): boolean {
   return /удали|отмени|undo|убери последн|верни назад|отмена/i.test(text);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Deterministic search-query parsing.
+//
+// Why bypass Claude: Haiku tool-routing for search-vs-list is unreliable
+// (~80% accuracy in testing). For the highest-value query pattern — "сколько
+// (раз) мы на/покупали <X>" — a regex matcher is 100% reliable. If the pattern
+// doesn't match, we fall through to Claude which has tool descriptions tuned
+// for these same queries.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Words to skip when hunting for the keyword noun. Includes question markers,
+// quantity words, verbs of purchase/consumption, pronouns, periods, and months
+// (periods are detected separately).
+const SEARCH_STOPWORDS = new Set([
+  // quantity / question
+  'сколько', 'раз', 'раза', 'как', 'часто', 'когда', 'последний', 'всего',
+  'how', 'much', 'many', 'times', 'total',
+  // pronouns
+  'мы', 'я', 'нас', 'нашей', 'нашу', 'свой', 'нашем', 'our', 'we',
+  // tense/modality
+  'уже', 'пока', 'ещё', 'еще', 'были', 'did', 'does',
+  // prepositions
+  'на', 'за', 'про', 'в', 'из', 'до', 'от', 'по', 'для', 'со', 'с', 'у', 'к',
+  'и', 'или', 'то', 'а', 'но', 'же', 'ли',
+  'on', 'for', 'about', 'the', 'a', 'an', 'of', 'to', 'in',
+  // verbs of purchase/consumption/spending
+  'ушло', 'ушли', 'ушёл', 'потратили', 'тратили', 'тратим',
+  'купили', 'покупали', 'покупили', 'куплено', 'ели', 'пили', 'брали',
+  'заплатили', 'отдали',
+  'spent', 'bought', 'paid', 'ate', 'drank',
+  // money words
+  'тенге', 'тг', 'денег', 'деньги', 'money',
+  // period words (months + "this month/week/year")
+  'этом', 'этой', 'этого', 'текущем', 'текущей',
+  'месяце', 'месяц', 'неделе', 'неделю', 'неделя', 'году', 'год',
+  'сегодня', 'вчера', 'завтра', 'сейчас',
+  'this', 'month', 'week', 'year', 'today', 'yesterday',
+  'январе', 'феврале', 'марте', 'апреле', 'мае', 'июне',
+  'июле', 'августе', 'сентябре', 'октябре', 'ноябре', 'декабре',
+  'январь', 'февраль', 'март', 'апрель', 'май', 'июнь',
+  'июль', 'август', 'сентябрь', 'октябрь', 'ноябрь', 'декабрь',
+  'january', 'february', 'march', 'april', 'may', 'june',
+  'july', 'august', 'september', 'october', 'november', 'december',
+]);
+
+const MONTH_STEMS_RU = [
+  'январ', 'феврал', 'март', 'апрел', 'мая', 'июн',
+  'июл', 'август', 'сентябр', 'октябр', 'ноябр', 'декабр',
+];
+
+interface SearchIntent {
+  keyword: string;
+  periodStart?: string;
+  periodEnd?: string;
+}
+
+function detectPeriod(lower: string): { start: string; end: string } | null {
+  const { year, month: curMonth } = currentMonthAlmaty();
+  const lastDay = (y: number, m: number): string => {
+    const d = new Date(Date.UTC(y, m, 0)).getUTCDate();
+    return `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+  };
+
+  // Current month
+  if (/(в|за)\s+(этом\s+месяце|текущем\s+месяце)|this\s+month/i.test(lower)) {
+    return { start: `${year}-${String(curMonth).padStart(2, '0')}-01`, end: lastDay(year, curMonth) };
+  }
+
+  // Current week
+  if (/(за|на)\s+(этой\s+неделе|неделю)|this\s+week/i.test(lower)) {
+    const { weekStartDate, weekEndDate } = computeWeekBoundsAlmaty();
+    // weekEndDate is the NEXT Monday (exclusive); trim a day for BETWEEN semantics
+    const endMinus1 = new Date(new Date(weekEndDate).getTime() - 86_400_000)
+      .toISOString().slice(0, 10);
+    return { start: weekStartDate, end: endMinus1 };
+  }
+
+  // Month name — "в апреле", "за март"
+  for (let i = 0; i < 12; i++) {
+    const stem = MONTH_STEMS_RU[i];
+    const re = new RegExp(`(в|за)\\s+${stem}`, 'i');
+    if (re.test(lower)) {
+      const m = i + 1;
+      return { start: `${year}-${String(m).padStart(2, '0')}-01`, end: lastDay(year, m) };
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Attempt to extract a search intent from the user's text. Returns null if
+ * the text doesn't look like a "how much / how many" keyword question.
+ *
+ * Examples that match:
+ *   "сколько на чипсы?"                → { keyword: "чипсы" }
+ *   "сколько агуш мы уже покупили"     → { keyword: "агуш" }
+ *   "сколько раз мы покупали кофе?"    → { keyword: "кофе" }
+ *   "сколько ушло на бензин в апреле?" → { keyword: "бензин", period: April }
+ *   "how much on groceries?"            → { keyword: "groceries" }
+ *
+ * Examples that don't match (pass through to Claude):
+ *   "покажи последние траты"           → not a quantity question
+ *   "как дела?"                        → no noun
+ *   "привет"                           → not a question
+ */
+function tryParseSearchQuery(text: string): SearchIntent | null {
+  const lower = text.toLowerCase().trim();
+  if (!lower) return null;
+
+  // Must smell like a quantity/frequency/search question.
+  // NOTE: JS regex \b doesn't work with Cyrillic (it treats Cyrillic as
+  // non-word chars). Use substring + separate English check instead.
+  const hasSkolko = lower.includes('сколько');
+  const hasHowMuch = /\bhow\s+(much|many)\b/i.test(lower);
+  if (!hasSkolko && !hasHowMuch) return null;
+
+  // Tokenize: strip punctuation, keep only letters, split on whitespace,
+  // drop short tokens + stopwords.
+  const tokens = lower
+    .replace(/[^\p{L}\s]/gu, ' ')
+    .split(/\s+/)
+    .filter(t => t.length >= 3 && !SEARCH_STOPWORDS.has(t));
+
+  if (tokens.length === 0) return null;
+
+  // First content word is the keyword. The stopword list is deliberately
+  // aggressive — by the time we get here, what's left is almost always the noun.
+  const keyword = tokens[0];
+  const period = detectPeriod(lower);
+  return {
+    keyword,
+    periodStart: period?.start,
+    periodEnd: period?.end,
+  };
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -312,6 +449,49 @@ async function handleDebt(debt: { amount: number; name: string }, ctx: FamilyCtx
   } catch (e) {
     return `❌ Долг НЕ записан: ${e instanceof Error ? e.message : 'ошибка'}`;
   }
+}
+
+async function handleKeywordSearch(intent: SearchIntent, ctx: FamilyCtx): Promise<string> {
+  const result = await searchTransactionsByComment(
+    ctx.familyId,
+    intent.keyword,
+    intent.periodStart,
+    intent.periodEnd,
+  );
+  return formatSearchReply(result, intent, await getCategoriesForFamily(ctx.familyId));
+}
+
+function formatSearchReply(
+  result: { sum: number; count: number; sample: import('@/types').Transaction[] },
+  intent: SearchIntent,
+  categories: import('@/types').Category[],
+): string {
+  if (result.count === 0) {
+    const periodHint = intent.periodStart || intent.periodEnd ? ` за указанный период` : '';
+    return `🔍 По '${intent.keyword}'${periodHint} — ничего не найдено.`;
+  }
+
+  const catMap = new Map(categories.map(c => [c.id, c]));
+
+  let text = `🔍 По '${intent.keyword}'`;
+  if (intent.periodStart || intent.periodEnd) {
+    text += ` (${intent.periodStart ?? '...'} → ${intent.periodEnd ?? '...'})`;
+  }
+
+  if (result.count <= result.sample.length) {
+    text += `: *${formatTenge(result.sum)}* · ${result.count} трат\n\n`;
+  } else {
+    text += `: найдено ${result.count} трат. Показываю последние ${result.sample.length} на сумму *${formatTenge(result.sum)}*\n\n`;
+  }
+
+  for (const t of result.sample) {
+    const cat = t.category_id ? catMap.get(t.category_id) : null;
+    const icon = cat?.emoji ?? '❓';
+    text += `${t.transaction_date} | ${icon} ${formatTenge(t.amount)}`;
+    if (t.comment) text += ` — ${t.comment}`;
+    text += '\n';
+  }
+  return text.trim();
 }
 
 async function handleUndo(ctx: FamilyCtx): Promise<string> {
@@ -973,35 +1153,11 @@ async function executeReadTool(
       const periodEnd = input.period_end as string | undefined;
 
       const result = await searchTransactionsByComment(ctx.familyId, keyword, periodStart, periodEnd);
-      if (result.count === 0) {
-        const periodHint = periodStart || periodEnd ? ` за указанный период` : '';
-        return `🔍 По '${keyword}'${periodHint} — ничего не найдено.`;
-      }
-
-      const categories = await getCategoriesForFamily(ctx.familyId);
-      const catMap = new Map(categories.map(c => [c.id, c]));
-
-      let text = `🔍 По '${keyword}'`;
-      if (periodStart || periodEnd) {
-        text += ` (${periodStart ?? '...'} → ${periodEnd ?? '...'})`;
-      }
-      // sample.sum is sum of the top-10 sample, but count is total. If the sample
-      // covers all matches (count <= 10), the sample sum IS the true sum.
-      // Otherwise we note "showing 10 of N" and sample sum is lower bound.
-      if (result.count <= result.sample.length) {
-        text += `: ${formatTenge(result.sum)} · ${result.count} трат\n\n`;
-      } else {
-        text += `: найдено ${result.count} трат. Показаны последние ${result.sample.length} на сумму ${formatTenge(result.sum)}\n\n`;
-      }
-
-      for (const t of result.sample) {
-        const cat = t.category_id ? catMap.get(t.category_id) : null;
-        const icon = cat?.emoji ?? '❓';
-        text += `${t.transaction_date} | ${icon} ${formatTenge(t.amount)}`;
-        if (t.comment) text += ` — ${t.comment}`;
-        text += '\n';
-      }
-      return text.trim();
+      return formatSearchReply(
+        result,
+        { keyword, periodStart, periodEnd },
+        await getCategoriesForFamily(ctx.familyId),
+      );
     }
 
     case 'get_debts': {
@@ -1088,7 +1244,19 @@ export async function chat(
     return textOnly(reply);
   }
 
-  // ── 5. Everything else → Claude (read + write tools) ──
+  // ── 5. Keyword search (deterministic, bypasses Claude) ──
+  // LLM tool-routing was unreliable for "сколько (раз) мы покупали X" patterns
+  // — Haiku kept choosing list_recent_transactions (last 20) instead of search.
+  // Parsing the intent deterministically here guarantees ALL history is searched.
+  const searchIntent = tryParseSearchQuery(text);
+  if (searchIntent) {
+    const reply = await handleKeywordSearch(searchIntent, ctx);
+    await saveUserMsg();
+    await saveAssistantMsg(reply);
+    return textOnly(reply);
+  }
+
+  // ── 6. Everything else → Claude (read + write tools) ──
   let history: { role: string; content: string }[] = [];
   try { history = await getRecentMessages(chatId, ctx.familyId, 10); } catch { /* */ }
 
