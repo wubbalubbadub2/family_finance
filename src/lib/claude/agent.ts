@@ -1,4 +1,5 @@
 import Anthropic from '@anthropic-ai/sdk';
+import type { InlineKeyboardButton } from 'grammy/types';
 import type { Category } from '@/types';
 import {
   getUserByTelegramId,
@@ -16,6 +17,27 @@ import {
   getActiveDebts,
   lookupCategoryOverride,
   getActiveGoal,
+  searchTransactionsByComment,
+  listRecentTransactionsPaged,
+  setPendingListContext,
+  getPendingListContext,
+  clearPendingListContext,
+  setPendingConfirm,
+  getPendingConfirm,
+  clearPendingConfirm,
+  generateConfirmNonce,
+  createGoal,
+  archiveGoal,
+  addGoalContribution,
+  createCategory,
+  renameCategory,
+  deleteCategory,
+  mergeCategories,
+  upsertMonthlyPlan,
+  updateTransactionCategory,
+  upsertCategoryOverride,
+  type ConfirmType,
+  type PendingConfirm,
 } from '@/lib/db/queries';
 import { todayAlmaty, currentMonthAlmaty, monthNameRu, formatTenge } from '@/lib/utils';
 import { renderGoalProgress } from '@/lib/goals';
@@ -91,6 +113,31 @@ interface FamilyCtx {
   userId: string;
   userName: string;
   chatId: number;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// BotResponse — the shape chat() returns. Optional inline keyboard
+// lets write-tool proposals render confirm/cancel buttons.
+// ═══════════════════════════════════════════════════════════════
+
+export interface BotResponse {
+  text: string;
+  keyboard?: InlineKeyboardButton[][];
+}
+
+function textOnly(text: string): BotResponse {
+  return { text };
+}
+
+function withKeyboard(text: string, keyboard: InlineKeyboardButton[][]): BotResponse {
+  return { text, keyboard };
+}
+
+function confirmKeyboard(nonce: string): InlineKeyboardButton[][] {
+  return [[
+    { text: '✅ Да', callback_data: `confirm:${nonce}` },
+    { text: '❌ Отмена', callback_data: `cancel:${nonce}` },
+  ]];
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -301,13 +348,49 @@ const READ_TOOLS: Anthropic.Tool[] = [
   },
   {
     name: 'get_recent_transactions',
-    description: 'Get recent transactions. Use when user asks to see expenses list.',
+    description: 'Legacy — use list_recent_transactions instead. Kept for backward compatibility.',
     input_schema: {
       type: 'object' as const,
       properties: {
         count: { type: 'number', description: 'Max 20', default: 10 },
       },
       required: [],
+    },
+  },
+  {
+    name: 'list_recent_transactions',
+    description:
+      'List recent transactions with pagination and optional date range. Use when user asks to see their expenses/transactions. ' +
+      'If user says "еще" (more), check if there is a stored pagination context and continue from previous offset. ' +
+      'If user specifies a period (e.g., "за апрель", "за неделю", "this month"), pass period_start and period_end in YYYY-MM-DD. ' +
+      'Hard cap 30 items per reply for Telegram message length safety.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        limit: { type: 'number', description: 'Max 30. Default 10.' },
+        offset: { type: 'number', description: 'For pagination. 0 = latest.' },
+        period_start: { type: 'string', description: 'YYYY-MM-DD (inclusive). Omit for all time.' },
+        period_end: { type: 'string', description: 'YYYY-MM-DD (inclusive). Omit for all time.' },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'search_transactions_by_comment',
+    description:
+      'Search expense comments for a keyword and return sum + count + sample. ' +
+      'Use when the user asks "how much did I/we spend on X?" or similar — e.g., ' +
+      '"сколько на чипсы?", "how much on taxi this month?". ' +
+      'Keyword is case-insensitive substring match on the comment field. ' +
+      'If user mentions a period (month, week, this year), pass period_start + period_end.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        keyword: { type: 'string', description: 'Substring to search in transaction comments. Lowercased automatically.' },
+        period_start: { type: 'string', description: 'YYYY-MM-DD (inclusive). Omit for all time.' },
+        period_end: { type: 'string', description: 'YYYY-MM-DD (inclusive). Omit for all time.' },
+      },
+      required: ['keyword'],
     },
   },
   {
@@ -329,17 +412,479 @@ function buildSystemPrompt(): string {
 
 Сегодня: ${today}. Месяц: ${monthNameRu(month)} ${year}.
 
-ВАЖНО: Ты НЕ МОЖЕШЬ записывать расходы, доходы или долги. У тебя нет tools для записи.
-Запись делает система автоматически. Ты только отвечаешь на вопросы и показываешь данные.
+РАСХОДЫ/ДОХОДЫ/ДОЛГИ записываются системой детерминированно из распарсенного сообщения
+("кофе 1200", "взял в долг 50000 Кайрат"). Эти тебе трогать не нужно — если пользователь
+просто пишет сумму и описание, молча не вмешивайся, система сама обработает.
 
-Результаты tools — готовый текст. Выводи ДОСЛОВНО, не переформатируй.
+ТВОИ ИНСТРУМЕНТЫ:
 
-Если пользователь просит записать расход/доход/долг — скажи "Напишите в формате: кофе 1200"`;
+Чтение (используются сразу):
+- get_month_summary(year, month) — итоги месяца
+- list_recent_transactions(limit?, offset?, period_start?, period_end?) — список трат
+- search_transactions_by_comment(keyword, period_start?, period_end?) — поиск по комментариям
+- get_debts — долги
+
+Запись (пользователь подтверждает кнопкой ✅ Да перед исполнением):
+- propose_create_goal(name, target_amount, deadline) — создать цель накоплений
+- propose_contribute_to_goal(amount) — положить N в активную цель
+- propose_archive_goal() — закрыть активную цель
+- propose_delete_transaction(transaction_id) — удалить транзакцию по ID (сначала найди через list_recent_transactions)
+- propose_update_transaction_category(transaction_id, new_category_slug) — переклассифицировать транзакцию. Система также запомнит keyword→category для будущих подобных
+- propose_set_monthly_plan(category_slug, amount, year?, month?) — установить бюджет на категорию
+- propose_create_category(name, emoji) — создать пользовательскую категорию
+- propose_rename_category(slug, new_name, new_emoji?) — переименовать категорию
+- propose_delete_category(slug, reassign_to_slug?) — удалить категорию (транзакции переносятся)
+- propose_merge_categories(from_slug, into_slug) — объединить категории
+
+КОГДА ИСКАТЬ vs. КОГДА СПИСОК:
+- "сколько на Х в апреле" / "how much on Х" → search_transactions_by_comment с keyword=Х
+- "покажи последние траты" / "покажи что было" → list_recent_transactions
+- "ещё" или "следующие 30" в контексте предыдущего списка → list_recent_transactions (offset автоматически подхватится)
+- Месяц из вопроса → period_start/period_end в YYYY-MM-DD (апрель 2026 = 2026-04-01..2026-04-30)
+
+КОГДА ПИСАТЬ:
+- "хочу накопить N к [даты]" или "создай цель" → propose_create_goal
+- "отложил/кинул/добавил N" (без описания расхода) → propose_contribute_to_goal
+- "закрой цель" / "забудь цель" → propose_archive_goal
+- "удали трату N" (где N — описание) → сначала list_recent_transactions найти её, потом propose_delete_transaction с ID
+- "это было не Х, а Y" / "поменяй категорию на Y" / "переклассифицируй в Y" → найди транзакцию через list_recent или search, потом propose_update_transaction_category
+- "поставь лимит N на [категорию]" → propose_set_monthly_plan
+- "создай категорию" / "добавь категорию" → propose_create_category
+- "переименуй X в Y" / "поменяй название" → propose_rename_category
+- "удали категорию" → propose_delete_category
+- "объедини X в Y" → propose_merge_categories
+
+Результаты read-tools — готовый текст. Выводи ДОСЛОВНО, не переформатируй.
+Результаты write-tools обрабатываются системой (показывается кнопка подтверждения пользователю) — тебе после пропозала ничего говорить не нужно.`;
 }
 
 interface ToolResult {
   tool_use_id: string;
   content: string;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Write tools — Claude proposes, user confirms via inline keyboard
+// ═══════════════════════════════════════════════════════════════
+
+const WRITE_TOOLS: Anthropic.Tool[] = [
+  {
+    name: 'propose_create_goal',
+    description:
+      'Propose creating a new savings goal. Only ONE active goal per family — if user already has one, system will reject. ' +
+      'Call when user says "хочу накопить Х к [деадлайну] на [что-то]" or similar. ' +
+      'Extract amount (in tenge, integer), deadline (YYYY-MM-DD), and goal name (what they\'re saving for).',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        name: { type: 'string', description: 'Короткое название цели, например "Отпуск 2026" или "Машина"' },
+        target_amount: { type: 'number', description: 'Целевая сумма в тенге (целое число)' },
+        deadline: { type: 'string', description: 'Дата достижения в формате YYYY-MM-DD' },
+      },
+      required: ['name', 'target_amount', 'deadline'],
+    },
+  },
+  {
+    name: 'propose_contribute_to_goal',
+    description:
+      'Propose adding money to the active goal. Call when user says "отложил/кинул/добавил N на цель/копилку" or similar. ' +
+      'Only works if the family has an active goal.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        amount: { type: 'number', description: 'Сумма взноса в тенге (целое, >0)' },
+      },
+      required: ['amount'],
+    },
+  },
+  {
+    name: 'propose_archive_goal',
+    description:
+      'Propose archiving the active goal (marks it complete/abandoned). ' +
+      'Call when user says "закрой цель", "отмени цель", "goal achieved".',
+    input_schema: {
+      type: 'object' as const,
+      properties: {},
+      required: [],
+    },
+  },
+  {
+    name: 'propose_delete_transaction',
+    description:
+      'Propose deleting a specific transaction by ID. Call when user references a specific transaction to delete ' +
+      '(e.g., "удали 3880 курица", "remove the coffee"). Use list_recent_transactions first if you need an ID. ' +
+      'For "удали последнюю" use the existing undo flow (no tool call needed — system handles it).',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        transaction_id: { type: 'string', description: 'UUID of the transaction to delete' },
+      },
+      required: ['transaction_id'],
+    },
+  },
+  {
+    name: 'propose_update_transaction_category',
+    description:
+      'Propose changing the category of a specific transaction. Call when user says the categorization was wrong: ' +
+      '"это было Продукты, не Разное", "переклассифицируй эту в Кафе", "поменяй категорию чипсов на Продукты". ' +
+      'Find the transaction via list_recent_transactions or search_transactions_by_comment first to get the ID. ' +
+      'IMPORTANT: on confirm, the system will also save a per-family override keyword→category so future similar ' +
+      'expenses auto-route correctly. This is the main mechanism for improving categorization reliability over time.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        transaction_id: { type: 'string', description: 'UUID of the transaction to re-categorize' },
+        new_category_slug: { type: 'string', description: 'Target category slug (must exist for this family)' },
+      },
+      required: ['transaction_id', 'new_category_slug'],
+    },
+  },
+  {
+    name: 'propose_set_monthly_plan',
+    description:
+      'Propose setting a monthly spending limit for a category. ' +
+      'Call when user says "поставь лимит Х на Y", "set Y budget to Х", "bu ayn kafeye X tenge".',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        category_slug: { type: 'string', description: 'Slug of the category (food, transport, cafe, etc.)' },
+        amount: { type: 'number', description: 'Planned amount in tenge' },
+        year: { type: 'number', description: 'Year (default: current)' },
+        month: { type: 'number', description: '1-12 (default: current)' },
+      },
+      required: ['category_slug', 'amount'],
+    },
+  },
+  {
+    name: 'propose_create_category',
+    description:
+      'Propose creating a new custom category for this family. ' +
+      'Call when user says "создай категорию Х" / "add category Х с эмодзи Y".',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        name: { type: 'string', description: 'Display name (e.g., "Чипсы/снеки")' },
+        emoji: { type: 'string', description: 'Single emoji for the category' },
+      },
+      required: ['name', 'emoji'],
+    },
+  },
+  {
+    name: 'propose_rename_category',
+    description: 'Propose renaming an existing category. Preserves slug; only name/emoji change.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        slug: { type: 'string', description: 'Slug of the category to rename' },
+        new_name: { type: 'string' },
+        new_emoji: { type: 'string', description: 'Optional new emoji' },
+      },
+      required: ['slug', 'new_name'],
+    },
+  },
+  {
+    name: 'propose_delete_category',
+    description:
+      'Propose deleting a category. All transactions are reassigned to the target category (default: misc). ' +
+      'Call when user says "удали категорию Х".',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        slug: { type: 'string', description: 'Slug of the category to delete' },
+        reassign_to_slug: { type: 'string', description: 'Where to move existing transactions. Default "misc".' },
+      },
+      required: ['slug'],
+    },
+  },
+  {
+    name: 'propose_merge_categories',
+    description:
+      'Propose merging one category into another. All transactions from `from_slug` move to `into_slug`, ' +
+      'then source is soft-deleted. Call for "объедини Х в Y" / "merge X into Y".',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        from_slug: { type: 'string' },
+        into_slug: { type: 'string' },
+      },
+      required: ['from_slug', 'into_slug'],
+    },
+  },
+];
+
+const WRITE_TOOL_NAMES = new Set(WRITE_TOOLS.map(t => t.name));
+
+/**
+ * Validate + serialize a write-tool call into a pending_confirm row,
+ * then return the confirm message + inline keyboard for the bot to send.
+ * Does NOT execute the underlying action — that happens in
+ * executeConfirmedAction after the user taps ✅ Да.
+ */
+async function proposeWriteTool(
+  toolName: string,
+  input: Record<string, unknown>,
+  ctx: FamilyCtx,
+): Promise<BotResponse> {
+  // Strip "propose_" prefix — stored type is the action name
+  const actionType = toolName.replace(/^propose_/, '') as ConfirmType;
+  const nonce = generateConfirmNonce();
+
+  // Build a human-readable confirm message based on the action + args
+  let message: string;
+  try {
+    message = await buildProposalMessage(actionType, input, ctx);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : 'неверные аргументы';
+    return textOnly(`❌ ${msg}`);
+  }
+
+  await setPendingConfirm(ctx.familyId, {
+    nonce,
+    type: actionType,
+    args: input,
+  });
+
+  return withKeyboard(message, confirmKeyboard(nonce));
+}
+
+async function buildProposalMessage(
+  type: ConfirmType,
+  input: Record<string, unknown>,
+  ctx: FamilyCtx,
+): Promise<string> {
+  switch (type) {
+    case 'create_goal': {
+      const name = String(input.name ?? '').trim();
+      const target = Number(input.target_amount);
+      const deadline = String(input.deadline ?? '');
+      if (!name) throw new Error('Укажи название цели.');
+      if (!target || target <= 0) throw new Error('Укажи сумму больше 0.');
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(deadline)) throw new Error('Дедлайн должен быть в формате YYYY-MM-DD.');
+      return `🎯 Создать цель: *${name}* — ${formatTenge(target)} к ${deadline}?`;
+    }
+    case 'contribute_to_goal': {
+      const amount = Number(input.amount);
+      if (!amount || amount <= 0) throw new Error('Укажи сумму больше 0.');
+      const goal = await getActiveGoal(ctx.familyId);
+      if (!goal) throw new Error('Нет активной цели. Сначала создай цель.');
+      return `💰 Добавить ${formatTenge(amount)} к цели *${goal.name}*? (будет ${formatTenge(goal.current_amount + amount)} из ${formatTenge(goal.target_amount)})`;
+    }
+    case 'archive_goal': {
+      const goal = await getActiveGoal(ctx.familyId);
+      if (!goal) throw new Error('Нет активной цели.');
+      return `🗂 Закрыть цель *${goal.name}*? Текущий прогресс: ${formatTenge(goal.current_amount)} из ${formatTenge(goal.target_amount)}.`;
+    }
+    case 'delete_transaction': {
+      const id = String(input.transaction_id ?? '');
+      if (!id) throw new Error('Не указан ID транзакции.');
+      return `🗑 Удалить транзакцию ${id}?`;
+    }
+    case 'update_transaction_category': {
+      const id = String(input.transaction_id ?? '');
+      const newSlug = String(input.new_category_slug ?? '');
+      if (!id) throw new Error('Не указан ID транзакции.');
+      if (!newSlug) throw new Error('Не указана новая категория.');
+      const cat = await getCategoryBySlugInFamily(newSlug, ctx.familyId);
+      if (!cat) throw new Error(`Категория '${newSlug}' не найдена.`);
+      return `🏷 Переклассифицировать эту транзакцию в ${cat.emoji} *${cat.name}*?\n(Запомню ключевое слово для этой семьи — похожие траты будут автоматически попадать сюда.)`;
+    }
+    case 'set_monthly_plan': {
+      const slug = String(input.category_slug ?? '');
+      const amount = Number(input.amount);
+      if (!slug) throw new Error('Укажи категорию.');
+      if (amount < 0) throw new Error('Сумма не может быть отрицательной.');
+      const cat = await getCategoryBySlugInFamily(slug, ctx.familyId);
+      if (!cat) throw new Error(`Категория '${slug}' не найдена.`);
+      const { year, month } = currentMonthAlmaty();
+      const y = (input.year as number) ?? year;
+      const m = (input.month as number) ?? month;
+      return `📊 Поставить лимит ${formatTenge(amount)} на ${cat.emoji} ${cat.name} за ${monthNameRu(m)} ${y}?`;
+    }
+    case 'create_category': {
+      const name = String(input.name ?? '').trim();
+      const emoji = String(input.emoji ?? '').trim();
+      if (!name) throw new Error('Укажи название категории.');
+      if (!emoji) throw new Error('Укажи эмодзи.');
+      return `🆕 Создать категорию *${emoji} ${name}*?`;
+    }
+    case 'rename_category': {
+      const slug = String(input.slug ?? '');
+      const newName = String(input.new_name ?? '').trim();
+      if (!slug || !newName) throw new Error('Укажи категорию и новое название.');
+      const cat = await getCategoryBySlugInFamily(slug, ctx.familyId);
+      if (!cat) throw new Error(`Категория '${slug}' не найдена.`);
+      const newEmoji = input.new_emoji ? String(input.new_emoji) : cat.emoji;
+      return `✏️ Переименовать ${cat.emoji} ${cat.name} → ${newEmoji} *${newName}*?`;
+    }
+    case 'delete_category': {
+      const slug = String(input.slug ?? '');
+      const reassignTo = String(input.reassign_to_slug ?? 'misc');
+      const cat = await getCategoryBySlugInFamily(slug, ctx.familyId);
+      if (!cat) throw new Error(`Категория '${slug}' не найдена.`);
+      const target = await getCategoryBySlugInFamily(reassignTo, ctx.familyId);
+      if (!target) throw new Error(`Целевая категория '${reassignTo}' не найдена.`);
+      return `🗑 Удалить ${cat.emoji} ${cat.name}? Транзакции перенесутся в ${target.emoji} ${target.name}.`;
+    }
+    case 'merge_categories': {
+      const fromSlug = String(input.from_slug ?? '');
+      const intoSlug = String(input.into_slug ?? '');
+      const source = await getCategoryBySlugInFamily(fromSlug, ctx.familyId);
+      const target = await getCategoryBySlugInFamily(intoSlug, ctx.familyId);
+      if (!source) throw new Error(`Категория '${fromSlug}' не найдена.`);
+      if (!target) throw new Error(`Категория '${intoSlug}' не найдена.`);
+      return `🔀 Объединить ${source.emoji} ${source.name} в ${target.emoji} ${target.name}?`;
+    }
+  }
+}
+
+/**
+ * Execute a previously-confirmed action. Called from handleCallback after
+ * user taps ✅ Да.
+ */
+async function executeConfirmedAction(
+  pending: PendingConfirm,
+  ctx: FamilyCtx,
+): Promise<string> {
+  const a = pending.args as Record<string, unknown>;
+  switch (pending.type) {
+    case 'create_goal': {
+      const goal = await createGoal({
+        family_id: ctx.familyId,
+        name: String(a.name),
+        target_amount: Number(a.target_amount),
+        deadline: String(a.deadline),
+      });
+      return `🎯 Цель создана: *${goal.name}* — ${formatTenge(goal.target_amount)} к ${goal.deadline}.\nВноси через "отложил N" или просто посылай траты.`;
+    }
+    case 'contribute_to_goal': {
+      const updated = await addGoalContribution(ctx.familyId, Number(a.amount), ctx.userId);
+      const pct = updated.target_amount > 0
+        ? Math.min(100, Math.round((updated.current_amount / updated.target_amount) * 100))
+        : 0;
+      return `💰 Добавлено ${formatTenge(Number(a.amount))} к цели *${updated.name}*.\nПрогресс: ${formatTenge(updated.current_amount)} из ${formatTenge(updated.target_amount)} (${pct}%).`;
+    }
+    case 'archive_goal': {
+      const goal = await getActiveGoal(ctx.familyId);
+      if (!goal) return '🤔 Нет активной цели.';
+      await archiveGoal(goal.id, ctx.familyId);
+      return `🗂 Цель *${goal.name}* закрыта.`;
+    }
+    case 'delete_transaction': {
+      await softDeleteTransaction(String(a.transaction_id), ctx.familyId);
+      return '🗑 Транзакция удалена.';
+    }
+    case 'update_transaction_category': {
+      const txnId = String(a.transaction_id);
+      const newSlug = String(a.new_category_slug);
+      const cat = await getCategoryBySlugInFamily(newSlug, ctx.familyId);
+      if (!cat) throw new Error(`Категория '${newSlug}' не найдена.`);
+
+      // 1. Update the transaction
+      const updated = await updateTransactionCategory(txnId, cat.id, ctx.familyId);
+
+      // 2. Learning loop: save an override for this keyword so future similar
+      //    transactions auto-route to the same category. Quietly skip if the
+      //    transaction has no comment to learn from.
+      if (updated.comment && updated.comment.trim().length > 0) {
+        try {
+          await upsertCategoryOverride(ctx.familyId, updated.comment, newSlug, ctx.userId);
+        } catch (e) {
+          // Non-fatal — the user's correction still stood. Just log.
+          console.warn('[update_transaction_category] override save failed:', e);
+        }
+      }
+
+      return `🏷 Перекатегоризовано → ${cat.emoji} *${cat.name}*. Запомнил.`;
+    }
+    case 'set_monthly_plan': {
+      const slug = String(a.category_slug);
+      const cat = await getCategoryBySlugInFamily(slug, ctx.familyId);
+      if (!cat) throw new Error(`Категория '${slug}' не найдена.`);
+      const { year: curY, month: curM } = currentMonthAlmaty();
+      const y = (a.year as number) ?? curY;
+      const m = (a.month as number) ?? curM;
+      await upsertMonthlyPlan({
+        family_id: ctx.familyId,
+        year: y,
+        month: m,
+        category_id: cat.id,
+        plan_type: 'expense',
+        amount: Number(a.amount),
+        created_by: ctx.userId,
+      });
+      return `📊 Лимит ${formatTenge(Number(a.amount))} на ${cat.emoji} ${cat.name} установлен.`;
+    }
+    case 'create_category': {
+      const cat = await createCategory({
+        family_id: ctx.familyId,
+        name: String(a.name),
+        emoji: String(a.emoji),
+      });
+      return `🆕 Категория создана: ${cat.emoji} *${cat.name}*.`;
+    }
+    case 'rename_category': {
+      const cat = await renameCategory({
+        family_id: ctx.familyId,
+        slug: String(a.slug),
+        new_name: String(a.new_name),
+        new_emoji: a.new_emoji ? String(a.new_emoji) : undefined,
+      });
+      return `✏️ Переименовано: ${cat.emoji} *${cat.name}*.`;
+    }
+    case 'delete_category': {
+      await deleteCategory({
+        family_id: ctx.familyId,
+        slug: String(a.slug),
+        reassign_to_slug: a.reassign_to_slug ? String(a.reassign_to_slug) : undefined,
+      });
+      return `🗑 Категория удалена, транзакции перенесены.`;
+    }
+    case 'merge_categories': {
+      await mergeCategories({
+        family_id: ctx.familyId,
+        from_slug: String(a.from_slug),
+        into_slug: String(a.into_slug),
+      });
+      return `🔀 Категории объединены.`;
+    }
+  }
+}
+
+/**
+ * Format a list of transactions as a Telegram-safe text block.
+ * Caps at 30 rows (caller should pre-trim if needed).
+ */
+function formatTransactionList(
+  transactions: import('@/types').Transaction[],
+  categories: import('@/types').Category[],
+  opts: { total: number; offset: number; hasMore: boolean },
+): string {
+  if (transactions.length === 0) return '📭 Нет транзакций.';
+
+  const catMap = new Map(categories.map(c => [c.id, c]));
+
+  const from = opts.offset + 1;
+  const to = opts.offset + transactions.length;
+  let text: string;
+  if (opts.total <= transactions.length && opts.offset === 0) {
+    text = `📋 ${transactions.length} записей:\n\n`;
+  } else {
+    text = `📋 Показано ${from}–${to} из ${opts.total}:\n\n`;
+  }
+
+  for (const t of transactions) {
+    const cat = t.category_id ? catMap.get(t.category_id) : null;
+    const icon = t.type === 'income' ? '📥' : (cat?.emoji ?? '❓');
+    text += `${t.transaction_date} | ${icon} ${formatTenge(t.amount)}`;
+    if (t.comment) text += ` — ${t.comment}`;
+    text += '\n';
+  }
+
+  if (opts.hasMore) {
+    text += `\n💡 Скажи "ещё" для следующих ${Math.min(30, opts.total - to)}, или укажи период.`;
+  }
+
+  return text.trim();
 }
 
 async function executeReadTool(
@@ -356,17 +901,90 @@ async function executeReadTool(
     }
 
     case 'get_recent_transactions': {
-      const count = Math.min((input.count as number) || 10, 20);
-      const txns = await getLastNTransactionsFamily(ctx.familyId, count);
+      // Legacy tool kept for backward compat. Delegates to list_recent_transactions.
+      const count = Math.min((input.count as number) || 10, 30);
+      const result = await listRecentTransactionsPaged(ctx.familyId, count, 0);
+      return formatTransactionList(result.transactions, await getCategoriesForFamily(ctx.familyId), {
+        total: result.total_count,
+        offset: 0,
+        hasMore: result.has_more,
+      });
+    }
+
+    case 'list_recent_transactions': {
+      const limit = Math.min(Math.max(1, (input.limit as number) || 10), 30);
+
+      // Check if the user is saying "ещё" — reuse stored context for continuation
+      const priorCtx = await getPendingListContext(ctx.familyId).catch(() => null);
+      const offsetRaw = input.offset as number | undefined;
+      const periodStart = input.period_start as string | undefined;
+      const periodEnd = input.period_end as string | undefined;
+
+      // If Claude didn't specify offset but there's a pending context, continue.
+      // (Claude should usually specify offset itself when user says "ещё", but
+      //  this is a safety net.)
+      const effectiveOffset = offsetRaw ?? (priorCtx?.offset ?? 0);
+      const effectivePeriodStart = periodStart ?? priorCtx?.period_start;
+      const effectivePeriodEnd = periodEnd ?? priorCtx?.period_end;
+
+      const result = await listRecentTransactionsPaged(
+        ctx.familyId,
+        limit,
+        effectiveOffset,
+        effectivePeriodStart,
+        effectivePeriodEnd,
+      );
+
+      // Persist context for potential follow-up "ещё"
+      if (result.has_more) {
+        await setPendingListContext(ctx.familyId, {
+          limit,
+          offset: effectiveOffset + result.transactions.length,
+          period_start: effectivePeriodStart,
+          period_end: effectivePeriodEnd,
+        }).catch(() => {});
+      } else {
+        await clearPendingListContext(ctx.familyId).catch(() => {});
+      }
+
+      return formatTransactionList(result.transactions, await getCategoriesForFamily(ctx.familyId), {
+        total: result.total_count,
+        offset: effectiveOffset,
+        hasMore: result.has_more,
+      });
+    }
+
+    case 'search_transactions_by_comment': {
+      const keyword = input.keyword as string;
+      if (!keyword || typeof keyword !== 'string') return '🤔 Укажи, что искать.';
+      const periodStart = input.period_start as string | undefined;
+      const periodEnd = input.period_end as string | undefined;
+
+      const result = await searchTransactionsByComment(ctx.familyId, keyword, periodStart, periodEnd);
+      if (result.count === 0) {
+        const periodHint = periodStart || periodEnd ? ` за указанный период` : '';
+        return `🔍 По '${keyword}'${periodHint} — ничего не найдено.`;
+      }
+
       const categories = await getCategoriesForFamily(ctx.familyId);
       const catMap = new Map(categories.map(c => [c.id, c]));
 
-      if (txns.length === 0) return '📭 Нет транзакций.';
+      let text = `🔍 По '${keyword}'`;
+      if (periodStart || periodEnd) {
+        text += ` (${periodStart ?? '...'} → ${periodEnd ?? '...'})`;
+      }
+      // sample.sum is sum of the top-10 sample, but count is total. If the sample
+      // covers all matches (count <= 10), the sample sum IS the true sum.
+      // Otherwise we note "showing 10 of N" and sample sum is lower bound.
+      if (result.count <= result.sample.length) {
+        text += `: ${formatTenge(result.sum)} · ${result.count} трат\n\n`;
+      } else {
+        text += `: найдено ${result.count} трат. Показаны последние ${result.sample.length} на сумму ${formatTenge(result.sum)}\n\n`;
+      }
 
-      let text = `📋 Последние ${txns.length} записей:\n\n`;
-      for (const t of txns) {
+      for (const t of result.sample) {
         const cat = t.category_id ? catMap.get(t.category_id) : null;
-        const icon = t.type === 'income' ? '📥' : (cat?.emoji ?? '❓');
+        const icon = cat?.emoji ?? '❓';
         text += `${t.transaction_date} | ${icon} ${formatTenge(t.amount)}`;
         if (t.comment) text += ` — ${t.comment}`;
         text += '\n';
@@ -405,11 +1023,11 @@ export async function chat(
   telegramId: number,
   userName: string,
   chatId: number
-): Promise<string> {
+): Promise<BotResponse> {
   // Resolve family context ONCE per request — never fetched inside handlers.
   // If this returns null, the user is not whitelisted anywhere and cannot act.
   const user = await getUserByTelegramId(telegramId);
-  if (!user) return '⛔ Пользователь не найден в системе.';
+  if (!user) return textOnly('⛔ Пользователь не найден в системе.');
 
   const ctx: FamilyCtx = {
     familyId: user.family_id,
@@ -428,7 +1046,7 @@ export async function chat(
     const reply = await handleUndo(ctx);
     await saveUserMsg();
     await saveAssistantMsg(reply);
-    return reply;
+    return textOnly(reply);
   }
 
   // ── 2. Debt (deterministic) ──
@@ -437,7 +1055,7 @@ export async function chat(
     const reply = await handleDebt(debt, ctx);
     await saveUserMsg();
     await saveAssistantMsg(reply);
-    return reply;
+    return textOnly(reply);
   }
 
   // ── 3. Income (deterministic) ──
@@ -446,7 +1064,7 @@ export async function chat(
     const reply = await handleIncome(income, ctx);
     await saveUserMsg();
     await saveAssistantMsg(reply);
-    return reply;
+    return textOnly(reply);
   }
 
   // ── 4. Expenses (deterministic) ──
@@ -455,10 +1073,10 @@ export async function chat(
     const reply = await handleExpenses(expenses, ctx);
     await saveUserMsg();
     await saveAssistantMsg(reply);
-    return reply;
+    return textOnly(reply);
   }
 
-  // ── 5. Everything else → Claude (read-only tools) ──
+  // ── 5. Everything else → Claude (read + write tools) ──
   let history: { role: string; content: string }[] = [];
   try { history = await getRecentMessages(chatId, ctx.familyId, 10); } catch { /* */ }
 
@@ -476,13 +1094,17 @@ export async function chat(
   await saveUserMsg();
 
   let finalReply = '';
+  // If a write tool is proposed, we exit the loop early with a keyboard reply
+  // so the user can tap Да/Отмена. Claude's own natural-language response for
+  // that turn is discarded in favor of our structured confirm message.
+  let confirmResponse: BotResponse | null = null;
 
   for (let i = 0; i < 5; i++) {
     const response = await client.messages.create({
       model: MODEL,
       max_tokens: 1024,
       system: buildSystemPrompt(),
-      tools: READ_TOOLS,
+      tools: [...READ_TOOLS, ...WRITE_TOOLS],
       messages,
     });
 
@@ -496,11 +1118,27 @@ export async function chat(
     messages.push({ role: 'assistant', content: response.content });
     const toolResults: ToolResult[] = [];
     for (const block of toolUses) {
-      if (block.type === 'tool_use') {
-        const result = await executeReadTool(block.name, block.input as Record<string, unknown>, ctx);
-        toolResults.push({ tool_use_id: block.id, content: result });
+      if (block.type !== 'tool_use') continue;
+      const toolName = block.name;
+      const input = block.input as Record<string, unknown>;
+
+      // WRITE tool → propose + confirm
+      if (WRITE_TOOL_NAMES.has(toolName)) {
+        const proposal = await proposeWriteTool(toolName, input, ctx);
+        // Short-circuit: return the confirm message directly to the user.
+        // (We don't feed this back to Claude because we're breaking out of
+        //  the loop — no further reasoning needed.)
+        confirmResponse = proposal;
+        break;
       }
+
+      // READ tool → execute + feed result back to Claude
+      const result = await executeReadTool(toolName, input, ctx);
+      toolResults.push({ tool_use_id: block.id, content: result });
     }
+
+    if (confirmResponse) break;
+
     messages.push({
       role: 'user',
       content: toolResults.map(r => ({
@@ -513,8 +1151,69 @@ export async function chat(
     if (response.stop_reason === 'end_turn') break;
   }
 
-  if (!finalReply) finalReply = '🤔';
+  if (confirmResponse) {
+    await saveAssistantMsg(confirmResponse.text);
+    return confirmResponse;
+  }
 
+  if (!finalReply) finalReply = '🤔';
   await saveAssistantMsg(finalReply);
-  return finalReply;
+  return textOnly(finalReply);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Callback-query entry point — invoked by bot handlers.ts when
+// user taps ✅ Да or ❌ Отмена on a confirm prompt.
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Handle an inline-keyboard callback. `data` is the `callback_data` field
+ * of the tapped button: `confirm:<nonce>` or `cancel:<nonce>`.
+ *
+ * Validates the nonce matches the stored pending_confirm for this family,
+ * executes (or cancels) the proposed action, and returns a result BotResponse.
+ */
+export async function handleCallback(
+  data: string,
+  telegramId: number,
+  userName: string,
+  chatId: number,
+): Promise<BotResponse> {
+  const user = await getUserByTelegramId(telegramId);
+  if (!user) return textOnly('⛔ Пользователь не найден.');
+
+  const ctx: FamilyCtx = {
+    familyId: user.family_id,
+    userId: user.id,
+    userName,
+    chatId,
+  };
+
+  const [action, nonce] = data.split(':');
+  if (!nonce || (action !== 'confirm' && action !== 'cancel')) {
+    return textOnly('🤔 Не понял, что подтвердить.');
+  }
+
+  const pending = await getPendingConfirm(ctx.familyId);
+  if (!pending) {
+    return textOnly('⌛ Запрос устарел. Попробуй ещё раз.');
+  }
+  if (pending.nonce !== nonce) {
+    return textOnly('🤔 Этот запрос уже обработан.');
+  }
+
+  // Clear regardless of action — stop the confirm window from lingering
+  await clearPendingConfirm(ctx.familyId);
+
+  if (action === 'cancel') {
+    return textOnly('❌ Отменено.');
+  }
+
+  // Execute the proposed action
+  try {
+    return textOnly(await executeConfirmedAction(pending, ctx));
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : 'ошибка';
+    return textOnly(`❌ ${msg}`);
+  }
 }

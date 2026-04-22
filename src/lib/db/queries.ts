@@ -311,6 +311,28 @@ export async function insertTransaction(tx: {
   return data;
 }
 
+/**
+ * Update a transaction's category. Scoped by family_id — cannot touch
+ * another family's data even if the caller somehow knows the UUID.
+ * Returns the updated transaction OR throws if not found.
+ */
+export async function updateTransactionCategory(
+  transactionId: string,
+  newCategoryId: number,
+  familyId: string,
+): Promise<Transaction> {
+  const { data, error } = await supabase
+    .from('transactions')
+    .update({ category_id: newCategoryId, updated_at: new Date().toISOString() })
+    .eq('id', transactionId)
+    .eq('family_id', familyId)
+    .select()
+    .single();
+  if (error) throw new Error(`Не удалось обновить категорию: ${error.message}`);
+  if (!data) throw new Error('Транзакция не найдена в этой семье.');
+  return data;
+}
+
 export async function softDeleteTransaction(id: string, familyId: string): Promise<void> {
   const { data, error } = await supabase
     .from('transactions')
@@ -1171,6 +1193,73 @@ export async function clearPendingListContext(familyId: string): Promise<void> {
   const { error } = await supabase
     .from('families')
     .update({ pending_list_context: null })
+    .eq('id', familyId);
+  if (error) throw error;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pending confirms (write-tool proposals awaiting user ✅/❌ tap)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export type ConfirmType =
+  | 'create_goal'
+  | 'contribute_to_goal'
+  | 'archive_goal'
+  | 'delete_transaction'
+  | 'update_transaction_category'
+  | 'set_monthly_plan'
+  | 'create_category'
+  | 'rename_category'
+  | 'delete_category'
+  | 'merge_categories';
+
+export interface PendingConfirm {
+  nonce: string;
+  type: ConfirmType;
+  args: Record<string, unknown>;
+  stored_at: string;  // ISO
+}
+
+/**
+ * Generate a short random nonce (4 hex chars = 65K possibilities). Fits
+ * easily in Telegram's 64-byte callback_data limit.
+ */
+export function generateConfirmNonce(): string {
+  return Math.random().toString(16).slice(2, 6).padStart(4, '0');
+}
+
+export async function setPendingConfirm(
+  familyId: string,
+  proposal: Omit<PendingConfirm, 'stored_at'>,
+): Promise<void> {
+  const full: PendingConfirm = { ...proposal, stored_at: new Date().toISOString() };
+  const { error } = await supabase
+    .from('families')
+    .update({ pending_confirm: full })
+    .eq('id', familyId);
+  if (error) throw new Error(`Не удалось сохранить запрос: ${error.message}`);
+}
+
+export async function getPendingConfirm(
+  familyId: string,
+  ttlMinutes = 10,
+): Promise<PendingConfirm | null> {
+  const { data } = await supabase
+    .from('families')
+    .select('pending_confirm')
+    .eq('id', familyId)
+    .single();
+  const pc = data?.pending_confirm as PendingConfirm | null;
+  if (!pc) return null;
+  const age = Date.now() - new Date(pc.stored_at).getTime();
+  if (age > ttlMinutes * 60_000) return null;
+  return pc;
+}
+
+export async function clearPendingConfirm(familyId: string): Promise<void> {
+  const { error } = await supabase
+    .from('families')
+    .update({ pending_confirm: null })
     .eq('id', familyId);
   if (error) throw error;
 }
