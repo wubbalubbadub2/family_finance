@@ -43,7 +43,11 @@ import { todayAlmaty, currentMonthAlmaty, monthNameRu, formatTenge } from '@/lib
 import { renderGoalProgress, computeWeekBoundsAlmaty } from '@/lib/goals';
 
 const client = new Anthropic();
-const MODEL = process.env.CLAUDE_MODEL || 'claude-haiku-4-5-20251001';
+// Sonnet 4.6 for tool routing — Haiku had ~15-30% miss rate on ambiguous
+// Russian phrasing even with aggressive prompts. Sonnet is ~5× more per call
+// but at 1-2 families scale, that's pennies/month and the reliability wins.
+// Override via env if you want to test Haiku or a different model.
+const MODEL = process.env.CLAUDE_MODEL || 'claude-sonnet-4-6';
 
 // ═══════════════════════════════════════════════════════════════
 // PATTERN DETECTION — determine user intent from text
@@ -191,6 +195,109 @@ function detectPeriod(lower: string): { start: string; end: string } | null {
   }
 
   return null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Deterministic list-query parsing.
+//
+// Triggers ONLY for explicit "show me recent transactions" phrasing. This is
+// a narrow tool — if user asks anything else, they get routed to Claude
+// (which has search/summary/debts but no list). The goal is to never confuse
+// list with search.
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface ListIntent {
+  limit: number;
+  offset: number;
+  periodStart?: string;
+  periodEnd?: string;
+  continuation: boolean;  // true if user said "ещё" and we should pick up from pending context
+}
+
+/**
+ * Recognize list-request phrasings:
+ *   "покажи последние траты"
+ *   "последние 20 транзакций"
+ *   "show me recent expenses"
+ *   "show last 10 transactions"
+ *   "/recent" / "/recent 50"
+ *   "ещё" or "еще" or "more" (continuation — pairs with pending_list_context)
+ *   "что мы тратили вчера?" / "что было в апреле" (temporal slice, no keyword)
+ */
+function tryParseListQuery(text: string): ListIntent | null {
+  const lower = text.toLowerCase().trim();
+  if (!lower) return null;
+
+  // Continuation: user said just "ещё" or "еще" or "more"
+  if (/^(ещё|еще|more|продолжи)[.!?]*$/i.test(lower)) {
+    return { limit: 10, offset: 0, continuation: true };
+  }
+
+  // /recent command with optional N
+  const cmdMatch = lower.match(/^\/recent(?:\s+(\d{1,3}))?/);
+  if (cmdMatch) {
+    const n = cmdMatch[1] ? parseInt(cmdMatch[1], 10) : 10;
+    return { limit: Math.min(Math.max(1, n), 30), offset: 0, continuation: false };
+  }
+
+  // "покажи [последние] [N] [транзакций|трат|записей|расходов]"
+  // Also matches English: "show me last N transactions"
+  const showPattern = /(?:покажи(?:те)?|показать|show(?:\s+me)?|дай|давай)(?:\s+мне)?\s+(?:(?:все|all|my|мои|наши)\s+)?(?:(?:последние?|последних|крайние|recent|last)\s+)?(?:(\d{1,3})\s+)?(?:трат|транзакц|записей|расход|expenses?|transactions?)/i;
+  const showMatch = lower.match(showPattern);
+  if (showMatch) {
+    const n = showMatch[1] ? parseInt(showMatch[1], 10) : 10;
+    // Reject if there's a keyword after "на" — that belongs to search, not list.
+    // E.g., "покажи траты на кофе" → keyword, not list.
+    if (/\bна\s+[а-яёa-z]{3,}/i.test(lower)) {
+      // Unless the thing after "на" is a period phrase like "на этой неделе"
+      const afterNa = lower.match(/\bна\s+([а-яёa-z]+)/i);
+      if (afterNa) {
+        const w = afterNa[1];
+        const isPeriodWord = /^(этой|этом|прошлой|прошлом|следующей|следующем|неделе|неделю|месяце|месяц|году|год|вчера|сегодня|завтра)$/i.test(w);
+        if (!isPeriodWord) return null;  // it's a keyword, not a period → search handles it
+      }
+    }
+    return {
+      limit: Math.min(Math.max(1, n), 30),
+      offset: 0,
+      ...periodFromText(lower),
+      continuation: false,
+    };
+  }
+
+  // Bare "последние N трат" without "покажи" prefix
+  const bareListPattern = /^(?:последние?|последних)\s+(\d{1,3})?\s*(?:трат|транзакц|записей|расход)/i;
+  if (bareListPattern.test(lower)) {
+    const m = lower.match(/(\d{1,3})/);
+    const n = m ? parseInt(m[1], 10) : 10;
+    return {
+      limit: Math.min(Math.max(1, n), 30),
+      offset: 0,
+      ...periodFromText(lower),
+      continuation: false,
+    };
+  }
+
+  // "что мы тратили вчера / в апреле / на этой неделе" (no keyword, temporal slice)
+  if (/что\s+(?:мы|я)\s+(?:тратили|покупали|купили|потратили)/i.test(lower)) {
+    const period = detectPeriod(lower);
+    if (period) {
+      return {
+        limit: 30,
+        offset: 0,
+        periodStart: period.start,
+        periodEnd: period.end,
+        continuation: false,
+      };
+    }
+  }
+
+  return null;
+}
+
+function periodFromText(lower: string): { periodStart?: string; periodEnd?: string } {
+  const p = detectPeriod(lower);
+  return p ? { periodStart: p.start, periodEnd: p.end } : {};
 }
 
 /**
@@ -451,6 +558,51 @@ async function handleDebt(debt: { amount: number; name: string }, ctx: FamilyCtx
   }
 }
 
+async function handleListQuery(intent: ListIntent, ctx: FamilyCtx): Promise<string> {
+  // Continuation: user said "ещё" — resume from stored pending_list_context
+  let effectiveLimit = intent.limit;
+  let effectiveOffset = intent.offset;
+  let effectivePeriodStart = intent.periodStart;
+  let effectivePeriodEnd = intent.periodEnd;
+
+  if (intent.continuation) {
+    const prior = await getPendingListContext(ctx.familyId).catch(() => null);
+    if (!prior) {
+      return '🤔 Нечего продолжать. Сначала покажи список: "покажи последние траты".';
+    }
+    effectiveLimit = prior.limit ?? 10;
+    effectiveOffset = prior.offset;
+    effectivePeriodStart = prior.period_start;
+    effectivePeriodEnd = prior.period_end;
+  }
+
+  const result = await listRecentTransactionsPaged(
+    ctx.familyId,
+    effectiveLimit,
+    effectiveOffset,
+    effectivePeriodStart,
+    effectivePeriodEnd,
+  );
+
+  // Persist context for potential "ещё" follow-up
+  if (result.has_more) {
+    await setPendingListContext(ctx.familyId, {
+      limit: effectiveLimit,
+      offset: effectiveOffset + result.transactions.length,
+      period_start: effectivePeriodStart,
+      period_end: effectivePeriodEnd,
+    }).catch(() => {});
+  } else {
+    await clearPendingListContext(ctx.familyId).catch(() => {});
+  }
+
+  return formatTransactionList(result.transactions, await getCategoriesForFamily(ctx.familyId), {
+    total: result.total_count,
+    offset: effectiveOffset,
+    hasMore: result.has_more,
+  });
+}
+
 async function handleKeywordSearch(intent: SearchIntent, ctx: FamilyCtx): Promise<string> {
   const result = await searchTransactionsByComment(
     ctx.familyId,
@@ -548,25 +700,10 @@ const READ_TOOLS: Anthropic.Tool[] = [
       required: ['year', 'month'],
     },
   },
-  {
-    name: 'list_recent_transactions',
-    description:
-      'List recent transactions, newest first, with pagination. Use ONLY when the user asks to SEE the list ' +
-      'without specifying a keyword — e.g., "покажи последние траты", "show me recent expenses", "what have we logged", ' +
-      '"последние 20 записей". If user says "ещё" (more), the stored offset continues automatically. ' +
-      'DO NOT use for keyword questions like "сколько на X" — use search_transactions_by_comment instead. ' +
-      'Hard cap 30 items per reply.',
-    input_schema: {
-      type: 'object' as const,
-      properties: {
-        limit: { type: 'number', description: 'Max 30. Default 10.' },
-        offset: { type: 'number', description: 'For pagination. 0 = latest.' },
-        period_start: { type: 'string', description: 'YYYY-MM-DD (inclusive). Omit for all time.' },
-        period_end: { type: 'string', description: 'YYYY-MM-DD (inclusive). Omit for all time.' },
-      },
-      required: [],
-    },
-  },
+  // NOTE: list_recent_transactions is NOT offered to Claude. It's a narrow
+  // use case ("show me the last N rows, no filter") and LLM routing
+  // consistently mis-picked it for keyword questions. A deterministic parser
+  // in chat() handles list requests — see tryParseListQuery.
   {
     name: 'get_debts',
     description: 'Show active debts (deterministic list with totals + per-debt remaining).',
@@ -592,27 +729,15 @@ function buildSystemPrompt(): string {
 
 ТВОИ ИНСТРУМЕНТЫ:
 
-Чтение (используются сразу):
-- search_transactions_by_comment(keyword, period?) — *ГЛАВНЫЙ* инструмент для вопросов с ключевым словом
-- list_recent_transactions(limit?, offset?, period?) — список последних трат БЕЗ ключевого слова
+Чтение:
+- search_transactions_by_comment(keyword, period?) — поиск по ключевому слову. Используй для вопросов типа "сколько на X" если система не перехватила их сама.
 - get_month_summary(year, month) — итоги месяца
 - get_debts — долги
 
-ПРАВИЛО РОУТИНГА (ОЧЕНЬ ВАЖНО):
-Если в вопросе есть существительное (например "чипсы", "агуша", "кофе", "бензин", "кафе",
-"продукты") И пользователь спрашивает ПРО это существительное — ВСЕГДА используй
-search_transactions_by_comment. НЕ list_recent_transactions.
-
-Примеры, где ОБЯЗАТЕЛЬНО search_transactions_by_comment:
-- "сколько на чипсы?" → search, keyword="чипсы"
-- "сколько раз мы покупали агушу и сколько в деньгах ушло?" → search, keyword="агуша"
-- "когда последний раз покупали бензин?" → search, keyword="бензин"
-- "сколько мы тратим на кофе обычно?" → search, keyword="кофе"
-
-Примеры для list_recent_transactions (БЕЗ ключевого слова):
-- "покажи последние траты" → list, limit=10
-- "что мы вчера тратили?" → list, period_start=вчера, period_end=вчера
-- "ещё" (после предыдущего списка) → list, offset подхватится
+ВАЖНО: списки последних транзакций ("покажи последние траты", "/recent", "ещё") система
+обрабатывает ДО того, как ты их увидишь — у тебя НЕТ инструмента list_recent. Если
+пользователь пишет такой запрос и ты до него дошёл, просто ответь обычным текстом
+"Напиши: покажи последние 10 трат".
 
 Запись (пользователь подтверждает кнопкой ✅ Да перед исполнением):
 - propose_create_goal(name, target_amount, deadline) — создать цель накоплений
@@ -1092,60 +1217,6 @@ async function executeReadTool(
       return buildSummaryText(summary);
     }
 
-    case 'get_recent_transactions': {
-      // Legacy tool kept for backward compat. Delegates to list_recent_transactions.
-      const count = Math.min((input.count as number) || 10, 30);
-      const result = await listRecentTransactionsPaged(ctx.familyId, count, 0);
-      return formatTransactionList(result.transactions, await getCategoriesForFamily(ctx.familyId), {
-        total: result.total_count,
-        offset: 0,
-        hasMore: result.has_more,
-      });
-    }
-
-    case 'list_recent_transactions': {
-      const limit = Math.min(Math.max(1, (input.limit as number) || 10), 30);
-
-      // Check if the user is saying "ещё" — reuse stored context for continuation
-      const priorCtx = await getPendingListContext(ctx.familyId).catch(() => null);
-      const offsetRaw = input.offset as number | undefined;
-      const periodStart = input.period_start as string | undefined;
-      const periodEnd = input.period_end as string | undefined;
-
-      // If Claude didn't specify offset but there's a pending context, continue.
-      // (Claude should usually specify offset itself when user says "ещё", but
-      //  this is a safety net.)
-      const effectiveOffset = offsetRaw ?? (priorCtx?.offset ?? 0);
-      const effectivePeriodStart = periodStart ?? priorCtx?.period_start;
-      const effectivePeriodEnd = periodEnd ?? priorCtx?.period_end;
-
-      const result = await listRecentTransactionsPaged(
-        ctx.familyId,
-        limit,
-        effectiveOffset,
-        effectivePeriodStart,
-        effectivePeriodEnd,
-      );
-
-      // Persist context for potential follow-up "ещё"
-      if (result.has_more) {
-        await setPendingListContext(ctx.familyId, {
-          limit,
-          offset: effectiveOffset + result.transactions.length,
-          period_start: effectivePeriodStart,
-          period_end: effectivePeriodEnd,
-        }).catch(() => {});
-      } else {
-        await clearPendingListContext(ctx.familyId).catch(() => {});
-      }
-
-      return formatTransactionList(result.transactions, await getCategoriesForFamily(ctx.familyId), {
-        total: result.total_count,
-        offset: effectiveOffset,
-        hasMore: result.has_more,
-      });
-    }
-
     case 'search_transactions_by_comment': {
       const keyword = input.keyword as string;
       if (!keyword || typeof keyword !== 'string') return '🤔 Укажи, что искать.';
@@ -1256,7 +1327,18 @@ export async function chat(
     return textOnly(reply);
   }
 
-  // ── 6. Everything else → Claude (read + write tools) ──
+  // ── 6. List query (deterministic, bypasses Claude) ──
+  // list_recent_transactions isn't in Claude's toolset — it gets called
+  // only via this parser, which triggers on explicit "show me last N" patterns.
+  const listIntent = tryParseListQuery(text);
+  if (listIntent) {
+    const reply = await handleListQuery(listIntent, ctx);
+    await saveUserMsg();
+    await saveAssistantMsg(reply);
+    return textOnly(reply);
+  }
+
+  // ── 7. Everything else → Claude (read + write tools) ──
   let history: { role: string; content: string }[] = [];
   try { history = await getRecentMessages(chatId, ctx.familyId, 10); } catch { /* */ }
 
