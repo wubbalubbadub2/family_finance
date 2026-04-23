@@ -1,122 +1,79 @@
-# Onboarding a new family
+# Admin onboarding: adding a new family to the bot
 
-Runbook for adding a paying family (or test family) to the bot.
-~3 minutes per family.
+~3 minutes per family. No default categories — users create their own via the bot (see `USER_GUIDE.md`).
 
 ## Prerequisites
 
-- Their Telegram user ID(s). Easiest way to get: have them send any message to
-  [@userinfobot](https://t.me/userinfobot) on Telegram, which replies with their ID.
-- A Telegram chat ID where cron notifications should go. Usually same as their
-  user ID for 1-on-1 DM mode.
-- 5 minutes access to the Supabase SQL Editor.
+- The new user's Telegram **numeric user ID**. They can get it by messaging [@userinfobot](https://t.me/userinfobot) and forwarding you the reply.
+- For group chats: the **chat_id** of the group (negative number). Easiest way to get it: add the bot to the group, have it post a test message, check the Vercel function log — `ctx.chat.id` is logged by the webhook.
+- 2 minutes access to the Supabase SQL Editor + Vercel env settings.
 
 ## Steps
 
-### 1. Add their Telegram IDs to the env allowlist
+### 1. Add their Telegram user ID(s) to `ALLOWED_TELEGRAM_IDS`
 
-On Vercel → Settings → Environment Variables, edit `ALLOWED_TELEGRAM_IDS`
-and append their ID(s), comma-separated. Redeploy so the change takes effect.
+Vercel → **Settings → Environment Variables** → edit `ALLOWED_TELEGRAM_IDS` (comma-separated). For a group with 3 family members, add all 3 user IDs. Redeploy.
 
-Example: if current value is `123456,234567`, new value is `123456,234567,<NEW_ID>`.
+### 2. Create the family row + user rows in Supabase
 
-### 2. Create family + users + seed categories
-
-Open the Supabase SQL Editor and run this, replacing placeholders.
+Open **SQL Editor**, replace placeholders, run:
 
 ```sql
--- Create the family and capture its UUID
 WITH new_family AS (
   INSERT INTO families (name, primary_chat_id)
-  VALUES ('Family name', 123456789)   -- name, primary chat ID
+  VALUES ('Psychologist Family', 123456789)  -- name, primary chat ID (group or user)
   RETURNING id
-),
-inserted_users AS (
-  INSERT INTO users (telegram_id, name, family_id)
-  SELECT unnest(ARRAY[111111111, 222222222]::bigint[]),      -- member TG IDs
-         unnest(ARRAY['Member A', 'Member B']),              -- display names
-         id
-  FROM new_family
-  RETURNING family_id, id, name, telegram_id
 )
-SELECT * FROM inserted_users;
+INSERT INTO users (telegram_id, name, family_id)
+SELECT unnest(ARRAY[111111111, 222222222]::bigint[]),  -- each member's Telegram user ID
+       unnest(ARRAY['Имя жены', 'Имя мужа']),           -- display names
+       id
+FROM new_family
+RETURNING family_id, id, name, telegram_id;
 ```
 
-Copy the `family_id` from the output. Use it in step 3.
+Copy the `family_id` from the output. Bot is now active for them.
 
-### 3. Seed default categories
+**`primary_chat_id` is where cron notifications go.** For a solo user → their Telegram user ID. For a group → the group chat ID (negative number).
 
-```sql
-SELECT seed_default_categories_for_family('<FAMILY_UUID>');
-```
+### 3. Send them `USER_GUIDE.md`
 
-Verifies 10 rows return successfully (Жильё, Продукты, Транспорт, Кафе & выход,
-Балапанчик, Здоровье, Кредиты, Личное, Savings, Разное).
+Screenshot or export it to PDF/image. They follow the 7 steps.
 
-### 4. (Optional) Pre-create a goal for a warm onboarding experience
+Their first message to the bot should be a `создай категории: ...` line. Once that's confirmed, everything else works.
 
-If you want the new user to see the goal progress line on their very first
-expense reply, insert a goal before the onboarding call:
+### 4. Watch the first few minutes
 
-```sql
-INSERT INTO goals (family_id, name, target_amount, deadline, status)
-VALUES ('<FAMILY_UUID>', 'Отпуск 2026', 1000000, '2026-12-31', 'active');
-```
+Stay on Telegram. If they hit a bug (bot silent, wrong category, confusing reply), you see it live and can debug.
 
-Otherwise, let the user create one during the call by saying
-"хочу накопить 1 000 000 на отпуск к декабрю" — the bot proposes + they
-confirm with the ✅ Да button.
+---
 
-### 5. Smoke test
-
-Have the user send any expense like `кофе 500`. Verify:
-- Bot replies with category + month summary
-- Goal progress line appears at the bottom (if you did step 4)
-- Dashboard at `/transactions` (if they have access) shows their entry scoped
-  to their family
-
-### 6. (Optional) Teach the user the core NL commands
-
-Share these with them directly:
-- `кофе 500` — log an expense
-- `зарплата 500000` — log income (any text with "зарплата", "доход", etc.)
-- `взял в долг 100000 Айдар` — track a debt
-- `сколько на чипсы в этом месяце?` — NL search
-- `покажи последние 10 трат` / `покажи траты за неделю` — list
-- `хочу накопить 500000 на машину к 2027-01-01` — propose a goal
-- `отложил 50000` — add to the active goal
-- `создай категорию Спорт с эмодзи 🏃` — add a custom category
-- Tap `✅ Да` on confirmation prompts to execute write actions.
-
-## Remove a family
-
-If a paying family stops (churns), just remove their Telegram IDs from the
-`ALLOWED_TELEGRAM_IDS` env var and redeploy. The bot will stop accepting their
-messages. Data stays in the DB. If you want a hard delete:
+## Removing a family
 
 ```sql
--- CAREFUL: this cascades to transactions, goals, monthly_plans, debts, etc.
+-- Hard delete (cascades to transactions, goals, monthly_plans, debts, etc.)
 DELETE FROM families WHERE id = '<FAMILY_UUID>';
 ```
 
+Then remove their Telegram IDs from `ALLOWED_TELEGRAM_IDS` in Vercel and redeploy.
+
+For a soft disable (keep data, block messages): just remove from `ALLOWED_TELEGRAM_IDS`.
+
+---
+
 ## Troubleshooting
 
-### "Пользователь не найден в системе" error
+**"Пользователь не найден в системе"**
+→ They messaged before you added them to the `users` table, OR their Telegram ID doesn't match what you registered.
 
-The user's `telegram_id` doesn't match any row in `users`. Check:
-- You added them to `users` table with the correct Telegram ID
-- They're messaging the bot from the same Telegram account you registered
+**"категория не найдена"**
+→ They tried to log an expense before creating any categories. Tell them to do step 2 of `USER_GUIDE.md` first.
 
-### "null value in column 'family_id' violates not-null constraint"
+**Cron notifications not arriving**
+→ `families.primary_chat_id` is null, or the bot isn't a member of that chat. Check that the bot has posted in that chat at least once.
 
-Some INSERT path isn't passing `family_id`. Find the offending caller and fix
-it to resolve `family_id` from the authenticated user. Check `queries.ts` for
-which helper was used.
+**Bot silent (no reply at all)**
+→ Check Vercel function logs for the webhook. Look for `[chat] iter N` log lines to see if Claude hit a timeout or an error. The 45s loop deadline should now prevent total silence — user sees at least a "это заняло долго, попробуй проще" message.
 
-### Cron notifications not reaching a family
-
-- Verify `families.primary_chat_id` is set (non-null)
-- Verify `TELEGRAM_BOT_TOKEN` env var matches the bot that member is DMing
-- Hit the cron URL manually: `curl -H "Authorization: Bearer <CRON_SECRET>" 
-  https://<your-vercel-url>/api/cron/weekly-digest` — check the JSON response
-  for per-family `sent: false, reason: ...`
+**Markdown formatting broken in bot replies**
+→ Harmless. `handlers.ts` falls back to plain text if Telegram rejects Markdown (common when user comments contain unescaped `*`, `_`, `[`).

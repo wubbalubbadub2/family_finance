@@ -28,6 +28,7 @@ import {
   archiveGoal,
   addGoalContribution,
   createCategory,
+  createCategoriesBulk,
   renameCategory,
   deleteCategory,
   mergeCategories,
@@ -515,14 +516,40 @@ const READ_TOOLS: Anthropic.Tool[] = [
   },
 ];
 
-function buildSystemPrompt(): string {
+/**
+ * Quick response for first-run users who try to log expenses before creating
+ * any categories. Echo back what they wrote so they know we saw it, then
+ * guide to the setup step.
+ */
+function firstRunWelcomeExpenseAttempt(expenses: { amount: number; description: string }[]): string {
+  let reply = '👋 Добро пожаловать! Прежде чем записывать траты, создай свои категории расходов.\n\n';
+  reply += 'Напиши, например:\n';
+  reply += '*"создай категории: Продукты 🛒, Транспорт 🚗, Кафе ☕, Жильё 🏠, Личное 🎯, Прочее 🎲"*\n\n';
+  reply += 'Бот предложит создать их все одной кнопкой ✅ Да.\n\n';
+  reply += 'После этого я смогу записать:\n';
+  for (const e of expenses.slice(0, 3)) {
+    reply += `- ${e.description} ${e.amount} ₸\n`;
+  }
+  return reply;
+}
+
+function buildSystemPrompt(firstRun = false): string {
   const { year, month } = currentMonthAlmaty();
   const today = todayAlmaty();
+
+  const firstRunBlock = firstRun ? `
+⚠️ FIRST RUN: у этой семьи НЕТ категорий. Что бы пользователь ни спрашивал —
+СНАЧАЛА предложи создать стартовый набор категорий. Используй
+propose_create_categories_bulk со списком из 6-8 типичных категорий
+(Продукты 🛒, Транспорт 🚗, Кафе ☕, Жильё 🏠, Здоровье 💊, Личное 🎯, Прочее 🎲),
+либо персонализированный под контекст пользователя. Пока категорий нет,
+ничего другого делать не нужно — только онбординг.
+` : '';
 
   return `Ты — семейный финансовый ассистент. Кратко, на русском.
 
 Сегодня: ${today}. Месяц: ${monthNameRu(month)} ${year}.
-
+${firstRunBlock}
 У тебя ЕСТЬ инструменты чтения и записи. НЕ отказывайся "я не могу изменить" — если
 пользователь просит что-то изменить, найди подходящий propose_* инструмент и вызови
 его. Система спросит у пользователя подтверждение.
@@ -556,7 +583,8 @@ function buildSystemPrompt(): string {
 - propose_delete_transaction(transaction_id)
 - propose_update_transaction_category(transaction_id, new_category_slug) ⬅
 - propose_set_monthly_plan(category_slug, amount, year?, month?)
-- propose_create_category(name, emoji)
+- propose_create_category(name, emoji) — одна категория
+- propose_create_categories_bulk(categories: [{name, emoji}, ...]) — несколько за раз, одна кнопка ✅ (используй при онбординге)
 - propose_rename_category(slug, new_name, new_emoji?)
 - propose_delete_category(slug, reassign_to_slug?)
 - propose_merge_categories(from_slug, into_slug)
@@ -606,7 +634,8 @@ function buildSystemPrompt(): string {
 - "удали трату N" (где N — описание) → сначала list_recent_transactions найти её, потом propose_delete_transaction с ID
 - "это было не Х, а Y" / "поменяй категорию на Y" / "переклассифицируй в Y" → найди транзакцию через list_recent или search, потом propose_update_transaction_category
 - "поставь лимит N на [категорию]" → propose_set_monthly_plan
-- "создай категорию" / "добавь категорию" → propose_create_category
+- "создай категорию X" (одна) → propose_create_category
+- "создай категории X, Y, Z" / "добавь 5 категорий" / "стартовый набор" → propose_create_categories_bulk
 - "переименуй X в Y" / "поменяй название" → propose_rename_category
 - "удали категорию" → propose_delete_category
 - "объедини X в Y" → propose_merge_categories
@@ -728,8 +757,9 @@ const WRITE_TOOLS: Anthropic.Tool[] = [
   {
     name: 'propose_create_category',
     description:
-      'Propose creating a new custom category for this family. ' +
-      'Call when user says "создай категорию Х" / "add category Х с эмодзи Y".',
+      'Propose creating a SINGLE new category for this family. ' +
+      'Call when user says "создай категорию X с эмодзи Y" for one category. ' +
+      'For multiple categories at once use propose_create_categories_bulk instead — one confirm tap covers all.',
     input_schema: {
       type: 'object' as const,
       properties: {
@@ -737,6 +767,32 @@ const WRITE_TOOLS: Anthropic.Tool[] = [
         emoji: { type: 'string', description: 'Single emoji for the category' },
       },
       required: ['name', 'emoji'],
+    },
+  },
+  {
+    name: 'propose_create_categories_bulk',
+    description:
+      'Propose creating MULTIPLE categories at once — one confirm covers all. ' +
+      'Use for first-run setup ("создай категории Продукты 🛒, Транспорт 🚗, Кафе ☕") ' +
+      'and for any message that lists ≥2 categories at once. Pick sensible emojis yourself ' +
+      'if the user only provides names.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        categories: {
+          type: 'array',
+          description: 'List of categories to create. Each has name + emoji.',
+          items: {
+            type: 'object',
+            properties: {
+              name: { type: 'string' },
+              emoji: { type: 'string' },
+            },
+            required: ['name', 'emoji'],
+          },
+        },
+      },
+      required: ['categories'],
     },
   },
   {
@@ -887,6 +943,23 @@ async function buildProposalMessage(
       if (!emoji) throw new Error('Укажи эмодзи.');
       return `🆕 Создать категорию *${emoji} ${name}*?`;
     }
+    case 'create_categories_bulk': {
+      const cats = (input.categories as Array<{ name?: string; emoji?: string }> | undefined) ?? [];
+      if (cats.length === 0) throw new Error('Пустой список категорий.');
+      // Validate every entry before proposing
+      const clean = cats.map(c => ({
+        name: String(c.name ?? '').trim(),
+        emoji: String(c.emoji ?? '').trim(),
+      }));
+      for (const c of clean) {
+        if (!c.name) throw new Error('У одной из категорий пустое название.');
+        if (!c.emoji) throw new Error(`У категории '${c.name}' нет эмодзи.`);
+      }
+      // Mutate input so execute path uses cleaned data
+      (input as Record<string, unknown>).categories = clean;
+      const list = clean.map(c => `${c.emoji} ${c.name}`).join(', ');
+      return `🆕 Создать ${clean.length} ${clean.length === 1 ? 'категорию' : 'категорий'}: ${list}?`;
+    }
     case 'rename_category': {
       const slug = String(input.slug ?? '');
       const newName = String(input.new_name ?? '').trim();
@@ -1001,6 +1074,23 @@ async function executeConfirmedAction(
         emoji: String(a.emoji),
       });
       return `🆕 Категория создана: ${cat.emoji} *${cat.name}*.`;
+    }
+    case 'create_categories_bulk': {
+      const cats = a.categories as Array<{ name: string; emoji: string }>;
+      const { created, skipped } = await createCategoriesBulk({
+        family_id: ctx.familyId,
+        categories: cats,
+      });
+      let reply = `🆕 Создано ${created.length} ${created.length === 1 ? 'категория' : 'категорий'}:\n`;
+      for (const c of created) reply += `- ${c.emoji} ${c.name}\n`;
+      if (skipped.length > 0) {
+        reply += `\n⚠️ Пропущено ${skipped.length}:\n`;
+        for (const s of skipped) reply += `- ${s.slug} (${s.reason})\n`;
+      }
+      if (created.length > 0) {
+        reply += `\nТеперь можешь логировать траты: напиши например "кофе 500" или "такси 2500".`;
+      }
+      return reply.trim();
     }
     case 'rename_category': {
       const cat = await renameCategory({
@@ -1201,6 +1291,15 @@ export async function chat(
   const saveUserMsg = () => saveMessage(ctx.chatId, ctx.familyId, 'user', `[${userName}]: ${text}`).catch(() => {});
   const saveAssistantMsg = (reply: string) => saveMessage(ctx.chatId, ctx.familyId, 'assistant', reply).catch(() => {});
 
+  // ── 0. First-run: family has no categories yet ──
+  // Families are created without default categories — user picks their own.
+  // Until at least one exists, expense parsing fails with "категория не найдена",
+  // so we intercept here and route EVERYTHING through Claude with category-
+  // creation as the primary action. Once ≥1 category exists this branch falls
+  // through and normal deterministic paths take over.
+  const familyCategoriesCheck = await getCategoriesForFamily(ctx.familyId).catch(() => []);
+  const isFirstRun = familyCategoriesCheck.length === 0;
+
   // ── 1. Undo (deterministic) ──
   if (isUndoRequest(text)) {
     const reply = await handleUndo(ctx);
@@ -1230,6 +1329,14 @@ export async function chat(
   // ── 4. Expenses (deterministic) ──
   const expenses = tryParseExpenses(text);
   if (expenses) {
+    // First-run guard: can't log an expense without any categories. Guide
+    // the user to set them up first instead of erroring on every line.
+    if (isFirstRun) {
+      const reply = firstRunWelcomeExpenseAttempt(expenses);
+      await saveUserMsg();
+      await saveAssistantMsg(reply);
+      return textOnly(reply);
+    }
     const reply = await handleExpenses(expenses, ctx);
     await saveUserMsg();
     await saveAssistantMsg(reply);
@@ -1281,7 +1388,7 @@ export async function chat(
     const response = await client.messages.create({
       model: MODEL,
       max_tokens: 1024,
-      system: buildSystemPrompt(),
+      system: buildSystemPrompt(isFirstRun),
       tools: [...READ_TOOLS, ...WRITE_TOOLS],
       messages,
     });

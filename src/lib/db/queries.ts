@@ -143,6 +143,51 @@ export async function createCategory(input: {
 }
 
 /**
+ * Bulk-create categories for a family. Used during onboarding so a new user
+ * can set up 5–10 categories with ONE confirm tap instead of 10.
+ * Skips any duplicates (slug collision) and reports them in a warnings list.
+ */
+export async function createCategoriesBulk(input: {
+  family_id: string;
+  categories: { name: string; emoji: string; slug?: string }[];
+}): Promise<{ created: Category[]; skipped: { slug: string; reason: string }[] }> {
+  const created: Category[] = [];
+  const skipped: { slug: string; reason: string }[] = [];
+
+  // Fetch existing sort_orders once so we can append new ones
+  const existing = await getAllCategoriesForFamily(input.family_id);
+  let nextOrder = existing.reduce((m, c) => Math.max(m, c.sort_order ?? 0), 0) + 1;
+  const existingSlugs = new Set(existing.map(c => c.slug));
+
+  for (const c of input.categories) {
+    const slug = c.slug ?? slugifyForCategory(c.name);
+    if (!slug) { skipped.push({ slug: c.name, reason: 'пустое название' }); continue; }
+    if (existingSlugs.has(slug)) { skipped.push({ slug, reason: 'уже существует' }); continue; }
+
+    const { data, error } = await supabase
+      .from('categories')
+      .insert({
+        family_id: input.family_id,
+        name: c.name,
+        emoji: c.emoji,
+        slug,
+        sort_order: nextOrder++,
+        is_active: true,
+      })
+      .select()
+      .single();
+    if (error) {
+      skipped.push({ slug, reason: error.code === '23505' ? 'дубликат' : error.message });
+      continue;
+    }
+    created.push(data);
+    existingSlugs.add(slug);
+  }
+
+  return { created, skipped };
+}
+
+/**
  * Rename a category. Updates name and optionally emoji. Slug stays stable
  * (slug is the machine-name; display name is what users see).
  */
@@ -1413,6 +1458,7 @@ export type ConfirmType =
   | 'update_transaction_category'
   | 'set_monthly_plan'
   | 'create_category'
+  | 'create_categories_bulk'
   | 'rename_category'
   | 'delete_category'
   | 'merge_categories';
