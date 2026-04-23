@@ -1110,6 +1110,58 @@ export function russianStem(word: string): string {
   return word;
 }
 
+/**
+ * Top individual items by total spend. Groups expense transactions by
+ * lowercased comment and returns the biggest buckets. Answers
+ * "на что больше всего потратили (сам элемент, не категория)?"
+ *
+ * Rows with NULL/empty comment collapse under "(без описания)".
+ * Same-comment-different-case rows merge ("Агуша" + "агуша" → one bucket).
+ */
+export interface TopItemRow {
+  label: string;         // lowercased comment, or "(без описания)"
+  total: number;         // sum across matching rows
+  count: number;         // number of matching rows
+}
+
+export async function topItemsByComment(
+  familyId: string,
+  limit = 10,
+  periodStart?: string,
+  periodEnd?: string,
+): Promise<TopItemRow[]> {
+  // Supabase JS client doesn't support GROUP BY directly. Two options:
+  //   (a) Postgres function (rpc), or
+  //   (b) fetch rows and aggregate in JS.
+  // Family-level row counts are small (<10K/month typical), so (b) is fine
+  // and avoids a migration for an RPC.
+  let q = supabase
+    .from('transactions')
+    .select('amount, comment')
+    .eq('family_id', familyId)
+    .is('deleted_at', null)
+    .eq('type', 'expense');
+  if (periodStart) q = q.gte('transaction_date', periodStart);
+  if (periodEnd) q = q.lte('transaction_date', periodEnd);
+
+  const { data } = await q;
+  if (!data || data.length === 0) return [];
+
+  const buckets = new Map<string, { total: number; count: number }>();
+  for (const row of data) {
+    const key = (row.comment ?? '').trim().toLowerCase() || '(без описания)';
+    const bucket = buckets.get(key) ?? { total: 0, count: 0 };
+    bucket.total += row.amount;
+    bucket.count += 1;
+    buckets.set(key, bucket);
+  }
+
+  return Array.from(buckets.entries())
+    .map(([label, { total, count }]) => ({ label, total, count }))
+    .sort((a, b) => b.total - a.total)
+    .slice(0, Math.min(Math.max(1, limit), 50));
+}
+
 export async function searchTransactionsByComment(
   familyId: string,
   keyword: string,

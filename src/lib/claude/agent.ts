@@ -35,6 +35,7 @@ import {
   updateTransactionCategory,
   upsertCategoryOverride,
   resolveTransactionRef,
+  topItemsByComment,
   type ConfirmType,
   type PendingConfirm,
 } from '@/lib/db/queries';
@@ -485,6 +486,25 @@ const READ_TOOLS: Anthropic.Tool[] = [
     },
   },
   {
+    name: 'get_top_items_by_comment',
+    description:
+      'Return the top N items (by total spent) grouped by transaction comment. ' +
+      'Use when user asks "на что больше всего потратили (САМ ЭЛЕМЕНТ, не категория)?", ' +
+      '"what did we spend the most on?", "топ-10 трат по товарам", "на какие товары больше всего ушло?". ' +
+      'Different from get_month_summary (which groups by category) — this groups by the specific item/comment. ' +
+      'Lowercased same-comment entries merge ("Агуша" + "агуша" → one row). ' +
+      'For "за апрель" / "за неделю" etc., pass period_start + period_end as YYYY-MM-DD.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        limit: { type: 'number', description: 'How many top items to return. Default 10, max 50.' },
+        period_start: { type: 'string', description: 'YYYY-MM-DD inclusive. Omit for all time.' },
+        period_end: { type: 'string', description: 'YYYY-MM-DD inclusive. Omit for all time.' },
+      },
+      required: [],
+    },
+  },
+  {
     name: 'get_debts',
     description: 'Show active debts (deterministic list with totals + per-debt remaining).',
     input_schema: {
@@ -521,7 +541,12 @@ function buildSystemPrompt(): string {
   Используй КОГДА пользователь хочет увидеть список БЕЗ конкретного товара
   ("покажи последние 20", "что мы тратили вчера"). Для "ещё" — передавай offset = предыдущий_offset + предыдущий_limit.
   НЕ используй для вопросов "сколько на X" — там нужен search.
-- get_month_summary(year, month) — итоги месяца с разбивкой по категориям
+- get_month_summary(year, month) — итоги месяца с разбивкой по КАТЕГОРИЯМ
+- get_top_items_by_comment(limit?, period?) — топ ТОВАРОВ/ЭЛЕМЕНТОВ по сумме трат.
+  Используй когда пользователь хочет знать "на что больше всего потратили" на уровне
+  КОНКРЕТНЫХ ВЕЩЕЙ, не категорий: "на что больше всего ушло?", "топ-10 товаров",
+  "на что больше всего потратили — не категория, а сам элемент".
+  НЕ get_month_summary — там разбивка по категориям (Продукты, Транспорт и т.д.).
 - get_debts — долги
 
 ЗАПИСЬ (пользователь подтверждает кнопкой ✅ Да перед исполнением):
@@ -1100,6 +1125,33 @@ async function executeReadTool(
       );
     }
 
+    case 'get_top_items_by_comment': {
+      const limit = Math.min(Math.max(1, (input.limit as number) || 10), 50);
+      const periodStart = input.period_start as string | undefined;
+      const periodEnd = input.period_end as string | undefined;
+
+      const rows = await topItemsByComment(ctx.familyId, limit, periodStart, periodEnd);
+      if (rows.length === 0) {
+        const periodHint = periodStart || periodEnd ? ' за указанный период' : '';
+        return `📊 Нет трат${periodHint}.`;
+      }
+
+      let text = `📊 Топ-${rows.length} товаров по тратам`;
+      if (periodStart || periodEnd) {
+        text += ` (${periodStart ?? '...'} → ${periodEnd ?? '...'})`;
+      }
+      text += ':\n\n';
+      const grandTotal = rows.reduce((s, r) => s + r.total, 0);
+      for (let i = 0; i < rows.length; i++) {
+        const r = rows[i];
+        const share = grandTotal > 0 ? Math.round((r.total / grandTotal) * 100) : 0;
+        text += `${i + 1}. *${formatTenge(r.total)}* · ${r.label}`;
+        if (r.count > 1) text += ` (×${r.count})`;
+        text += ` — ${share}%\n`;
+      }
+      return text.trim();
+    }
+
     case 'get_debts': {
       const debts = await getActiveDebts(ctx.familyId);
       if (debts.length === 0) return '🎉 Нет активных долгов!';
@@ -1214,8 +1266,18 @@ export async function chat(
   // so the user can tap Да/Отмена. Claude's own natural-language response for
   // that turn is discarded in favor of our structured confirm message.
   let confirmResponse: BotResponse | null = null;
+  const loopStart = Date.now();
 
   for (let i = 0; i < 5; i++) {
+    // Vercel webhook has a 60s budget. If we've already burned 45s, bail so
+    // the user sees something instead of Telegram timing out on its retry.
+    if (Date.now() - loopStart > 45_000) {
+      console.warn(`[chat] loop budget exceeded at iter ${i}, bailing`);
+      finalReply = finalReply || '⌛ Это заняло слишком долго. Попробуй переформулировать или задать проще.';
+      break;
+    }
+
+    console.log(`[chat] iter ${i}: sending ${messages.length} messages to ${MODEL}`);
     const response = await client.messages.create({
       model: MODEL,
       max_tokens: 1024,
@@ -1240,17 +1302,39 @@ export async function chat(
 
       // WRITE tool → propose + confirm
       if (WRITE_TOOL_NAMES.has(toolName)) {
-        const proposal = await proposeWriteTool(toolName, input, ctx);
-        // Short-circuit: return the confirm message directly to the user.
-        // (We don't feed this back to Claude because we're breaking out of
-        //  the loop — no further reasoning needed.)
-        confirmResponse = proposal;
+        try {
+          const proposal = await proposeWriteTool(toolName, input, ctx);
+          // Short-circuit: return the confirm message directly to the user.
+          confirmResponse = proposal;
+        } catch (e) {
+          // Don't kill the whole reply — tell Sonnet what went wrong and let
+          // it either retry with different args or explain to the user.
+          const errMsg = e instanceof Error ? e.message : String(e);
+          console.warn(`[chat] write tool ${toolName} threw:`, errMsg);
+          toolResults.push({
+            tool_use_id: block.id,
+            content: `ERROR: ${errMsg}. Fix the args and try again, or explain the issue to the user.`,
+          });
+          continue;
+        }
         break;
       }
 
-      // READ tool → execute + feed result back to Claude
-      const result = await executeReadTool(toolName, input, ctx);
-      toolResults.push({ tool_use_id: block.id, content: result });
+      // READ tool → execute + feed result back to Claude. Wrap in try/catch
+      // so a single bad tool call never silences the whole reply.
+      try {
+        const tStart = Date.now();
+        const result = await executeReadTool(toolName, input, ctx);
+        console.log(`[chat] tool ${toolName} took ${Date.now() - tStart}ms`);
+        toolResults.push({ tool_use_id: block.id, content: result });
+      } catch (e) {
+        const errMsg = e instanceof Error ? e.message : String(e);
+        console.warn(`[chat] read tool ${toolName} threw:`, errMsg);
+        toolResults.push({
+          tool_use_id: block.id,
+          content: `ERROR: ${errMsg}. Tell the user what went wrong and what they can try instead.`,
+        });
+      }
     }
 
     if (confirmResponse) break;
@@ -1272,7 +1356,12 @@ export async function chat(
     return confirmResponse;
   }
 
-  if (!finalReply) finalReply = '🤔';
+  // Absolute last-resort fallback — should never be empty after all the above,
+  // but if Sonnet returned zero text + zero tool uses, at least say SOMETHING.
+  if (!finalReply) {
+    console.warn('[chat] empty finalReply after loop — falling back');
+    finalReply = '🤔 Не понял. Попробуй переформулировать — например: "сколько на X?" или "покажи последние 10 трат".';
+  }
   await saveAssistantMsg(finalReply);
   return textOnly(finalReply);
 }
