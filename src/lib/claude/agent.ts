@@ -37,8 +37,6 @@ import {
   upsertCategoryOverride,
   resolveTransactionRef,
   topItemsByComment,
-  createFamily,
-  createFamilyInvite,
   type ConfirmType,
   type PendingConfirm,
 } from '@/lib/db/queries';
@@ -523,60 +521,6 @@ const READ_TOOLS: Anthropic.Tool[] = [
  * any categories. Echo back what they wrote so they know we saw it, then
  * guide to the setup step.
  */
-/**
- * Create a new family + one-shot invite link. Inviter (current user) is
- * logged as created_by but is NOT auto-added to the new family — the first
- * person to use the invite becomes its first member.
- *
- * This is the full self-service onboarding path: Shynggys types
- * `/newfamily Psychologist Family` in his own bot chat, gets a link,
- * sends it to her. She taps → her user is created in that new family.
- * No SQL, no env edits.
- */
-async function handleNewFamily(name: string, ctx: FamilyCtx): Promise<string> {
-  try {
-    const familyId = await createFamily(name);
-    const invite = await createFamilyInvite({
-      family_id: familyId,
-      created_by_user_id: ctx.userId,
-      uses: 1,
-      expires_in_days: 14,
-    });
-    const botHandle = process.env.TELEGRAM_BOT_HANDLE?.replace(/^@/, '') ?? 'FamilyBudgetBot';
-    const link = `https://t.me/${botHandle}?start=invite_${invite.code}`;
-    return (
-      `✅ Создал семью *${name}*.\n\n` +
-      `📎 Пригласи первого члена (ссылка действует 14 дней, одноразовая):\n${link}\n\n` +
-      `Когда они кликнут — их аккаунт добавится автоматически. Потом они сами создадут категории через бота.`
-    );
-  } catch (e) {
-    return `❌ ${e instanceof Error ? e.message : 'ошибка'}`;
-  }
-}
-
-/**
- * Generate an invite link for the CURRENT family (the caller's family).
- * Useful for adding a spouse/kid to an existing family.
- */
-async function handleInviteCreate(ctx: FamilyCtx): Promise<string> {
-  try {
-    const invite = await createFamilyInvite({
-      family_id: ctx.familyId,
-      created_by_user_id: ctx.userId,
-      uses: 1,
-      expires_in_days: 14,
-    });
-    const botHandle = process.env.TELEGRAM_BOT_HANDLE?.replace(/^@/, '') ?? 'FamilyBudgetBot';
-    const link = `https://t.me/${botHandle}?start=invite_${invite.code}`;
-    return (
-      `📎 Ссылка для приглашения в твою семью (14 дней, одноразовая):\n${link}\n\n` +
-      `Поделись — они кликнут, и добавятся автоматически.`
-    );
-  } catch (e) {
-    return `❌ ${e instanceof Error ? e.message : 'ошибка'}`;
-  }
-}
-
 function firstRunWelcomeExpenseAttempt(expenses: { amount: number; description: string }[]): string {
   let reply = '👋 Добро пожаловать! Прежде чем записывать траты, создай свои категории расходов.\n\n';
   reply += 'Напиши, например:\n';
@@ -1347,26 +1291,10 @@ export async function chat(
   const saveUserMsg = () => saveMessage(ctx.chatId, ctx.familyId, 'user', `[${userName}]: ${text}`).catch(() => {});
   const saveAssistantMsg = (reply: string) => saveMessage(ctx.chatId, ctx.familyId, 'assistant', reply).catch(() => {});
 
-  // ── -1. Admin command: /newfamily <name> — creates a new family + invite link.
-  //        Anyone in any family can call this; they become the inviter but NOT
-  //        a member of the new family. Used by Shynggys to onboard paying users
-  //        without any SQL or env-var work.
-  const newFamilyMatch = text.match(/^\/newfamily\s+(.{1,80})$/i);
-  if (newFamilyMatch) {
-    const reply = await handleNewFamily(newFamilyMatch[1].trim(), ctx);
-    await saveUserMsg();
-    await saveAssistantMsg(reply);
-    return textOnly(reply);
-  }
-
-  // ── 0a. Admin command: /invite — generate an invite link for YOUR family.
-  //        Useful for adding a spouse/kid to your existing family.
-  if (/^\/invite(\s|$)/i.test(text)) {
-    const reply = await handleInviteCreate(ctx);
-    await saveUserMsg();
-    await saveAssistantMsg(reply);
-    return textOnly(reply);
-  }
+  // NOTE: /newfamily and /invite are handled in bot/handlers.ts BEFORE the
+  // command-prefix strip, because chat() only receives cleanText (prefix
+  // already removed). Keeping them there means this file never sees raw
+  // slash-commands and can focus on natural-language / parsed intents.
 
   // ── 0. First-run: family has no categories yet ──
   // Families are created without default categories — user picks their own.

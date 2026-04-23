@@ -1,7 +1,12 @@
 import { Bot, type Context } from 'grammy';
 import type { InlineKeyboardButton } from 'grammy/types';
 import { chat, handleCallback, type BotResponse } from '@/lib/claude/agent';
-import { consumeFamilyInvite, getUserByTelegramId } from '@/lib/db/queries';
+import {
+  consumeFamilyInvite,
+  getUserByTelegramId,
+  createFamily,
+  createFamilyInvite,
+} from '@/lib/db/queries';
 
 // NOTE: we removed ALLOWED_TELEGRAM_IDS. Allowlist is the `users` table now.
 // Anyone can DM the bot — if they're not in the table, they get a welcome
@@ -41,6 +46,75 @@ async function sendChunked(ctx: Context, response: BotResponse) {
 function parseInvitePayload(text: string): string | null {
   const m = text.match(/^\/start(?:@\w+)?\s+invite_([a-z0-9]+)\s*$/i);
   return m ? m[1].toLowerCase() : null;
+}
+
+function buildInviteLink(code: string): string {
+  const handle = (process.env.TELEGRAM_BOT_HANDLE ?? 'FamilyBudgetBot').replace(/^@/, '');
+  return `https://t.me/${handle}?start=invite_${code}`;
+}
+
+/**
+ * Admin command: create a new EMPTY family + invite link.
+ * The caller is NOT added to the new family — first person to tap the
+ * returned link becomes the first member.
+ */
+async function handleNewFamilyCommand(
+  ctx: Context,
+  name: string | null,
+  callerUserId: string,
+): Promise<void> {
+  if (!name || !name.trim()) {
+    await ctx.reply(
+      '📝 Использование: `/newfamily Название семьи`\n\n' +
+      'Пример: `/newfamily Psychologist Family`\n\n' +
+      'Создаст новую пустую семью и вернёт ссылку-приглашение (действует 14 дней, одноразовая). ' +
+      'Вы НЕ становитесь членом новой семьи — первый, кто кликнет ссылку, будет первым участником.',
+      { parse_mode: 'Markdown' },
+    ).catch(() => ctx.reply('Использование: /newfamily <название>'));
+    return;
+  }
+  try {
+    const familyId = await createFamily(name.trim());
+    const invite = await createFamilyInvite({
+      family_id: familyId,
+      created_by_user_id: callerUserId,
+      uses: 1,
+      expires_in_days: 14,
+    });
+    const link = buildInviteLink(invite.code);
+    await ctx.reply(
+      `✅ Создал семью *${name.trim()}*.\n\n` +
+      `📎 Ссылка-приглашение (14 дней, одноразовая):\n${link}\n\n` +
+      `Перешли её первому члену семьи. Когда они кликнут — их аккаунт добавится автоматически.`,
+      { parse_mode: 'Markdown' },
+    ).catch(() => ctx.reply(`Создал семью "${name.trim()}". Ссылка: ${link}`));
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    await ctx.reply(`❌ ${msg}`);
+  }
+}
+
+/**
+ * Admin command: generate an invite link for the CALLER's own family.
+ * Adds a new member (spouse, kid, etc.) to the existing family.
+ */
+async function handleInviteCommand(ctx: Context, callerFamilyId: string, callerUserId: string): Promise<void> {
+  try {
+    const invite = await createFamilyInvite({
+      family_id: callerFamilyId,
+      created_by_user_id: callerUserId,
+      uses: 1,
+      expires_in_days: 14,
+    });
+    const link = buildInviteLink(invite.code);
+    await ctx.reply(
+      `📎 Ссылка для приглашения в твою семью (14 дней, одноразовая):\n${link}\n\n` +
+      `Перешли тому, кого хочешь добавить. Они кликнут и автоматически присоединятся.`,
+    );
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    await ctx.reply(`❌ ${msg}`);
+  }
 }
 
 /**
@@ -122,6 +196,19 @@ export function createBot(): Bot {
           '👋 Этот бот работает только по приглашению.\n' +
           'Попроси у админа семьи ссылку-приглашение.',
         );
+        return;
+      }
+
+      // Path 3.5: admin slash commands that can't survive the clean-text strip.
+      // These must be handled with the RAW text because the stripping logic
+      // below removes the leading /command from what chat() ultimately sees.
+      const newFamMatch = rawText.match(/^\/newfamily(?:@\w+)?(?:\s+(.+?))?\s*$/i);
+      if (newFamMatch) {
+        await handleNewFamilyCommand(ctx, newFamMatch[1] ?? null, user.id);
+        return;
+      }
+      if (/^\/invite(?:@\w+)?\s*$/i.test(rawText)) {
+        await handleInviteCommand(ctx, user.family_id, user.id);
         return;
       }
 
