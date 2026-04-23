@@ -8,7 +8,6 @@ import {
   insertTransaction,
   softDeleteTransaction,
   getLastTransaction,
-  getLastNTransactionsFamily,
   getMonthSummary,
   getRecentMessages,
   saveMessage,
@@ -723,33 +722,57 @@ function buildSystemPrompt(): string {
 
 Сегодня: ${today}. Месяц: ${monthNameRu(month)} ${year}.
 
-РАСХОДЫ/ДОХОДЫ/ДОЛГИ записываются системой детерминированно из распарсенного сообщения
-("кофе 1200", "взял в долг 50000 Кайрат"). Эти тебе трогать не нужно — если пользователь
-просто пишет сумму и описание, молча не вмешивайся, система сама обработает.
+У тебя ЕСТЬ инструменты чтения и записи. НЕ отказывайся "я не могу изменить" — если
+пользователь просит что-то изменить, найди подходящий propose_* инструмент и вызови
+его. Система спросит у пользователя подтверждение.
 
-ТВОИ ИНСТРУМЕНТЫ:
+Новые траты/доходы/долги уже записываются системой автоматически из сумм+описаний
+("кофе 1200"). Если пользователь просто пишет сумму и описание — не вмешивайся. Но
+если он хочет ИЗМЕНИТЬ уже записанное (поменять категорию, удалить) — это ТВОЯ работа.
 
-Чтение:
-- search_transactions_by_comment(keyword, period?) — поиск по ключевому слову. Используй для вопросов типа "сколько на X" если система не перехватила их сама.
+ЧТЕНИЕ:
+- search_transactions_by_comment(keyword, period?) — поиск по ключевому слову.
+  Также используй чтобы НАЙТИ транзакцию по описанию перед её изменением.
 - get_month_summary(year, month) — итоги месяца
 - get_debts — долги
 
-ВАЖНО: списки последних транзакций ("покажи последние траты", "/recent", "ещё") система
-обрабатывает ДО того, как ты их увидишь — у тебя НЕТ инструмента list_recent. Если
-пользователь пишет такой запрос и ты до него дошёл, просто ответь обычным текстом
-"Напиши: покажи последние 10 трат".
+ЗАПИСЬ (пользователь подтверждает кнопкой ✅ Да перед исполнением):
+- propose_create_goal(name, target_amount, deadline)
+- propose_contribute_to_goal(amount)
+- propose_archive_goal()
+- propose_delete_transaction(transaction_id)
+- propose_update_transaction_category(transaction_id, new_category_slug) ⬅
+- propose_set_monthly_plan(category_slug, amount, year?, month?)
+- propose_create_category(name, emoji)
+- propose_rename_category(slug, new_name, new_emoji?)
+- propose_delete_category(slug, reassign_to_slug?)
+- propose_merge_categories(from_slug, into_slug)
 
-Запись (пользователь подтверждает кнопкой ✅ Да перед исполнением):
-- propose_create_goal(name, target_amount, deadline) — создать цель накоплений
-- propose_contribute_to_goal(amount) — положить N в активную цель
-- propose_archive_goal() — закрыть активную цель
-- propose_delete_transaction(transaction_id) — удалить транзакцию по ID (сначала найди через list_recent_transactions)
-- propose_update_transaction_category(transaction_id, new_category_slug) — переклассифицировать транзакцию. Система также запомнит keyword→category для будущих подобных
-- propose_set_monthly_plan(category_slug, amount, year?, month?) — установить бюджет на категорию
-- propose_create_category(name, emoji) — создать пользовательскую категорию
-- propose_rename_category(slug, new_name, new_emoji?) — переименовать категорию
-- propose_delete_category(slug, reassign_to_slug?) — удалить категорию (транзакции переносятся)
-- propose_merge_categories(from_slug, into_slug) — объединить категории
+ПОТОК ИЗМЕНЕНИЯ КАТЕГОРИИ ТРАНЗАКЦИИ (важно, часто спрашивают):
+Триггеры: "включи X в Y", "перемести X в Y", "переклассифицируй X в Y",
+"это было не X а Y", "поменяй категорию X на Y", "put X in Y".
+Шаги:
+  1. search_transactions_by_comment(keyword=X) — найти последнюю транзакцию с X
+  2. propose_update_transaction_category(transaction_id=<id последней>, new_category_slug=<slug Y>)
+
+Категория-slug маппинги по умолчанию (для твоей семьи после миграции 007):
+  "жильё/квартира/коммуналка" = home
+  "продукты/еда" = food
+  "транспорт/такси/бензин" = transport
+  "кафе/ресторан/выход" = cafe
+  "ребёнок/балапанчик/дети" = baby
+  "здоровье/аптека/врач" = health
+  "кредит/долг" = credit
+  "личное/одежда/стрижка" = personal
+  "сбережения/savings/копилка" = savings
+  "разное/прочее" = misc
+У семьи также могут быть свои категории — используй search_transactions_by_comment
+или задай уточняющий вопрос если slug неясен.
+
+СПИСКИ И "ЕЩЁ":
+Система обрабатывает "покажи последние траты" и "ещё" ДО тебя. У тебя НЕТ list_recent.
+Если пользователь пишет такой запрос и ты дошёл до него — скажи:
+"Напиши: покажи последние 10 трат".
 
 ПЕРИОДЫ:
 Когда в вопросе упомянут месяц/неделя/диапазон, всегда передавай period_start и period_end
