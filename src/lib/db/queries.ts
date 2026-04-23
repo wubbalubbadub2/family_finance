@@ -888,6 +888,134 @@ export async function getAllFamilies(): Promise<{ id: string; name: string; prim
   return data ?? [];
 }
 
+/**
+ * Create a new family. Returns the family_id. Does NOT create any users —
+ * call createFamilyInvite() next and share the link; the first person to
+ * use the invite becomes the first family member.
+ */
+export async function createFamily(name: string, primaryChatId?: number): Promise<string> {
+  if (!name || !name.trim()) throw new Error('Укажи название семьи.');
+  const { data, error } = await supabase
+    .from('families')
+    .insert({ name: name.trim(), primary_chat_id: primaryChatId ?? null })
+    .select('id')
+    .single();
+  if (error || !data) throw new Error(`Не удалось создать семью: ${error?.message ?? 'no data'}`);
+  return data.id;
+}
+
+/**
+ * Short random code. ~6 chars, lowercase alphanumeric. 36^6 = 2B combinations,
+ * enough for this scale; still short enough to type manually if the deep link
+ * fails to open. Excludes ambiguous chars (0/o, 1/l/i).
+ */
+function generateInviteCode(): string {
+  const alphabet = 'abcdefghjkmnpqrstuvwxyz23456789';
+  let code = '';
+  for (let i = 0; i < 6; i++) {
+    code += alphabet[Math.floor(Math.random() * alphabet.length)];
+  }
+  return code;
+}
+
+export interface FamilyInvite {
+  code: string;
+  family_id: string;
+  created_by: string | null;
+  created_at: string;
+  expires_at: string | null;
+  uses_remaining: number;
+}
+
+/**
+ * Generate a one-time invite code for a family. Default expires in 7 days,
+ * single-use. The caller's user_id is stored as `created_by` for audit.
+ */
+export async function createFamilyInvite(input: {
+  family_id: string;
+  created_by_user_id?: string;
+  uses?: number;
+  expires_in_days?: number;
+}): Promise<FamilyInvite> {
+  // Try a few times in the astronomically rare case of a code collision
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const code = generateInviteCode();
+    const expiresAt = input.expires_in_days != null
+      ? new Date(Date.now() + input.expires_in_days * 86400 * 1000).toISOString()
+      : new Date(Date.now() + 7 * 86400 * 1000).toISOString();  // default 7d
+
+    const { data, error } = await supabase
+      .from('family_invites')
+      .insert({
+        code,
+        family_id: input.family_id,
+        created_by: input.created_by_user_id ?? null,
+        expires_at: expiresAt,
+        uses_remaining: input.uses ?? 1,
+      })
+      .select('*')
+      .single();
+
+    if (!error && data) return data;
+    // 23505 = unique violation (code collision) — retry with a new code
+    if (error?.code !== '23505') {
+      throw new Error(`Не удалось создать приглашение: ${error?.message}`);
+    }
+  }
+  throw new Error('Не удалось сгенерировать уникальный код приглашения.');
+}
+
+/**
+ * Consume an invite code: validate, create the user row, decrement uses.
+ * Returns the new user's family_id + name on success, null if the invite
+ * is invalid/expired/exhausted OR the telegram_id already exists.
+ */
+export async function consumeFamilyInvite(
+  code: string,
+  telegramId: number,
+  name: string,
+): Promise<{ familyId: string; userId: string } | { error: string }> {
+  // If the user is already registered, don't re-add — just return their family.
+  // This keeps the invite flow idempotent for users who tap the link twice.
+  const existing = await getUserByTelegramId(telegramId);
+  if (existing) return { familyId: existing.family_id, userId: existing.id };
+
+  const { data: invite } = await supabase
+    .from('family_invites')
+    .select('*')
+    .eq('code', code)
+    .single();
+
+  if (!invite) return { error: 'Приглашение не найдено.' };
+  if (invite.uses_remaining <= 0) return { error: 'Приглашение уже использовано.' };
+  if (invite.expires_at && new Date(invite.expires_at) < new Date()) {
+    return { error: 'Срок приглашения истёк.' };
+  }
+
+  // Create user
+  const { data: newUser, error: userErr } = await supabase
+    .from('users')
+    .insert({
+      telegram_id: telegramId,
+      name: name || 'User',
+      family_id: invite.family_id,
+    })
+    .select('id, family_id')
+    .single();
+
+  if (userErr || !newUser) {
+    return { error: `Не удалось создать пользователя: ${userErr?.message ?? 'no data'}` };
+  }
+
+  // Decrement uses (non-fatal if this fails — user is already registered)
+  await supabase
+    .from('family_invites')
+    .update({ uses_remaining: invite.uses_remaining - 1 })
+    .eq('code', code);
+
+  return { familyId: newUser.family_id, userId: newUser.id };
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Goals
 // ─────────────────────────────────────────────────────────────────────────────

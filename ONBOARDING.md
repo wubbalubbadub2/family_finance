@@ -1,79 +1,107 @@
-# Admin onboarding: adding a new family to the bot
+# Admin onboarding: adding a new family
 
-~3 minutes per family. No default categories — users create their own via the bot (see `USER_GUIDE.md`).
-
-## Prerequisites
-
-- The new user's Telegram **numeric user ID**. They can get it by messaging [@userinfobot](https://t.me/userinfobot) and forwarding you the reply.
-- For group chats: the **chat_id** of the group (negative number). Easiest way to get it: add the bot to the group, have it post a test message, check the Vercel function log — `ctx.chat.id` is logged by the webhook.
-- 2 minutes access to the Supabase SQL Editor + Vercel env settings.
-
-## Steps
-
-### 1. Add their Telegram user ID(s) to `ALLOWED_TELEGRAM_IDS`
-
-Vercel → **Settings → Environment Variables** → edit `ALLOWED_TELEGRAM_IDS` (comma-separated). For a group with 3 family members, add all 3 user IDs. Redeploy.
-
-### 2. Create the family row + user rows in Supabase
-
-Open **SQL Editor**, replace placeholders, run:
-
-```sql
-WITH new_family AS (
-  INSERT INTO families (name, primary_chat_id)
-  VALUES ('Psychologist Family', 123456789)  -- name, primary chat ID (group or user)
-  RETURNING id
-)
-INSERT INTO users (telegram_id, name, family_id)
-SELECT unnest(ARRAY[111111111, 222222222]::bigint[]),  -- each member's Telegram user ID
-       unnest(ARRAY['Имя жены', 'Имя мужа']),           -- display names
-       id
-FROM new_family
-RETURNING family_id, id, name, telegram_id;
-```
-
-Copy the `family_id` from the output. Bot is now active for them.
-
-**`primary_chat_id` is where cron notifications go.** For a solo user → their Telegram user ID. For a group → the group chat ID (negative number).
-
-### 3. Send them `USER_GUIDE.md`
-
-Screenshot or export it to PDF/image. They follow the 7 steps.
-
-Their first message to the bot should be a `создай категории: ...` line. Once that's confirmed, everything else works.
-
-### 4. Watch the first few minutes
-
-Stay on Telegram. If they hit a bug (bot silent, wrong category, confusing reply), you see it live and can debug.
+**~1 minute per family.** One command in your own bot chat — no SQL, no Vercel env edits, no asking users for their Telegram ID.
 
 ---
 
-## Removing a family
+## The flow
 
-```sql
--- Hard delete (cascades to transactions, goals, monthly_plans, debts, etc.)
-DELETE FROM families WHERE id = '<FAMILY_UUID>';
+### 1. Create the family in your bot
+
+In your own bot chat, type:
+
+```
+/newfamily Psychologist Family
 ```
 
-Then remove their Telegram IDs from `ALLOWED_TELEGRAM_IDS` in Vercel and redeploy.
+The bot replies with a one-shot invite link:
 
-For a soft disable (keep data, block messages): just remove from `ALLOWED_TELEGRAM_IDS`.
+```
+✅ Создал семью Psychologist Family.
+
+📎 Пригласи первого члена (ссылка действует 14 дней, одноразовая):
+https://t.me/YourBot?start=invite_abc123
+
+Когда они кликнут — их аккаунт добавится автоматически.
+```
+
+### 2. Send the link to the family admin
+
+Forward or paste the invite link to the psychologist (or whoever is setting up the family) on Telegram.
+
+### 3. They tap the link — done
+
+Telegram opens the bot, sends `/start invite_abc123` to it automatically. The bot:
+- Creates their user row
+- Links them to the family
+- Sends them a welcome message explaining the next step (create categories)
+
+From their side, it looks like a single tap + a welcome. No code entry, no registration form.
+
+### 4. They set up their categories via the bot
+
+First message from them:
+
+```
+создай категории: Продукты 🛒, Транспорт 🚗, Кафе ☕, Жильё 🏠, Личное 🎯, Прочее 🎲
+```
+
+Bot shows the list + ✅ Да button. One tap creates all of them.
+
+### 5. They start logging
+
+```
+кофе 1200
+такси 2500
+```
+
+---
+
+## Adding more people to an existing family
+
+Anyone in a family can type `/invite` in their bot chat to get a new invite link for their OWN family. Share it with a spouse/kid/parent — they tap, they're in.
+
+---
+
+## Removing a family or user
+
+```sql
+-- Remove a user (they lose access immediately; their historical transactions stay)
+DELETE FROM users WHERE telegram_id = 123456789;
+
+-- Remove a family entirely (cascades to transactions, goals, plans, debts, etc.)
+DELETE FROM families WHERE id = '<FAMILY_UUID>';
+```
 
 ---
 
 ## Troubleshooting
 
-**"Пользователь не найден в системе"**
-→ They messaged before you added them to the `users` table, OR their Telegram ID doesn't match what you registered.
+**"Приглашение не найдено"** → code typed wrong or already used. Generate a new link with `/invite`.
 
-**"категория не найдена"**
-→ They tried to log an expense before creating any categories. Tell them to do step 2 of `USER_GUIDE.md` first.
+**"Срок приглашения истёк"** → 14-day TTL hit. Generate a new link.
 
-**Cron notifications not arriving**
-→ `families.primary_chat_id` is null, or the bot isn't a member of that chat. Check that the bot has posted in that chat at least once.
+**"категория не найдена" on first expense** → the user tried to log before creating categories. Tell them to do step 4 first.
 
-**Bot silent (no reply at all)**
-→ Check Vercel function logs for the webhook. Look for `[chat] iter N` log lines to see if Claude hit a timeout or an error. The 45s loop deadline should now prevent total silence — user sees at least a "это заняло долго, попробуй проще" message.
+**Bot silent** → check Vercel function logs. The 45s loop deadline should prevent total silence; if it happens, look for `[chat] iter N` and `[chat] tool X took Yms` timing lines.
 
-**Markdown formatting broken in bot replies**
-→ Harmless. `handlers.ts` falls back to plain text if Telegram rejects Markdown (common when user comments contain unescaped `*`, `_`, `[`).
+**Cron notifications not arriving** → `families.primary_chat_id` is null. Fix:
+```sql
+UPDATE families SET primary_chat_id = <their_chat_id> WHERE id = '<FAMILY_UUID>';
+```
+Their chat_id is their Telegram user_id for DMs or the group chat ID (negative) for group bots.
+
+---
+
+## One-time initial setup (you don't need this again)
+
+Required env vars on Vercel:
+
+- `TELEGRAM_BOT_TOKEN` — from @BotFather
+- `TELEGRAM_BOT_HANDLE` — username without @, e.g. `FamilyBudgetBot` (used to build invite links)
+- `CLAUDE_MODEL` — defaults to `claude-sonnet-4-6`; override if you want Haiku
+- `CRON_SECRET` — any random string for cron auth
+- `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY`
+- `DEFAULT_FAMILY_ID` — optional; for the web dashboard. Default `00000000-0000-0000-0000-000000000001` (your existing family).
+
+Note: `ALLOWED_TELEGRAM_IDS` is no longer used and can be deleted. The `users` table is the allowlist now.

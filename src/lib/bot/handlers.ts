@@ -1,20 +1,13 @@
 import { Bot, type Context } from 'grammy';
 import type { InlineKeyboardButton } from 'grammy/types';
 import { chat, handleCallback, type BotResponse } from '@/lib/claude/agent';
+import { consumeFamilyInvite, getUserByTelegramId } from '@/lib/db/queries';
 
-const ALLOWED_IDS = (process.env.ALLOWED_TELEGRAM_IDS ?? '')
-  .split(',')
-  .map(id => parseInt(id.trim(), 10))
-  .filter(Boolean);
-
-function isAllowed(telegramId: number | undefined): boolean {
-  if (!telegramId) return false;
-  // Allowlist is OR-based: either the env-configured global allowlist,
-  // or any user in the users table (lookup happens inside chat()).
-  // For now the env list is the only gate — chat() also rejects unknown users.
-  if (ALLOWED_IDS.length === 0) return true;  // no allowlist configured → anyone passes the env gate
-  return ALLOWED_IDS.includes(telegramId);
-}
+// NOTE: we removed ALLOWED_TELEGRAM_IDS. Allowlist is the `users` table now.
+// Anyone can DM the bot — if they're not in the table, they get a welcome
+// message telling them to get an invite link from their family admin. If
+// they are, they go through normal chat(). The invite flow (/start invite_X)
+// handles new-user onboarding without requiring env changes.
 
 async function sendResponse(ctx: Context, response: BotResponse) {
   const replyOpts: {
@@ -24,9 +17,6 @@ async function sendResponse(ctx: Context, response: BotResponse) {
   if (response.keyboard && response.keyboard.length > 0) {
     replyOpts.reply_markup = { inline_keyboard: response.keyboard };
   }
-
-  // Try Markdown first; fall back to plain text if Telegram rejects the markup
-  // (common when user comments contain unbalanced *, _, [, etc.)
   try {
     await ctx.reply(response.text, { ...replyOpts, parse_mode: 'Markdown' });
   } catch {
@@ -39,14 +29,49 @@ async function sendChunked(ctx: Context, response: BotResponse) {
     await sendResponse(ctx, response);
     return;
   }
-  // Telegram max message is 4096 chars. Split conservatively, put the
-  // keyboard on the FINAL chunk only so the user doesn't see a button
-  // mid-stream.
   const parts = response.text.match(/[\s\S]{1,4000}/g) ?? [response.text];
   for (let i = 0; i < parts.length - 1; i++) {
     await sendResponse(ctx, { text: parts[i] });
   }
   await sendResponse(ctx, { text: parts[parts.length - 1], keyboard: response.keyboard });
+}
+
+// Telegram deep links: t.me/<bot>?start=<payload> → Telegram sends `/start <payload>`.
+// We use `invite_<code>` as the payload for family onboarding.
+function parseInvitePayload(text: string): string | null {
+  const m = text.match(/^\/start(?:@\w+)?\s+invite_([a-z0-9]+)\s*$/i);
+  return m ? m[1].toLowerCase() : null;
+}
+
+/**
+ * Handle a new user arriving via `/start invite_<code>` deep link.
+ * Creates their user row, links them to the family, welcomes them.
+ */
+async function handleInviteArrival(ctx: Context, code: string): Promise<void> {
+  const telegramId = ctx.from?.id;
+  const name = ctx.from?.first_name || 'User';
+  if (!telegramId) { await ctx.reply('⛔ Не могу определить твой Telegram ID.'); return; }
+
+  const result = await consumeFamilyInvite(code, telegramId, name);
+  if ('error' in result) {
+    await ctx.reply(
+      `❌ ${result.error}\n\nПопроси у админа семьи свежую ссылку-приглашение.`,
+    );
+    return;
+  }
+
+  // Success — brand new user (or idempotent re-tap)
+  await ctx.reply(
+    `👋 Привет, ${name}! Ты теперь в семейном боте.\n\n` +
+    '**Первый шаг** — создай свои категории расходов. Напиши, например:\n\n' +
+    '*"создай категории: Продукты 🛒, Транспорт 🚗, Кафе ☕, Жильё 🏠, Личное 🎯, Прочее 🎲"*\n\n' +
+    'Бот предложит создать их все одной кнопкой ✅ Да.\n\n' +
+    'После этого записывай траты: `кофе 500`, `такси 2500`, и т.д.',
+    { parse_mode: 'Markdown' },
+  ).catch(async () => {
+    // Fall back to plain if Markdown parse fails
+    await ctx.reply(`👋 Привет, ${name}! Ты теперь в семейном боте. Напиши "создай категории: Продукты 🛒, Транспорт 🚗, Кафе ☕" чтобы начать.`);
+  });
 }
 
 export function createBot(): Bot {
@@ -58,21 +83,57 @@ export function createBot(): Bot {
   // ── Text messages ──
   bot.on('message:text', async (ctx) => {
     const telegramId = ctx.from?.id;
-    if (!isAllowed(telegramId)) return;
     if (!telegramId) return;
 
-    const text = ctx.message.text.trim();
-    if (!text) return;
-
-    const cleanText = text
-      .replace(/@\w+/g, '')
-      .replace(/^\/\w+\s*/, '')
-      .trim();
-    if (!cleanText) return;
+    const rawText = ctx.message.text.trim();
+    if (!rawText) return;
 
     try {
+      // Path 1: invite deep-link — anyone can submit, no prior registration needed
+      const inviteCode = parseInvitePayload(rawText);
+      if (inviteCode) {
+        await handleInviteArrival(ctx, inviteCode);
+        return;
+      }
+
+      // Path 2: bare /start — welcome message for existing users,
+      // or "ask for invite" for strangers
+      if (/^\/start(@\w+)?$/i.test(rawText)) {
+        const existing = await getUserByTelegramId(telegramId);
+        if (existing) {
+          await ctx.reply(
+            `👋 Привет, ${existing.name}! Записывай траты обычным текстом: *кофе 500*, ` +
+            `или спрашивай: *сколько на чипсы?* · *покажи последние 10 трат*.`,
+            { parse_mode: 'Markdown' },
+          ).catch(() => ctx.reply(`👋 Привет, ${existing.name}!`));
+        } else {
+          await ctx.reply(
+            '👋 Этот бот работает по приглашению.\n' +
+            'Попроси у админа семьи ссылку вида `t.me/<имя_бота>?start=invite_XXX` — после клика тебя добавят автоматически.',
+          );
+        }
+        return;
+      }
+
+      // Path 3: unknown users get a polite gate
+      const user = await getUserByTelegramId(telegramId);
+      if (!user) {
+        await ctx.reply(
+          '👋 Этот бот работает только по приглашению.\n' +
+          'Попроси у админа семьи ссылку-приглашение.',
+        );
+        return;
+      }
+
+      // Path 4: registered user → normal chat() flow
+      const cleanText = rawText
+        .replace(/@\w+/g, '')
+        .replace(/^\/\w+\s*/, '')
+        .trim();
+      if (!cleanText) return;
+
       await ctx.replyWithChatAction('typing');
-      const userName = ctx.from?.first_name || 'User';
+      const userName = ctx.from?.first_name || user.name || 'User';
       const response = await chat(cleanText, telegramId, userName, ctx.chat.id);
       await sendChunked(ctx, response);
     } catch (error) {
@@ -82,28 +143,28 @@ export function createBot(): Bot {
     }
   });
 
-  // ── Callback queries (inline keyboard taps: ✅ Да / ❌ Отмена) ──
+  // ── Callback queries (inline keyboard taps) ──
   bot.on('callback_query:data', async (ctx) => {
     const telegramId = ctx.from?.id;
-    if (!isAllowed(telegramId)) {
-      await ctx.answerCallbackQuery({ text: '⛔ Доступ запрещён' });
-      return;
-    }
     if (!telegramId || !ctx.chat) {
       await ctx.answerCallbackQuery();
       return;
     }
 
+    // Unknown users can't have pending confirmations, so fail fast
+    const user = await getUserByTelegramId(telegramId);
+    if (!user) {
+      await ctx.answerCallbackQuery({ text: '⛔ Требуется приглашение' });
+      return;
+    }
+
     const data = ctx.callbackQuery.data;
     try {
-      const userName = ctx.from?.first_name || 'User';
+      const userName = ctx.from?.first_name || user.name || 'User';
       const response = await handleCallback(data, telegramId, userName, ctx.chat.id);
 
-      // Acknowledge the tap (clears the spinner on the button)
       await ctx.answerCallbackQuery();
-      // Remove the buttons from the original message so the user can't re-tap
-      try { await ctx.editMessageReplyMarkup({ reply_markup: undefined }); } catch { /* message may be too old to edit */ }
-      // Send the result as a new message
+      try { await ctx.editMessageReplyMarkup({ reply_markup: undefined }); } catch { /* too old */ }
       await sendChunked(ctx, response);
     } catch (error) {
       const errMsg = error instanceof Error ? error.message : String(error);
