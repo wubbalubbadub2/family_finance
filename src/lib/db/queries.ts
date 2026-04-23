@@ -311,6 +311,90 @@ export async function insertTransaction(tx: {
   return data;
 }
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Resolve a "transaction reference" to a concrete transaction. Accepts either:
+ *   - A real UUID (used directly), or
+ *   - A keyword/description — we find the MOST RECENT expense whose comment
+ *     matches the keyword (substring, case-insensitive, with Russian stemming
+ *     fallback). Covers the common case where Sonnet passes "последняя покупка
+ *     пива" instead of a UUID because it skipped the search step.
+ *
+ * Throws with a user-readable error if no match is found.
+ */
+export async function resolveTransactionRef(
+  ref: string,
+  familyId: string,
+): Promise<Transaction> {
+  const trimmed = ref.trim();
+  if (!trimmed) throw new Error('Не указана транзакция.');
+
+  // Path 1: real UUID
+  if (UUID_RE.test(trimmed)) {
+    const { data } = await supabase
+      .from('transactions')
+      .select('*')
+      .eq('id', trimmed)
+      .eq('family_id', familyId)
+      .single();
+    if (!data) throw new Error('Транзакция с таким ID не найдена.');
+    return data;
+  }
+
+  // Path 2: treat as a keyword — most recent expense matching this comment
+  // (substring, then stemmed fallback). Extract a likely noun: take the
+  // last non-trivial word from the ref, since Sonnet often passes strings
+  // like "the most recent пиво transaction" or "последняя покупка пиво".
+  const words = trimmed
+    .toLowerCase()
+    .replace(/[^\p{L}\s]/gu, ' ')
+    .split(/\s+/)
+    .filter(w => w.length >= 3);
+  // Try each word as a keyword, prefer the LAST one (most likely the noun
+  // in English/Russian descriptive strings).
+  const candidates = words.length > 0 ? [...words].reverse() : [trimmed];
+
+  for (const kw of candidates) {
+    const attempt = await mostRecentExpenseByKeyword(kw, familyId);
+    if (attempt) return attempt;
+  }
+
+  throw new Error(
+    `Не нашёл транзакцию по '${trimmed}'. Скажи точнее: например "последняя трата на кофе".`,
+  );
+}
+
+async function mostRecentExpenseByKeyword(
+  keyword: string,
+  familyId: string,
+): Promise<Transaction | null> {
+  const tryOne = async (kw: string) => {
+    const safe = kw.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
+    const { data } = await supabase
+      .from('transactions')
+      .select('*')
+      .eq('family_id', familyId)
+      .eq('type', 'expense')
+      .is('deleted_at', null)
+      .ilike('comment', `%${safe}%`)
+      .order('transaction_date', { ascending: false })
+      .order('created_at', { ascending: false })
+      .limit(1);
+    return data && data.length > 0 ? data[0] : null;
+  };
+
+  const direct = await tryOne(keyword);
+  if (direct) return direct;
+
+  // Russian morphology fallback (same trick as searchTransactionsByComment)
+  const stem = russianStem(keyword);
+  if (stem !== keyword && stem.length >= 3) {
+    return await tryOne(stem);
+  }
+  return null;
+}
+
 /**
  * Update a transaction's category. Scoped by family_id — cannot touch
  * another family's data even if the caller somehow knows the UUID.

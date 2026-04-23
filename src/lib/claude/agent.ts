@@ -34,6 +34,7 @@ import {
   upsertMonthlyPlan,
   updateTransactionCategory,
   upsertCategoryOverride,
+  resolveTransactionRef,
   type ConfirmType,
   type PendingConfirm,
 } from '@/lib/db/queries';
@@ -316,6 +317,35 @@ async function handleDebt(debt: { amount: number; name: string }, ctx: FamilyCtx
   }
 }
 
+/**
+ * Heuristic: does this comment look like a multi-item / bundled purchase?
+ * When true, attributing the FULL amount to the search keyword is misleading
+ * (e.g., "Ферровит с и агуша" for 7 139 ₸ — half was Ферровит).
+ *
+ * Signals:
+ *   - Contains ` и ` or `, ` or ` + ` → multiple items joined
+ *   - Contains `/` or ` с ` (Russian "with") → probably a combo
+ *   - ≥ 3 whitespace-separated tokens → description that's more than a single noun
+ *
+ * False positives are OK ("Лента универсам" gets flagged as multi-item) —
+ * the footer warning is advisory, not restrictive.
+ */
+function commentLooksBundled(comment: string, keyword: string): boolean {
+  const trimmed = comment.trim();
+  if (!trimmed) return false;
+  if (/[,\/+]/.test(trimmed)) return true;
+  if (/\s+и\s+/.test(trimmed)) return true;
+  if (/\s+с\s+/.test(trimmed)) return true;
+  // 3+ non-trivial tokens, at least one not containing the search keyword
+  const tokens = trimmed.toLowerCase().split(/\s+/).filter(t => t.length >= 3);
+  if (tokens.length >= 3) {
+    const kwLower = keyword.toLowerCase();
+    const nonKwTokens = tokens.filter(t => !t.includes(kwLower));
+    if (nonKwTokens.length >= 2) return true;
+  }
+  return false;
+}
+
 function formatSearchReply(
   result: { sum: number; count: number; sample: import('@/types').Transaction[]; effectiveKeyword?: string },
   args: { keyword: string; periodStart?: string; periodEnd?: string },
@@ -346,13 +376,24 @@ function formatSearchReply(
     text += `: найдено ${result.count} трат. Показываю последние ${result.sample.length} на сумму *${formatTenge(result.sum)}*\n\n`;
   }
 
+  // Rows — always show the comment verbatim; flag multi-item lines with 📎
+  // so users can tell their search keyword was one of several items.
+  let bundledCount = 0;
   for (const t of result.sample) {
     const cat = t.category_id ? catMap.get(t.category_id) : null;
     const icon = cat?.emoji ?? '❓';
+    const bundled = t.comment ? commentLooksBundled(t.comment, args.keyword) : false;
+    if (bundled) bundledCount++;
     text += `${t.transaction_date} | ${icon} ${formatTenge(t.amount)}`;
-    if (t.comment) text += ` — ${t.comment}`;
+    if (t.comment) text += ` — ${bundled ? '📎 ' : ''}${t.comment}`;
     text += '\n';
   }
+
+  if (bundledCount > 0) {
+    text += `\n⚠️ ${bundledCount} ${bundledCount === 1 ? 'покупка содержит' : 'покупок содержат'} несколько позиций (📎). `;
+    text += `Реальная сумма только по '${args.keyword}' может быть меньше *${formatTenge(result.sum)}*.`;
+  }
+
   return text.trim();
 }
 
@@ -545,7 +586,15 @@ function buildSystemPrompt(): string {
 - "удали категорию" → propose_delete_category
 - "объедини X в Y" → propose_merge_categories
 
-Результаты read-tools — готовый текст. Выводи ДОСЛОВНО, не переформатируй.
+КРИТИЧЕСКИ ВАЖНО: результаты read-tools — ЭТО УЖЕ ГОТОВЫЙ ТЕКСТ для пользователя.
+— Выводи ДОСЛОВНО, символ в символ, без изменений.
+— НЕ создавай markdown-таблицы (| Дата | Сумма |). Telegram их не рендерит нормально,
+  текст становится мусором из столбиков палок.
+— НЕ сокращай комментарии транзакций — пользователю важно видеть ПОЛНЫЙ текст
+  ("Ферровит с и агуша" означает ДВА товара; если выкинуть — данные искажаются).
+— НЕ убирай значки 📎 и ⚠️ из ответов search — они помечают многопозиционные покупки.
+— Если тебе очень хочется что-то добавить от себя — добавь коротко В КОНЦЕ, после
+  полного результата tool. Сам результат НЕ трогай.
 Результаты write-tools обрабатываются системой (показывается кнопка подтверждения пользователю) — тебе после пропозала ничего говорить не нужно.`;
 }
 
@@ -602,13 +651,15 @@ const WRITE_TOOLS: Anthropic.Tool[] = [
   {
     name: 'propose_delete_transaction',
     description:
-      'Propose deleting a specific transaction by ID. Call when user references a specific transaction to delete ' +
-      '(e.g., "удали 3880 курица", "remove the coffee"). Use list_recent_transactions first if you need an ID. ' +
-      'For "удали последнюю" use the existing undo flow (no tool call needed — system handles it).',
+      'Propose deleting a specific transaction. Call when user wants to remove a logged expense ' +
+      '(e.g., "удали 3880 курица", "remove the coffee", "удали пиво"). ' +
+      'The transaction_id field accepts EITHER a UUID (if you already looked it up) OR a keyword/description ' +
+      '(e.g., "пиво", "чипсы"). If you pass a keyword, the server finds the most recent matching expense automatically. ' +
+      'You do NOT need to call list_recent_transactions or search first if the user already gave you a clear keyword.',
     input_schema: {
       type: 'object' as const,
       properties: {
-        transaction_id: { type: 'string', description: 'UUID of the transaction to delete' },
+        transaction_id: { type: 'string', description: 'UUID OR a keyword from the transaction comment (e.g. "пиво", "кофе"). Server resolves to most recent match.' },
       },
       required: ['transaction_id'],
     },
@@ -616,16 +667,19 @@ const WRITE_TOOLS: Anthropic.Tool[] = [
   {
     name: 'propose_update_transaction_category',
     description:
-      'Propose changing the category of a specific transaction. Call when user says the categorization was wrong: ' +
-      '"это было Продукты, не Разное", "переклассифицируй эту в Кафе", "поменяй категорию чипсов на Продукты". ' +
-      'Find the transaction via list_recent_transactions or search_transactions_by_comment first to get the ID. ' +
-      'IMPORTANT: on confirm, the system will also save a per-family override keyword→category so future similar ' +
-      'expenses auto-route correctly. This is the main mechanism for improving categorization reliability over time.',
+      'Propose changing the category of a transaction. Call when user says the categorization was wrong: ' +
+      '"пиво не продукты, а кафе", "это было Продукты, не Разное", "поменяй категорию чипсов на Продукты", ' +
+      '"переклассифицируй пиво в личное". ' +
+      'The transaction_id field accepts EITHER a UUID OR a keyword/description. If you pass a keyword like ' +
+      '"пиво" or "чипсы", the server finds the most recent matching expense automatically — you do NOT need ' +
+      'to call search first. ' +
+      'IMPORTANT: on confirm, the system also saves a per-family override keyword→category so future similar ' +
+      'expenses auto-route correctly. This is the main mechanism for improving categorization reliability.',
     input_schema: {
       type: 'object' as const,
       properties: {
-        transaction_id: { type: 'string', description: 'UUID of the transaction to re-categorize' },
-        new_category_slug: { type: 'string', description: 'Target category slug (must exist for this family)' },
+        transaction_id: { type: 'string', description: 'UUID OR a keyword from the transaction comment (e.g. "пиво", "кофе"). Server resolves to most recent match.' },
+        new_category_slug: { type: 'string', description: 'Target category slug from the family list (food, cafe, personal, etc.)' },
       },
       required: ['transaction_id', 'new_category_slug'],
     },
@@ -766,18 +820,28 @@ async function buildProposalMessage(
       return `🗂 Закрыть цель *${goal.name}*? Текущий прогресс: ${formatTenge(goal.current_amount)} из ${formatTenge(goal.target_amount)}.`;
     }
     case 'delete_transaction': {
-      const id = String(input.transaction_id ?? '');
-      if (!id) throw new Error('Не указан ID транзакции.');
-      return `🗑 Удалить транзакцию ${id}?`;
+      const ref = String(input.transaction_id ?? '');
+      if (!ref) throw new Error('Не указана транзакция.');
+      // Resolve the ref NOW so the confirm dialog shows the actual transaction
+      // and we catch "not found" errors before the user taps ✅.
+      const tx = await resolveTransactionRef(ref, ctx.familyId);
+      // Replace the input so execute uses the resolved UUID, not the ambiguous ref
+      (input as Record<string, unknown>).transaction_id = tx.id;
+      const catName = tx.category_id
+        ? (await getCategoriesForFamily(ctx.familyId)).find(c => c.id === tx.category_id)
+        : null;
+      return `🗑 Удалить транзакцию от ${tx.transaction_date} — ${formatTenge(tx.amount)}${tx.comment ? ` (${tx.comment})` : ''}${catName ? ` [${catName.emoji} ${catName.name}]` : ''}?`;
     }
     case 'update_transaction_category': {
-      const id = String(input.transaction_id ?? '');
+      const ref = String(input.transaction_id ?? '');
       const newSlug = String(input.new_category_slug ?? '');
-      if (!id) throw new Error('Не указан ID транзакции.');
+      if (!ref) throw new Error('Не указана транзакция.');
       if (!newSlug) throw new Error('Не указана новая категория.');
       const cat = await getCategoryBySlugInFamily(newSlug, ctx.familyId);
       if (!cat) throw new Error(`Категория '${newSlug}' не найдена.`);
-      return `🏷 Переклассифицировать эту транзакцию в ${cat.emoji} *${cat.name}*?\n(Запомню ключевое слово для этой семьи — похожие траты будут автоматически попадать сюда.)`;
+      const tx = await resolveTransactionRef(ref, ctx.familyId);
+      (input as Record<string, unknown>).transaction_id = tx.id;
+      return `🏷 Переклассифицировать транзакцию от ${tx.transaction_date} — ${formatTenge(tx.amount)}${tx.comment ? ` (${tx.comment})` : ''} → ${cat.emoji} *${cat.name}*?\n(Запомню ключевое слово для этой семьи — похожие траты будут автоматически попадать сюда.)`;
     }
     case 'set_monthly_plan': {
       const slug = String(input.category_slug ?? '');
