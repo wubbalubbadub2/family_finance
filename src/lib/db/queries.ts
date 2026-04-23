@@ -968,35 +968,103 @@ export interface TransactionSearchResult {
   sample: Transaction[];  // up to 10 matching rows
 }
 
+/**
+ * Russian morphological stemmer — light-touch, rule-based.
+ *
+ * Why this exists: users type "агушу" (accusative), "агуши" (plural), "агуша"
+ * (nominative), "агушой" (instrumental)… all referring to the SAME product.
+ * Our comments might store any form. A straight ILIKE for the typed word
+ * misses all other forms.
+ *
+ * The cheap fix: before searching, reduce both sides to a short prefix by
+ * stripping common Russian inflection endings. We don't need full Porter-style
+ * stemming — we're doing substring match, so a 3-4 char prefix catches all
+ * forms the root shares.
+ *
+ * Rules in priority order (longest first — matters):
+ *   -ами/-ями  (instr. pl.)
+ *   -ому/-ему/-ого/-его/-ему/-ого  (various)
+ *   -ами/-ями  (dup, already handled)
+ *   -ых/-их    (gen./prep. pl.)
+ *   -ую/-юю    (acc. f.)
+ *   -ой/-ей/-ою  (instr. f.)
+ *   -ый/-ий/-ая/-яя/-ое/-ее  (adjective endings)
+ *   -ов/-ев/-ёв  (gen. pl. m.)
+ *   -ам/-ям    (dat. pl.)
+ *   -ах/-ях    (prep. pl.)
+ *   -ом/-ем/-ём  (instr. m.)
+ *   -ют/-ят/-ит/-ет  (verb endings)
+ *   -ешь/-ишь  (verb endings)
+ *   -а/-я/-о/-е/-у/-ю/-ы/-и/-ь/-й/-л  (single-char endings, last resort)
+ *
+ * For words ≤ 4 chars, no stemming (too short — would over-trim).
+ */
+export function russianStem(word: string): string {
+  if (word.length <= 4) return word;
+  // Multi-char endings first (checked in order, longest-first groups).
+  const multiCharEndings = [
+    'ами', 'ями', 'ому', 'ему', 'ого', 'его', 'ими', 'ыми',
+    'ую', 'юю', 'ой', 'ей', 'ою', 'ею',
+    'ый', 'ий', 'ая', 'яя', 'ое', 'ее',
+    'ов', 'ев', 'ёв', 'ам', 'ям', 'ах', 'ях',
+    'ом', 'ем', 'ём', 'ют', 'ят', 'ит', 'ет',
+    'ешь', 'ишь', 'ула', 'ила', 'ыла', 'ала',
+    'ых', 'их',
+  ];
+  for (const end of multiCharEndings.sort((a, b) => b.length - a.length)) {
+    if (word.endsWith(end) && word.length - end.length >= 3) {
+      return word.slice(0, -end.length);
+    }
+  }
+  // Single-char trailing vowel/softener (more aggressive, less safe).
+  const singleCharEndings = ['а', 'я', 'о', 'е', 'у', 'ю', 'ы', 'и', 'ь', 'й', 'л'];
+  for (const end of singleCharEndings) {
+    if (word.endsWith(end) && word.length - 1 >= 3) {
+      return word.slice(0, -1);
+    }
+  }
+  return word;
+}
+
 export async function searchTransactionsByComment(
   familyId: string,
   keyword: string,
   periodStart?: string,
   periodEnd?: string,
-): Promise<TransactionSearchResult> {
-  const safe = escapeLikeSpecials(normalizeKeyword(keyword));
-  if (!safe) return { sum: 0, count: 0, sample: [] };
+): Promise<TransactionSearchResult & { effectiveKeyword: string }> {
+  const raw = normalizeKeyword(keyword);
+  if (!raw) return { sum: 0, count: 0, sample: [], effectiveKeyword: '' };
 
-  let q = supabase
-    .from('transactions')
-    .select('*', { count: 'exact' })
-    .eq('family_id', familyId)
-    .is('deleted_at', null)
-    .eq('type', 'expense')
-    .ilike('comment', `%${safe}%`);
+  // Try 1: as-is. Catches exact matches (comment contains the word verbatim).
+  const tryOne = async (kw: string) => {
+    const safe = escapeLikeSpecials(kw);
+    let q = supabase
+      .from('transactions')
+      .select('*', { count: 'exact' })
+      .eq('family_id', familyId)
+      .is('deleted_at', null)
+      .eq('type', 'expense')
+      .ilike('comment', `%${safe}%`);
+    if (periodStart) q = q.gte('transaction_date', periodStart);
+    if (periodEnd) q = q.lte('transaction_date', periodEnd);
+    q = q.order('transaction_date', { ascending: false }).limit(10);
+    const { data, count } = await q;
+    const sample = data ?? [];
+    return { sum: sample.reduce((s, t) => s + t.amount, 0), count: count ?? sample.length, sample };
+  };
 
-  if (periodStart) q = q.gte('transaction_date', periodStart);
-  if (periodEnd) q = q.lte('transaction_date', periodEnd);
+  const asIs = await tryOne(raw);
+  if (asIs.count > 0) return { ...asIs, effectiveKeyword: raw };
 
-  q = q.order('transaction_date', { ascending: false }).limit(10);
+  // Try 2: stemmed. If the user said "агушу" we also try "агуш" which catches
+  // "агуша", "агуши", "агушей", etc. Safety net for Russian morphology.
+  const stem = russianStem(raw);
+  if (stem !== raw && stem.length >= 3) {
+    const stemmed = await tryOne(stem);
+    if (stemmed.count > 0) return { ...stemmed, effectiveKeyword: stem };
+  }
 
-  const { data, count } = await q;
-  const sample = data ?? [];
-  const sum = sample.reduce((s, t) => s + t.amount, 0);
-  // `count` is the total matching across the full period, not just the sample.
-  // For sum-across-all we'd need a second aggregation; for v1, sample sum + total count.
-  // If count is much larger than sample, bot reply should note "showing first 10 of N".
-  return { sum, count: count ?? sample.length, sample };
+  return { sum: 0, count: 0, sample: [], effectiveKeyword: raw };
 }
 
 export interface ListRecentResult {

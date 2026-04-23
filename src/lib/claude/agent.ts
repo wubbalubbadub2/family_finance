@@ -19,7 +19,6 @@ import {
   searchTransactionsByComment,
   listRecentTransactionsPaged,
   setPendingListContext,
-  getPendingListContext,
   clearPendingListContext,
   setPendingConfirm,
   getPendingConfirm,
@@ -39,7 +38,7 @@ import {
   type PendingConfirm,
 } from '@/lib/db/queries';
 import { todayAlmaty, currentMonthAlmaty, monthNameRu, formatTenge } from '@/lib/utils';
-import { renderGoalProgress, computeWeekBoundsAlmaty } from '@/lib/goals';
+import { renderGoalProgress } from '@/lib/goals';
 
 const client = new Anthropic();
 // Sonnet 4.6 for tool routing — Haiku had ~15-30% miss rate on ambiguous
@@ -104,246 +103,6 @@ function tryParseDebt(text: string): { amount: number; name: string } | null {
 
 function isUndoRequest(text: string): boolean {
   return /удали|отмени|undo|убери последн|верни назад|отмена/i.test(text);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Deterministic search-query parsing.
-//
-// Why bypass Claude: Haiku tool-routing for search-vs-list is unreliable
-// (~80% accuracy in testing). For the highest-value query pattern — "сколько
-// (раз) мы на/покупали <X>" — a regex matcher is 100% reliable. If the pattern
-// doesn't match, we fall through to Claude which has tool descriptions tuned
-// for these same queries.
-// ─────────────────────────────────────────────────────────────────────────────
-
-// Words to skip when hunting for the keyword noun. Includes question markers,
-// quantity words, verbs of purchase/consumption, pronouns, periods, and months
-// (periods are detected separately).
-const SEARCH_STOPWORDS = new Set([
-  // quantity / question
-  'сколько', 'раз', 'раза', 'как', 'часто', 'когда', 'последний', 'всего',
-  'how', 'much', 'many', 'times', 'total',
-  // pronouns
-  'мы', 'я', 'нас', 'нашей', 'нашу', 'свой', 'нашем', 'our', 'we',
-  // tense/modality
-  'уже', 'пока', 'ещё', 'еще', 'были', 'did', 'does',
-  // prepositions
-  'на', 'за', 'про', 'в', 'из', 'до', 'от', 'по', 'для', 'со', 'с', 'у', 'к',
-  'и', 'или', 'то', 'а', 'но', 'же', 'ли',
-  'on', 'for', 'about', 'the', 'a', 'an', 'of', 'to', 'in',
-  // verbs of purchase/consumption/spending
-  'ушло', 'ушли', 'ушёл', 'потратили', 'тратили', 'тратим',
-  'купили', 'покупали', 'покупили', 'куплено', 'ели', 'пили', 'брали',
-  'заплатили', 'отдали',
-  'spent', 'bought', 'paid', 'ate', 'drank',
-  // money words
-  'тенге', 'тг', 'денег', 'деньги', 'money',
-  // period words (months + "this month/week/year")
-  'этом', 'этой', 'этого', 'текущем', 'текущей',
-  'месяце', 'месяц', 'неделе', 'неделю', 'неделя', 'году', 'год',
-  'сегодня', 'вчера', 'завтра', 'сейчас',
-  'this', 'month', 'week', 'year', 'today', 'yesterday',
-  'январе', 'феврале', 'марте', 'апреле', 'мае', 'июне',
-  'июле', 'августе', 'сентябре', 'октябре', 'ноябре', 'декабре',
-  'январь', 'февраль', 'март', 'апрель', 'май', 'июнь',
-  'июль', 'август', 'сентябрь', 'октябрь', 'ноябрь', 'декабрь',
-  'january', 'february', 'march', 'april', 'may', 'june',
-  'july', 'august', 'september', 'october', 'november', 'december',
-]);
-
-const MONTH_STEMS_RU = [
-  'январ', 'феврал', 'март', 'апрел', 'мая', 'июн',
-  'июл', 'август', 'сентябр', 'октябр', 'ноябр', 'декабр',
-];
-
-interface SearchIntent {
-  keyword: string;
-  periodStart?: string;
-  periodEnd?: string;
-}
-
-function detectPeriod(lower: string): { start: string; end: string } | null {
-  const { year, month: curMonth } = currentMonthAlmaty();
-  const lastDay = (y: number, m: number): string => {
-    const d = new Date(Date.UTC(y, m, 0)).getUTCDate();
-    return `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
-  };
-
-  // Current month
-  if (/(в|за)\s+(этом\s+месяце|текущем\s+месяце)|this\s+month/i.test(lower)) {
-    return { start: `${year}-${String(curMonth).padStart(2, '0')}-01`, end: lastDay(year, curMonth) };
-  }
-
-  // Current week
-  if (/(за|на)\s+(этой\s+неделе|неделю)|this\s+week/i.test(lower)) {
-    const { weekStartDate, weekEndDate } = computeWeekBoundsAlmaty();
-    // weekEndDate is the NEXT Monday (exclusive); trim a day for BETWEEN semantics
-    const endMinus1 = new Date(new Date(weekEndDate).getTime() - 86_400_000)
-      .toISOString().slice(0, 10);
-    return { start: weekStartDate, end: endMinus1 };
-  }
-
-  // Month name — "в апреле", "за март"
-  for (let i = 0; i < 12; i++) {
-    const stem = MONTH_STEMS_RU[i];
-    const re = new RegExp(`(в|за)\\s+${stem}`, 'i');
-    if (re.test(lower)) {
-      const m = i + 1;
-      return { start: `${year}-${String(m).padStart(2, '0')}-01`, end: lastDay(year, m) };
-    }
-  }
-
-  return null;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Deterministic list-query parsing.
-//
-// Triggers ONLY for explicit "show me recent transactions" phrasing. This is
-// a narrow tool — if user asks anything else, they get routed to Claude
-// (which has search/summary/debts but no list). The goal is to never confuse
-// list with search.
-// ─────────────────────────────────────────────────────────────────────────────
-
-interface ListIntent {
-  limit: number;
-  offset: number;
-  periodStart?: string;
-  periodEnd?: string;
-  continuation: boolean;  // true if user said "ещё" and we should pick up from pending context
-}
-
-/**
- * Recognize list-request phrasings:
- *   "покажи последние траты"
- *   "последние 20 транзакций"
- *   "show me recent expenses"
- *   "show last 10 transactions"
- *   "/recent" / "/recent 50"
- *   "ещё" or "еще" or "more" (continuation — pairs with pending_list_context)
- *   "что мы тратили вчера?" / "что было в апреле" (temporal slice, no keyword)
- */
-function tryParseListQuery(text: string): ListIntent | null {
-  const lower = text.toLowerCase().trim();
-  if (!lower) return null;
-
-  // Continuation: user said just "ещё" or "еще" or "more"
-  if (/^(ещё|еще|more|продолжи)[.!?]*$/i.test(lower)) {
-    return { limit: 10, offset: 0, continuation: true };
-  }
-
-  // /recent command with optional N
-  const cmdMatch = lower.match(/^\/recent(?:\s+(\d{1,3}))?/);
-  if (cmdMatch) {
-    const n = cmdMatch[1] ? parseInt(cmdMatch[1], 10) : 10;
-    return { limit: Math.min(Math.max(1, n), 30), offset: 0, continuation: false };
-  }
-
-  // "покажи [последние] [N] [транзакций|трат|записей|расходов]"
-  // Also matches English: "show me last N transactions"
-  const showPattern = /(?:покажи(?:те)?|показать|show(?:\s+me)?|дай|давай)(?:\s+мне)?\s+(?:(?:все|all|my|мои|наши)\s+)?(?:(?:последние?|последних|крайние|recent|last)\s+)?(?:(\d{1,3})\s+)?(?:трат|транзакц|записей|расход|expenses?|transactions?)/i;
-  const showMatch = lower.match(showPattern);
-  if (showMatch) {
-    const n = showMatch[1] ? parseInt(showMatch[1], 10) : 10;
-    // Reject if there's a keyword after "на" — that belongs to search, not list.
-    // E.g., "покажи траты на кофе" → keyword, not list.
-    if (/\bна\s+[а-яёa-z]{3,}/i.test(lower)) {
-      // Unless the thing after "на" is a period phrase like "на этой неделе"
-      const afterNa = lower.match(/\bна\s+([а-яёa-z]+)/i);
-      if (afterNa) {
-        const w = afterNa[1];
-        const isPeriodWord = /^(этой|этом|прошлой|прошлом|следующей|следующем|неделе|неделю|месяце|месяц|году|год|вчера|сегодня|завтра)$/i.test(w);
-        if (!isPeriodWord) return null;  // it's a keyword, not a period → search handles it
-      }
-    }
-    return {
-      limit: Math.min(Math.max(1, n), 30),
-      offset: 0,
-      ...periodFromText(lower),
-      continuation: false,
-    };
-  }
-
-  // Bare "последние N трат" without "покажи" prefix
-  const bareListPattern = /^(?:последние?|последних)\s+(\d{1,3})?\s*(?:трат|транзакц|записей|расход)/i;
-  if (bareListPattern.test(lower)) {
-    const m = lower.match(/(\d{1,3})/);
-    const n = m ? parseInt(m[1], 10) : 10;
-    return {
-      limit: Math.min(Math.max(1, n), 30),
-      offset: 0,
-      ...periodFromText(lower),
-      continuation: false,
-    };
-  }
-
-  // "что мы тратили вчера / в апреле / на этой неделе" (no keyword, temporal slice)
-  if (/что\s+(?:мы|я)\s+(?:тратили|покупали|купили|потратили)/i.test(lower)) {
-    const period = detectPeriod(lower);
-    if (period) {
-      return {
-        limit: 30,
-        offset: 0,
-        periodStart: period.start,
-        periodEnd: period.end,
-        continuation: false,
-      };
-    }
-  }
-
-  return null;
-}
-
-function periodFromText(lower: string): { periodStart?: string; periodEnd?: string } {
-  const p = detectPeriod(lower);
-  return p ? { periodStart: p.start, periodEnd: p.end } : {};
-}
-
-/**
- * Attempt to extract a search intent from the user's text. Returns null if
- * the text doesn't look like a "how much / how many" keyword question.
- *
- * Examples that match:
- *   "сколько на чипсы?"                → { keyword: "чипсы" }
- *   "сколько агуш мы уже покупили"     → { keyword: "агуш" }
- *   "сколько раз мы покупали кофе?"    → { keyword: "кофе" }
- *   "сколько ушло на бензин в апреле?" → { keyword: "бензин", period: April }
- *   "how much on groceries?"            → { keyword: "groceries" }
- *
- * Examples that don't match (pass through to Claude):
- *   "покажи последние траты"           → not a quantity question
- *   "как дела?"                        → no noun
- *   "привет"                           → not a question
- */
-function tryParseSearchQuery(text: string): SearchIntent | null {
-  const lower = text.toLowerCase().trim();
-  if (!lower) return null;
-
-  // Must smell like a quantity/frequency/search question.
-  // NOTE: JS regex \b doesn't work with Cyrillic (it treats Cyrillic as
-  // non-word chars). Use substring + separate English check instead.
-  const hasSkolko = lower.includes('сколько');
-  const hasHowMuch = /\bhow\s+(much|many)\b/i.test(lower);
-  if (!hasSkolko && !hasHowMuch) return null;
-
-  // Tokenize: strip punctuation, keep only letters, split on whitespace,
-  // drop short tokens + stopwords.
-  const tokens = lower
-    .replace(/[^\p{L}\s]/gu, ' ')
-    .split(/\s+/)
-    .filter(t => t.length >= 3 && !SEARCH_STOPWORDS.has(t));
-
-  if (tokens.length === 0) return null;
-
-  // First content word is the keyword. The stopword list is deliberately
-  // aggressive — by the time we get here, what's left is almost always the noun.
-  const keyword = tokens[0];
-  const period = detectPeriod(lower);
-  return {
-    keyword,
-    periodStart: period?.start,
-    periodEnd: period?.end,
-  };
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -557,76 +316,28 @@ async function handleDebt(debt: { amount: number; name: string }, ctx: FamilyCtx
   }
 }
 
-async function handleListQuery(intent: ListIntent, ctx: FamilyCtx): Promise<string> {
-  // Continuation: user said "ещё" — resume from stored pending_list_context
-  let effectiveLimit = intent.limit;
-  let effectiveOffset = intent.offset;
-  let effectivePeriodStart = intent.periodStart;
-  let effectivePeriodEnd = intent.periodEnd;
-
-  if (intent.continuation) {
-    const prior = await getPendingListContext(ctx.familyId).catch(() => null);
-    if (!prior) {
-      return '🤔 Нечего продолжать. Сначала покажи список: "покажи последние траты".';
-    }
-    effectiveLimit = prior.limit ?? 10;
-    effectiveOffset = prior.offset;
-    effectivePeriodStart = prior.period_start;
-    effectivePeriodEnd = prior.period_end;
-  }
-
-  const result = await listRecentTransactionsPaged(
-    ctx.familyId,
-    effectiveLimit,
-    effectiveOffset,
-    effectivePeriodStart,
-    effectivePeriodEnd,
-  );
-
-  // Persist context for potential "ещё" follow-up
-  if (result.has_more) {
-    await setPendingListContext(ctx.familyId, {
-      limit: effectiveLimit,
-      offset: effectiveOffset + result.transactions.length,
-      period_start: effectivePeriodStart,
-      period_end: effectivePeriodEnd,
-    }).catch(() => {});
-  } else {
-    await clearPendingListContext(ctx.familyId).catch(() => {});
-  }
-
-  return formatTransactionList(result.transactions, await getCategoriesForFamily(ctx.familyId), {
-    total: result.total_count,
-    offset: effectiveOffset,
-    hasMore: result.has_more,
-  });
-}
-
-async function handleKeywordSearch(intent: SearchIntent, ctx: FamilyCtx): Promise<string> {
-  const result = await searchTransactionsByComment(
-    ctx.familyId,
-    intent.keyword,
-    intent.periodStart,
-    intent.periodEnd,
-  );
-  return formatSearchReply(result, intent, await getCategoriesForFamily(ctx.familyId));
-}
-
 function formatSearchReply(
-  result: { sum: number; count: number; sample: import('@/types').Transaction[] },
-  intent: SearchIntent,
+  result: { sum: number; count: number; sample: import('@/types').Transaction[]; effectiveKeyword?: string },
+  args: { keyword: string; periodStart?: string; periodEnd?: string },
   categories: import('@/types').Category[],
 ): string {
+  // When server-side stemming kicks in (e.g., user asked "агушу" but we found
+  // results with stem "агуш"), note the effective keyword in the header so
+  // the user understands what we matched.
+  const matchedWord = result.effectiveKeyword && result.effectiveKeyword !== args.keyword
+    ? `${args.keyword} (искал как '${result.effectiveKeyword}')`
+    : args.keyword;
+
   if (result.count === 0) {
-    const periodHint = intent.periodStart || intent.periodEnd ? ` за указанный период` : '';
-    return `🔍 По '${intent.keyword}'${periodHint} — ничего не найдено.`;
+    const periodHint = args.periodStart || args.periodEnd ? ` за указанный период` : '';
+    return `🔍 По '${matchedWord}'${periodHint} — ничего не найдено.`;
   }
 
   const catMap = new Map(categories.map(c => [c.id, c]));
 
-  let text = `🔍 По '${intent.keyword}'`;
-  if (intent.periodStart || intent.periodEnd) {
-    text += ` (${intent.periodStart ?? '...'} → ${intent.periodEnd ?? '...'})`;
+  let text = `🔍 По '${matchedWord}'`;
+  if (args.periodStart || args.periodEnd) {
+    text += ` (${args.periodStart ?? '...'} → ${args.periodEnd ?? '...'})`;
   }
 
   if (result.count <= result.sample.length) {
@@ -668,18 +379,29 @@ const READ_TOOLS: Anthropic.Tool[] = [
   {
     name: 'search_transactions_by_comment',
     description:
-      'PRIMARY TOOL for keyword questions. Use this whenever the user mentions a specific word/item and wants ' +
-      'to know about it — totals, frequency, occurrences, history. Searches ALL transactions (not just last 20). ' +
-      'Examples that MUST route here: ' +
-      '"сколько на чипсы?" · "how much on taxi?" · "сколько раз мы покупали агушу?" (keyword="агуша") · ' +
-      '"когда последний раз покупали бензин?" · "показать все траты на кофе" · ' +
-      '"сколько мы потратили на кафе в апреле?" (keyword="кафе", period=April). ' +
-      'The keyword should be the NOUN the user asked about — strip question words like "сколько", "how much", "how many times". ' +
-      'Do NOT use list_recent_transactions for keyword questions — it only sees the last N rows and will miss older matches.',
+      'PRIMARY TOOL for keyword-specific questions — "how much on X", "when did we buy X", ' +
+      '"how many times did we purchase X", "дай расходы на X". Searches ALL transaction history ' +
+      '(not just recent), sums matching amounts, returns count + sample.\n\n' +
+      'WHEN TO USE:\n' +
+      '  "сколько на чипсы?" → keyword="чипсы"\n' +
+      '  "сколько потратили на агушу?" → keyword="агуша" (use nominative/base form when possible)\n' +
+      '  "дай расходы на агушу" → keyword="агуша" (strip "дай расходы на" prefix)\n' +
+      '  "сколько раз мы покупали кофе?" → keyword="кофе"\n' +
+      '  "сколько на кафе в апреле?" → keyword="кафе", period_start="2026-04-01", period_end="2026-04-30"\n' +
+      '  "how much on taxi this month?" → keyword="taxi", period_start=<first of month>\n\n' +
+      'KEYWORD EXTRACTION RULES (important for Russian):\n' +
+      '  • Use the NOUN the user asked about. Strip verbs ("потратили", "купили"), ' +
+      'question words ("сколько", "как"), prepositions ("на", "за"), pronouns ("мы", "я"), ' +
+      'and request verbs ("дай", "покажи", "give me").\n' +
+      '  • Prefer the nominative/base form (e.g., "агуша" not "агушу", "чипсы" not "чипсов"). ' +
+      'The server applies Russian morphology stemming as a safety net, but base form gives best results.\n' +
+      '  • ILIKE does case-insensitive substring match — "агуш" catches "агуша", "агуши", "агушей", etc.\n\n' +
+      'DO NOT use list_recent_transactions for keyword questions — list only sees the last N rows. ' +
+      'If the user mentions a specific product/service by name, THIS is the tool.',
     input_schema: {
       type: 'object' as const,
       properties: {
-        keyword: { type: 'string', description: 'Noun the user asked about (e.g., "агуша", "чипсы", "кофе", "taxi"). Lowercased automatically.' },
+        keyword: { type: 'string', description: 'Base form of the noun the user is asking about. Examples: "агуша", "чипсы", "кофе", "такси", "groceries". Lowercased automatically.' },
         period_start: { type: 'string', description: 'YYYY-MM-DD (inclusive). Omit for all time.' },
         period_end: { type: 'string', description: 'YYYY-MM-DD (inclusive). Omit for all time.' },
       },
@@ -699,10 +421,28 @@ const READ_TOOLS: Anthropic.Tool[] = [
       required: ['year', 'month'],
     },
   },
-  // NOTE: list_recent_transactions is NOT offered to Claude. It's a narrow
-  // use case ("show me the last N rows, no filter") and LLM routing
-  // consistently mis-picked it for keyword questions. A deterministic parser
-  // in chat() handles list requests — see tryParseListQuery.
+  {
+    name: 'list_recent_transactions',
+    description:
+      'List transactions chronologically, newest first, with pagination support. ' +
+      'Use when user asks to SEE a list without specifying a product/keyword — e.g., ' +
+      '"покажи последние 20 транзакций", "show me recent expenses", "что мы тратили вчера?", ' +
+      '"last 10 transactions". ' +
+      'For pagination: if user says "ещё" or "more", call again with offset = previous_offset + previous_limit. ' +
+      'For time windows, pass period_start and period_end as YYYY-MM-DD (e.g., April 2026 = 2026-04-01..2026-04-30). ' +
+      'Hard cap 30 items per reply (Telegram message length). ' +
+      'DO NOT use this for "сколько на X" / "сколько мы потратили на X" — those go to search_transactions_by_comment.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        limit: { type: 'number', description: 'Max 30. Default 10.' },
+        offset: { type: 'number', description: 'For pagination. 0 = latest.' },
+        period_start: { type: 'string', description: 'YYYY-MM-DD inclusive. Omit for all time.' },
+        period_end: { type: 'string', description: 'YYYY-MM-DD inclusive. Omit for all time.' },
+      },
+      required: [],
+    },
+  },
   {
     name: 'get_debts',
     description: 'Show active debts (deterministic list with totals + per-debt remaining).',
@@ -732,8 +472,15 @@ function buildSystemPrompt(): string {
 
 ЧТЕНИЕ:
 - search_transactions_by_comment(keyword, period?) — поиск по ключевому слову.
+  Используй КОГДА пользователь называет товар/услугу ("сколько на чипсы", "дай расходы на агушу").
   Также используй чтобы НАЙТИ транзакцию по описанию перед её изменением.
-- get_month_summary(year, month) — итоги месяца
+  Сервер сам применит русскую морфологию — но ты всё равно передавай базовую форму
+  (именительный падеж) если можешь: "агуша" не "агушу", "чипсы" не "чипсов".
+- list_recent_transactions(limit?, offset?, period?) — список последних транзакций.
+  Используй КОГДА пользователь хочет увидеть список БЕЗ конкретного товара
+  ("покажи последние 20", "что мы тратили вчера"). Для "ещё" — передавай offset = предыдущий_offset + предыдущий_limit.
+  НЕ используй для вопросов "сколько на X" — там нужен search.
+- get_month_summary(year, month) — итоги месяца с разбивкой по категориям
 - get_debts — долги
 
 ЗАПИСЬ (пользователь подтверждает кнопкой ✅ Да перед исполнением):
@@ -769,10 +516,14 @@ function buildSystemPrompt(): string {
 У семьи также могут быть свои категории — используй search_transactions_by_comment
 или задай уточняющий вопрос если slug неясен.
 
-СПИСКИ И "ЕЩЁ":
-Система обрабатывает "покажи последние траты" и "ещё" ДО тебя. У тебя НЕТ list_recent.
-Если пользователь пишет такой запрос и ты дошёл до него — скажи:
-"Напиши: покажи последние 10 трат".
+ПЕРИОДЫ:
+Когда пользователь упоминает период, конвертируй в YYYY-MM-DD:
+  "в этом месяце" → period_start = ${year}-${String(month).padStart(2, '0')}-01, period_end = последний день этого месяца
+  "в апреле" / "за март" / etc. → period_start + period_end для того месяца ${year} года
+  "за неделю" / "на этой неделе" → понедельник—воскресенье этой недели (Asia/Almaty)
+  "вчера" → period_start = period_end = вчера (Almaty)
+  "сегодня" → period_start = period_end = ${today}
+Если период не указан — не передавай period_start/period_end, ищи за всё время.
 
 ПЕРИОДЫ:
 Когда в вопросе упомянут месяц/неделя/диапазон, всегда передавай period_start и period_end
@@ -1254,6 +1005,37 @@ async function executeReadTool(
       );
     }
 
+    case 'list_recent_transactions': {
+      const limit = Math.min(Math.max(1, (input.limit as number) || 10), 30);
+      const offset = Math.max(0, (input.offset as number) || 0);
+      const periodStart = input.period_start as string | undefined;
+      const periodEnd = input.period_end as string | undefined;
+
+      const result = await listRecentTransactionsPaged(
+        ctx.familyId, limit, offset, periodStart, periodEnd,
+      );
+
+      // Store context so user saying "ещё" later works even if conversation
+      // history gets trimmed. Claude can also call us with explicit offset —
+      // both paths work.
+      if (result.has_more) {
+        await setPendingListContext(ctx.familyId, {
+          limit,
+          offset: offset + result.transactions.length,
+          period_start: periodStart,
+          period_end: periodEnd,
+        }).catch(() => {});
+      } else {
+        await clearPendingListContext(ctx.familyId).catch(() => {});
+      }
+
+      return formatTransactionList(
+        result.transactions,
+        await getCategoriesForFamily(ctx.familyId),
+        { total: result.total_count, offset, hasMore: result.has_more },
+      );
+    }
+
     case 'get_debts': {
       const debts = await getActiveDebts(ctx.familyId);
       if (debts.length === 0) return '🎉 Нет активных долгов!';
@@ -1338,30 +1120,15 @@ export async function chat(
     return textOnly(reply);
   }
 
-  // ── 5. Keyword search (deterministic, bypasses Claude) ──
-  // LLM tool-routing was unreliable for "сколько (раз) мы покупали X" patterns
-  // — Haiku kept choosing list_recent_transactions (last 20) instead of search.
-  // Parsing the intent deterministically here guarantees ALL history is searched.
-  const searchIntent = tryParseSearchQuery(text);
-  if (searchIntent) {
-    const reply = await handleKeywordSearch(searchIntent, ctx);
-    await saveUserMsg();
-    await saveAssistantMsg(reply);
-    return textOnly(reply);
-  }
-
-  // ── 6. List query (deterministic, bypasses Claude) ──
-  // list_recent_transactions isn't in Claude's toolset — it gets called
-  // only via this parser, which triggers on explicit "show me last N" patterns.
-  const listIntent = tryParseListQuery(text);
-  if (listIntent) {
-    const reply = await handleListQuery(listIntent, ctx);
-    await saveUserMsg();
-    await saveAssistantMsg(reply);
-    return textOnly(reply);
-  }
-
-  // ── 7. Everything else → Claude (read + write tools) ──
+  // ── 5. Everything else → Sonnet (read + write tools) ──
+  //
+  // Philosophy: Sonnet 4.6 understands Russian phrasings + morphology much
+  // better than any regex we can write. "сколько потратили на агушу",
+  // "дай расходы на агушу", "hi how much did we spend on chips" — Sonnet
+  // extracts the keyword + intent and picks the right tool. We lost a
+  // whole evening trying to beat Sonnet with regex parsing; we won't do
+  // that again. The search tool itself handles Russian morphology via
+  // server-side stemming (see searchTransactionsByComment in queries.ts).
   let history: { role: string; content: string }[] = [];
   try { history = await getRecentMessages(chatId, ctx.familyId, 10); } catch { /* */ }
 
