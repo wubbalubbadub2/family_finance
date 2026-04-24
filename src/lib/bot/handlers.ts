@@ -100,12 +100,15 @@ async function handleNewFamilyCommand(
       expires_in_days: 14,
     });
     const link = await buildInviteLink(ctx, invite.code);
+    // NO parse_mode here: bot usernames and invite codes contain underscores,
+    // which legacy Markdown treats as italic markers — they get eaten and the
+    // link breaks. Plain text preserves the URL verbatim and Telegram still
+    // auto-links it client-side.
     await ctx.reply(
-      `✅ Создал семью *${name.trim()}*.\n\n` +
+      `✅ Создал семью "${name.trim()}".\n\n` +
       `📎 Ссылка-приглашение (14 дней, одноразовая):\n${link}\n\n` +
       `Перешли её первому члену семьи. Когда они кликнут — их аккаунт добавится автоматически.`,
-      { parse_mode: 'Markdown' },
-    ).catch(() => ctx.reply(`Создал семью "${name.trim()}". Ссылка: ${link}`));
+    );
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     await ctx.reply(`❌ ${msg}`);
