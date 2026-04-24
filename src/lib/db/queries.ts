@@ -1297,11 +1297,42 @@ export interface TopItemRow {
   count: number;         // number of matching rows
 }
 
+/**
+ * Resolve a free-form category name (as user or LLM typed it) to a row.
+ * Case-insensitive, strips emoji, accepts partial matches ("Раз" → "Разное").
+ * Returns null if no match or ambiguous.
+ */
+export async function resolveCategoryByName(
+  familyId: string,
+  name: string,
+): Promise<Category | null> {
+  const needle = name.trim().replace(/[\p{Extended_Pictographic}‍]/gu, '').trim().toLowerCase();
+  if (!needle) return null;
+
+  const cats = await getAllCategoriesForFamily(familyId);
+  const norm = (s: string) => s.replace(/[\p{Extended_Pictographic}‍]/gu, '').trim().toLowerCase();
+
+  // 1. Exact case-insensitive match on name OR slug
+  const exact = cats.find((c) => norm(c.name) === needle || c.slug.toLowerCase() === needle);
+  if (exact) return exact;
+
+  // 2. Prefix match (single hit only — ambiguous prefix returns null)
+  const prefix = cats.filter((c) => norm(c.name).startsWith(needle));
+  if (prefix.length === 1) return prefix[0];
+
+  // 3. Substring match (single hit only)
+  const substr = cats.filter((c) => norm(c.name).includes(needle));
+  if (substr.length === 1) return substr[0];
+
+  return null;
+}
+
 export async function topItemsByComment(
   familyId: string,
   limit = 10,
   periodStart?: string,
   periodEnd?: string,
+  categoryId?: number,
 ): Promise<TopItemRow[]> {
   // Supabase JS client doesn't support GROUP BY directly. Two options:
   //   (a) Postgres function (rpc), or
@@ -1314,6 +1345,7 @@ export async function topItemsByComment(
     .eq('family_id', familyId)
     .is('deleted_at', null)
     .eq('type', 'expense');
+  if (categoryId) q = q.eq('category_id', categoryId);
   if (periodStart) q = q.gte('transaction_date', periodStart);
   if (periodEnd) q = q.lte('transaction_date', periodEnd);
 

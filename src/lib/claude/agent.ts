@@ -37,6 +37,7 @@ import {
   upsertCategoryOverride,
   resolveTransactionRef,
   topItemsByComment,
+  resolveCategoryByName,
   type ConfirmType,
   type PendingConfirm,
 } from '@/lib/db/queries';
@@ -494,13 +495,19 @@ const READ_TOOLS: Anthropic.Tool[] = [
       '"what did we spend the most on?", "топ-10 трат по товарам", "на какие товары больше всего ушло?". ' +
       'Different from get_month_summary (which groups by category) — this groups by the specific item/comment. ' +
       'Lowercased same-comment entries merge ("Агуша" + "агуша" → one row). ' +
-      'For "за апрель" / "за неделю" etc., pass period_start + period_end as YYYY-MM-DD.',
+      'For "за апрель" / "за неделю" etc., pass period_start + period_end as YYYY-MM-DD.\n\n' +
+      'CATEGORY DRILL-DOWN: pass `category` to list ALL items inside a single category. ' +
+      'This is the right tool for "из чего состоит Разное?", "что в категории Продукты?", ' +
+      '"что входит в Кафе?", "breakdown of X category". Pair with period + a high limit ' +
+      '(e.g. 50) to get the full composition. The category arg is fuzzy — "Разное", "разное", ' +
+      '"раз" all match "Разное 🎲".',
     input_schema: {
       type: 'object' as const,
       properties: {
-        limit: { type: 'number', description: 'How many top items to return. Default 10, max 50.' },
+        limit: { type: 'number', description: 'How many top items to return. Default 10, max 50. Use 50 for category drill-down to get everything.' },
         period_start: { type: 'string', description: 'YYYY-MM-DD inclusive. Omit for all time.' },
         period_end: { type: 'string', description: 'YYYY-MM-DD inclusive. Omit for all time.' },
+        category: { type: 'string', description: 'Optional. Category name (e.g. "Разное"). When set, only items in that category are listed/aggregated.' },
       },
       required: [],
     },
@@ -569,11 +576,15 @@ ${firstRunBlock}
   ("покажи последние 20", "что мы тратили вчера"). Для "ещё" — передавай offset = предыдущий_offset + предыдущий_limit.
   НЕ используй для вопросов "сколько на X" — там нужен search.
 - get_month_summary(year, month) — итоги месяца с разбивкой по КАТЕГОРИЯМ
-- get_top_items_by_comment(limit?, period?) — топ ТОВАРОВ/ЭЛЕМЕНТОВ по сумме трат.
+- get_top_items_by_comment(limit?, period?, category?) — топ ТОВАРОВ/ЭЛЕМЕНТОВ по сумме трат.
   Используй когда пользователь хочет знать "на что больше всего потратили" на уровне
   КОНКРЕТНЫХ ВЕЩЕЙ, не категорий: "на что больше всего ушло?", "топ-10 товаров",
   "на что больше всего потратили — не категория, а сам элемент".
   НЕ get_month_summary — там разбивка по категориям (Продукты, Транспорт и т.д.).
+  РАЗБОР КАТЕГОРИИ: "из чего состоит Разное?", "что входит в Продукты?",
+  "breakdown of X", "покажи все в категории Y" → передавай category="Y", limit=50,
+  period=текущий месяц (если пользователь не указал другой). Это вернёт ВСЕ позиции
+  внутри категории в одном сообщении — НЕ предлагай "ещё" и НЕ get_month_summary.
 - get_debts — долги
 
 ЗАПИСЬ (пользователь подтверждает кнопкой ✅ Да перед исполнением):
@@ -1219,14 +1230,30 @@ async function executeReadTool(
       const limit = Math.min(Math.max(1, (input.limit as number) || 10), 50);
       const periodStart = input.period_start as string | undefined;
       const periodEnd = input.period_end as string | undefined;
+      const categoryName = input.category as string | undefined;
 
-      const rows = await topItemsByComment(ctx.familyId, limit, periodStart, periodEnd);
-      if (rows.length === 0) {
-        const periodHint = periodStart || periodEnd ? ' за указанный период' : '';
-        return `📊 Нет трат${periodHint}.`;
+      let categoryId: number | undefined;
+      let resolvedCategory: Category | null = null;
+      if (categoryName && categoryName.trim()) {
+        resolvedCategory = await resolveCategoryByName(ctx.familyId, categoryName);
+        if (!resolvedCategory) {
+          const cats = await getCategoriesForFamily(ctx.familyId);
+          const names = cats.map((c) => `${c.emoji} ${c.name}`).join(', ');
+          return `🤔 Не нашёл категорию "${categoryName}". Доступные: ${names}`;
+        }
+        categoryId = resolvedCategory.id;
       }
 
-      let text = `📊 Топ-${rows.length} товаров по тратам`;
+      const rows = await topItemsByComment(ctx.familyId, limit, periodStart, periodEnd, categoryId);
+      if (rows.length === 0) {
+        const periodHint = periodStart || periodEnd ? ' за указанный период' : '';
+        const catHint = resolvedCategory ? ` в категории ${resolvedCategory.emoji} ${resolvedCategory.name}` : '';
+        return `📊 Нет трат${catHint}${periodHint}.`;
+      }
+
+      let text = resolvedCategory
+        ? `📊 ${resolvedCategory.emoji} ${resolvedCategory.name} — ${rows.length} позиц${rows.length === 1 ? 'ия' : rows.length < 5 ? 'ии' : 'ий'}`
+        : `📊 Топ-${rows.length} товаров по тратам`;
       if (periodStart || periodEnd) {
         text += ` (${periodStart ?? '...'} → ${periodEnd ?? '...'})`;
       }
