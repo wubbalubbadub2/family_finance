@@ -48,8 +48,26 @@ function parseInvitePayload(text: string): string | null {
   return m ? m[1].toLowerCase() : null;
 }
 
-function buildInviteLink(code: string): string {
-  const handle = (process.env.TELEGRAM_BOT_HANDLE ?? 'FamilyBudgetBot').replace(/^@/, '');
+// Derive the handle from the BOT'S OWN TOKEN via getMe(). The token IS the
+// bot's identity, so this is the only source of truth that cannot produce a
+// link pointing at the wrong bot. Cached per lambda instance.
+//
+// We had an incident (2026-04) where TELEGRAM_BOT_HANDLE wasn't set on Vercel
+// and the old fallback was a hardcoded string that happened to be another
+// real bot — users tapped "their" invite link and talked to a stranger's bot.
+// Never again: no env var, no default, no silent divergence.
+let cachedBotHandle: string | null = null;
+
+async function resolveBotHandle(ctx: Context): Promise<string> {
+  if (cachedBotHandle) return cachedBotHandle;
+  const me = await ctx.api.getMe();
+  if (!me.username) throw new Error('Bot has no @username set in BotFather');
+  cachedBotHandle = me.username;
+  return cachedBotHandle;
+}
+
+async function buildInviteLink(ctx: Context, code: string): Promise<string> {
+  const handle = await resolveBotHandle(ctx);
   return `https://t.me/${handle}?start=invite_${code}`;
 }
 
@@ -81,7 +99,7 @@ async function handleNewFamilyCommand(
       uses: 1,
       expires_in_days: 14,
     });
-    const link = buildInviteLink(invite.code);
+    const link = await buildInviteLink(ctx, invite.code);
     await ctx.reply(
       `✅ Создал семью *${name.trim()}*.\n\n` +
       `📎 Ссылка-приглашение (14 дней, одноразовая):\n${link}\n\n` +
@@ -106,7 +124,7 @@ async function handleInviteCommand(ctx: Context, callerFamilyId: string, callerU
       uses: 1,
       expires_in_days: 14,
     });
-    const link = buildInviteLink(invite.code);
+    const link = await buildInviteLink(ctx, invite.code);
     await ctx.reply(
       `📎 Ссылка для приглашения в твою семью (14 дней, одноразовая):\n${link}\n\n` +
       `Перешли тому, кого хочешь добавить. Они кликнут и автоматически присоединятся.`,
