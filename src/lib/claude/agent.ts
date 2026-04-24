@@ -1315,6 +1315,16 @@ export async function chat(
 
   const text = userMessage.trim();
 
+  // Short-circuit: ambiguous 1-2 char inputs ("?", "??", "!", ".", "hmm") have no
+  // actionable content. Sonnet confronted with these tends to hallucinate from
+  // recent conversation history (observed in prod: "?" produced a fabricated
+  // reply about the PREVIOUS expense, claiming the user had just logged it).
+  // Ask for clarification instead of letting the model guess.
+  const meaningfulChars = text.replace(/[\s?!.,;:]/g, '');
+  if (meaningfulChars.length < 3) {
+    return textOnly('🤔 Не понял вопрос. Например: "сколько на кофе?", "из чего состоит Разное?", "покажи последние 10 трат".');
+  }
+
   const saveUserMsg = () => saveMessage(ctx.chatId, ctx.familyId, 'user', `[${userName}]: ${text}`).catch(() => {});
   const saveAssistantMsg = (reply: string) => saveMessage(ctx.chatId, ctx.familyId, 'assistant', reply).catch(() => {});
 
@@ -1401,6 +1411,12 @@ export async function chat(
   await saveUserMsg();
 
   let finalReply = '';
+  // Last read-tool's raw output. System prompt declares read-tool results are
+  // ready-for-user text, so if Sonnet ends silent after a tool call (observed
+  // in prod: "из чего состоит Разное?" triggered tool → second turn returned
+  // no text), we fall back to sending the tool output directly instead of
+  // saying "Не понял".
+  let lastReadResult: string | null = null;
   // If a write tool is proposed, we exit the loop early with a keyboard reply
   // so the user can tap Да/Отмена. Claude's own natural-language response for
   // that turn is discarded in favor of our structured confirm message.
@@ -1416,7 +1432,7 @@ export async function chat(
       break;
     }
 
-    console.log(`[chat] iter ${i}: sending ${messages.length} messages to ${MODEL}`);
+    console.error(`[chat] iter ${i}: sending ${messages.length} messages to ${MODEL}`);
     const response = await client.messages.create({
       model: MODEL,
       max_tokens: 1024,
@@ -1428,6 +1444,7 @@ export async function chat(
     const toolUses = response.content.filter(b => b.type === 'tool_use');
     const textBlocks = response.content.filter(b => b.type === 'text');
     const turnText = textBlocks.map(b => b.type === 'text' ? b.text : '').join('\n').trim();
+    console.error(`[chat] iter ${i}: stop=${response.stop_reason} tools=${toolUses.length} text=${turnText.length}b`);
     if (turnText) finalReply = turnText;
 
     if (toolUses.length === 0) break;
@@ -1464,11 +1481,12 @@ export async function chat(
       try {
         const tStart = Date.now();
         const result = await executeReadTool(toolName, input, ctx);
-        console.log(`[chat] tool ${toolName} took ${Date.now() - tStart}ms`);
+        console.error(`[chat] tool ${toolName} took ${Date.now() - tStart}ms, ${result.length}b`);
         toolResults.push({ tool_use_id: block.id, content: result });
+        lastReadResult = result;
       } catch (e) {
         const errMsg = e instanceof Error ? e.message : String(e);
-        console.warn(`[chat] read tool ${toolName} threw:`, errMsg);
+        console.error(`[chat] read tool ${toolName} threw:`, errMsg);
         toolResults.push({
           tool_use_id: block.id,
           content: `ERROR: ${errMsg}. Tell the user what went wrong and what they can try instead.`,
@@ -1495,10 +1513,18 @@ export async function chat(
     return confirmResponse;
   }
 
-  // Absolute last-resort fallback — should never be empty after all the above,
-  // but if Sonnet returned zero text + zero tool uses, at least say SOMETHING.
+  // If Sonnet produced no text but DID execute a read tool, ship the tool's
+  // output directly. Read-tool outputs are designed to be user-ready, so this
+  // is strictly better than "Не понял" when the user asked for information
+  // and we successfully retrieved it but the model went silent on turn 2.
+  if (!finalReply && lastReadResult) {
+    console.error(`[chat] Sonnet silent after tool call; passing through read result (${lastReadResult.length}b)`);
+    finalReply = lastReadResult;
+  }
+
+  // Absolute last-resort fallback — Sonnet returned no text AND no tool uses.
   if (!finalReply) {
-    console.warn('[chat] empty finalReply after loop — falling back');
+    console.error('[chat] empty finalReply after loop — falling back to "не понял"');
     finalReply = '🤔 Не понял. Попробуй переформулировать — например: "сколько на X?" или "покажи последние 10 трат".';
   }
   await saveAssistantMsg(finalReply);
