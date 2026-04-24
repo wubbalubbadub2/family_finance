@@ -322,6 +322,42 @@ function slugifyForCategory(name: string): string {
 
 // ── Transactions ──
 
+/**
+ * Look for a near-identical expense logged in the recent past. Identical =
+ * same family_id, same amount (to the tenge), same normalized comment. Used
+ * as a dedup guard: when the bot retries, a double-tap, or rapid paste
+ * submits the same row twice, we want to reject the second one.
+ *
+ * `windowMinutes` = how far back to look. Default 10 min catches retries
+ * and double-taps while preserving legitimate repeat entries (morning +
+ * evening bus, multiple coffees in a day).
+ */
+export async function findRecentDuplicate(args: {
+  familyId: string;
+  amount: number;
+  comment: string;
+  windowMinutes?: number;
+}): Promise<Transaction | null> {
+  const window = args.windowMinutes ?? 10;
+  const since = new Date(Date.now() - window * 60_000).toISOString();
+  const normalized = args.comment.trim().toLowerCase();
+  if (!normalized) return null;
+
+  const { data } = await supabase
+    .from('transactions')
+    .select('*')
+    .eq('family_id', args.familyId)
+    .eq('amount', args.amount)
+    .is('deleted_at', null)
+    .gte('created_at', since)
+    .order('created_at', { ascending: false })
+    .limit(20);
+  if (!data || data.length === 0) return null;
+  // Exact comment match (case-insensitive) so "пиво" matches "Пиво" but not
+  // "пиво 2" or other slightly different descriptions.
+  return data.find((t) => (t.comment ?? '').trim().toLowerCase() === normalized) ?? null;
+}
+
 export async function insertTransaction(tx: {
   family_id: string;
   user_id: string;

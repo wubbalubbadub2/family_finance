@@ -38,6 +38,7 @@ import {
   resolveTransactionRef,
   topItemsByComment,
   resolveCategoryByName,
+  findRecentDuplicate,
   type ConfirmType,
   type PendingConfirm,
 } from '@/lib/db/queries';
@@ -228,6 +229,21 @@ async function handleExpenses(
   const familyCategories = await getCategoriesForFamily(ctx.familyId);
 
   for (const exp of expenses) {
+    // Dedup guard: reject a second identical row within 10 min. Catches the
+    // bot-retry / double-tap pattern that polluted April with ~6 duplicates
+    // before we noticed. Legitimate repeat entries (morning + evening bus,
+    // two coffees in a day) sit outside the window so they still log.
+    const dupe = await findRecentDuplicate({
+      familyId: ctx.familyId,
+      amount: exp.amount,
+      comment: exp.description,
+    }).catch(() => null);
+    if (dupe) {
+      const ageMin = Math.max(1, Math.round((Date.now() - new Date(dupe.created_at).getTime()) / 60_000));
+      results.push(`⏭️ ${formatTenge(exp.amount)} (${exp.description}) — пропущено, дубликат записи ${ageMin} мин назад. Если это отдельная трата — добавь уточнение: «${exp.description} 2 ${exp.amount}».`);
+      continue;
+    }
+
     const slug = await categorize(exp.description, familyCategories, ctx.familyId);
     const category = familyCategories.find(c => c.slug === slug) ?? await getCategoryBySlugInFamily(slug, ctx.familyId);
     if (!category) { errors.push(`❌ ${exp.description}: категория не найдена`); continue; }
