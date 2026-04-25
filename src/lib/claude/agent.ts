@@ -56,8 +56,22 @@ const MODEL = process.env.CLAUDE_MODEL || 'claude-sonnet-4-6';
 // PATTERN DETECTION — determine user intent from text
 // ═══════════════════════════════════════════════════════════════
 
+// Strip currency markers that follow a digit ("1762тг", "400 ₸", "5000 тенге").
+// Russian-speaking users routinely append currency, but the regex below requires
+// the line to end with digits, so unstripped suffixes produce parser misses.
+// Real prod incident (2026-04-25): Akbota wrote "Супермаркет 1762тг" — bot
+// fell through to Sonnet, which said "Записала!" without recording anything.
+//
+// Stripping ONLY happens in expense parsing — search/list queries with
+// currency-like words are routed by the LLM and don't pass through here.
+const CURRENCY_SUFFIX_RE = /(\d)\s*(?:тенге|тг|kzt|₸)/giu;
+
+export function stripCurrencyMarkers(line: string): string {
+  return line.replace(CURRENCY_SUFFIX_RE, '$1').replace(/\s+/g, ' ').trim();
+}
+
 function tryParseExpenses(text: string): { amount: number; description: string }[] | null {
-  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+  const lines = text.split('\n').map(l => stripCurrencyMarkers(l)).filter(Boolean);
   const results: { amount: number; description: string }[] = [];
 
   for (const line of lines) {
@@ -580,6 +594,18 @@ ${firstRunBlock}
 Новые траты/доходы/долги уже записываются системой автоматически из сумм+описаний
 ("кофе 1200"). Если пользователь просто пишет сумму и описание — не вмешивайся. Но
 если он хочет ИЗМЕНИТЬ уже записанное (поменять категорию, удалить) — это ТВОЯ работа.
+
+🚨 КРИТИЧЕСКОЕ ПРАВИЛО (не нарушать ни при каких условиях):
+Если пользовательское сообщение ВЫГЛЯДИТ как трата (что-то + число), но ты
+видишь его — значит детерминированный парсер пропустил его (странный формат,
+суффикс "тг"/"₸"/"тенге", опечатка). НИКОГДА не отвечай "Записала", "Записано",
+"система зафиксирует", "Зафиксировал", или любой формулировкой, подразумевающей
+что трата сохранена — потому что у тебя НЕТ инструмента создания транзакций,
+и любое такое подтверждение будет ЛОЖЬЮ. Это сломает доверие пользователя к боту.
+
+Вместо этого скажи: "🤔 Не понял формат — напиши проще: «описание сумма» (без 'тг'/'₸').
+Например: «Супермаркет 1762» или «1762 супермаркет»." Дай конкретный пример из
+сообщения пользователя.
 
 ЧТЕНИЕ:
 - search_transactions_by_comment(keyword, period?) — поиск по ключевому слову.
