@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { createBot } from '@/lib/bot/handlers';
 import { webhookCallback } from 'grammy';
+import { captureError } from '@/lib/observability';
 
 // Allow up to 60 seconds for bot processing (Claude API + DB writes)
 export const maxDuration = 60;
@@ -21,7 +22,9 @@ export async function POST(req: NextRequest) {
     const callback = getHandler();
     return await callback(req);
   } catch (error) {
-    console.error('Webhook error:', error);
+    // Outer catch — only fires if grammy itself throws (malformed update, etc).
+    // Per-message handler errors are caught inside handlers.ts with captureError.
+    await captureError(error, { source: 'webhook:route' });
     return NextResponse.json({ ok: true }); // Always return 200 to Telegram
   }
 }

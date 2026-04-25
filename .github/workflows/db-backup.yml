@@ -1,0 +1,106 @@
+# Weekly encrypted Supabase Postgres backup.
+#
+# Why this exists: Supabase free tier does NOT include automated backups (those are
+# Pro-tier only). With 9 paying/testing households accumulating sensitive financial
+# data, "we trust Supabase to never lose data" is not a posture we can have.
+#
+# What it does:
+#   1. Runs every Sunday 02:00 UTC (07:00 Almaty)
+#   2. Dumps the full Postgres database via pg_dump
+#   3. Encrypts the dump with AES-256 using a passphrase from GitHub secrets
+#   4. Uploads the encrypted dump as a workflow artifact (90-day retention on
+#      GitHub free tier, which is enough until we move to durable storage)
+#
+# Required secrets (set via `gh secret set <NAME>`):
+#   SUPABASE_DB_URL          — full Postgres connection string from Supabase dashboard
+#                              Settings → Database → Connection string → "Direct"
+#                              Format: postgres://postgres:PWD@db.PROJECT_REF.supabase.co:5432/postgres
+#   BACKUP_ENCRYPTION_KEY    — strong passphrase used to encrypt the dump
+#                              Generate locally: openssl rand -base64 32
+#                              Store this passphrase somewhere durable (1Password, etc).
+#                              Without it the artifacts are useless.
+#
+# To restore manually (you'd do this in a fresh shell, not on the runner):
+#   gh run download <run-id> -n db-backup-encrypted
+#   openssl enc -d -aes-256-cbc -pbkdf2 -in dump.sql.enc -out dump.sql -pass pass:"$KEY"
+#   psql "$NEW_DATABASE_URL" < dump.sql
+#
+# To trigger manually for first test: gh workflow run db-backup.yml
+
+name: Weekly DB Backup
+
+on:
+  schedule:
+    # Sunday 02:00 UTC = Sunday 07:00 Almaty. Off-peak, won't interfere with cron jobs.
+    - cron: '0 2 * * 0'
+  # Manual trigger for first run + ad-hoc backups.
+  workflow_dispatch:
+
+# Hardening: minimum permissions. This workflow doesn't need to write to the repo.
+permissions:
+  contents: read
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Install postgresql-client-15
+        # Ubuntu 22.04 default ships with pg_dump 14, which can choke on Postgres 15
+        # server features. Pull v15 from the official PostgreSQL apt repo to match.
+        run: |
+          sudo sh -c 'echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
+          sudo apt-get update -qq
+          sudo apt-get install -y postgresql-client-15
+          /usr/lib/postgresql/15/bin/pg_dump --version
+
+      - name: Dump database
+        env:
+          PGCONNECT_TIMEOUT: '30'
+        run: |
+          set -euo pipefail
+          # --no-owner / --no-privileges: makes restore portable to a fresh project
+          # --clean --if-exists: restore script can re-run cleanly
+          # --quote-all-identifiers: future-proofs against reserved-word column names
+          /usr/lib/postgresql/15/bin/pg_dump \
+            --no-owner \
+            --no-privileges \
+            --clean \
+            --if-exists \
+            --quote-all-identifiers \
+            --file=dump.sql \
+            "${{ secrets.SUPABASE_DB_URL }}"
+          ls -lh dump.sql
+          # Sanity: a bot db with 9 families should produce >50KB of dump.
+          # If it's tiny, something went wrong (auth failure, empty schema).
+          dump_bytes=$(stat -c %s dump.sql)
+          if [ "$dump_bytes" -lt 10240 ]; then
+            echo "::error::dump.sql is suspiciously small ($dump_bytes bytes). Aborting."
+            exit 1
+          fi
+
+      - name: Encrypt dump
+        run: |
+          set -euo pipefail
+          # AES-256-CBC with PBKDF2 key derivation (modern openssl default).
+          # Random salt is embedded in the output. Decryption needs the same passphrase.
+          openssl enc -aes-256-cbc -pbkdf2 -salt \
+            -in dump.sql \
+            -out dump.sql.enc \
+            -pass "pass:${{ secrets.BACKUP_ENCRYPTION_KEY }}"
+          # Don't leave plaintext on disk — even though the runner is ephemeral,
+          # an upload-artifact misconfiguration could leak it.
+          shred -u dump.sql || rm -f dump.sql
+          ls -lh dump.sql.enc
+
+      - name: Upload encrypted dump
+        uses: actions/upload-artifact@v4
+        with:
+          name: db-backup-encrypted-${{ github.run_id }}
+          path: dump.sql.enc
+          # 90 days is GitHub free tier maximum. Beyond that, move to durable
+          # storage (B2 / Cloudflare R2). Tracked as Day-15 decision in design doc.
+          retention-days: 90
+          if-no-files-found: error

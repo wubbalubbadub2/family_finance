@@ -7,6 +7,7 @@ import {
   createFamily,
   createFamilyInvite,
 } from '@/lib/db/queries';
+import { captureError } from '@/lib/observability';
 
 // NOTE: we removed ALLOWED_TELEGRAM_IDS. Allowlist is the `users` table now.
 // Anyone can DM the bot — if they're not in the table, they get a welcome
@@ -246,7 +247,11 @@ export function createBot(): Bot {
       await sendChunked(ctx, response);
     } catch (error) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      console.error('Bot error:', errMsg);
+      await captureError(error, {
+        source: 'webhook:message',
+        userTgId: telegramId,
+        context: { text: rawText.slice(0, 200), chat_type: ctx.chat?.type },
+      });
       await ctx.reply(`😔 Ошибка: ${errMsg.slice(0, 200)}`);
     }
   });
@@ -276,7 +281,11 @@ export function createBot(): Bot {
       await sendChunked(ctx, response);
     } catch (error) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      console.error('Callback error:', errMsg);
+      await captureError(error, {
+        source: 'webhook:callback',
+        userTgId: telegramId,
+        context: { data: ctx.callbackQuery.data?.slice(0, 200) },
+      });
       try { await ctx.answerCallbackQuery({ text: '😔 Ошибка' }); } catch { /* already answered */ }
       await ctx.reply(`😔 Ошибка: ${errMsg.slice(0, 200)}`);
     }
