@@ -44,6 +44,17 @@ import {
 } from '@/lib/db/queries';
 import { todayAlmaty, currentMonthAlmaty, monthNameRu, formatTenge } from '@/lib/utils';
 import { renderGoalProgress } from '@/lib/goals';
+import {
+  stripCurrencyMarkers,
+  tryParseExpenses,
+  tryParseIncome,
+  tryParseDebt,
+  isUndoRequest,
+  isMeaningfulInput,
+} from '@/lib/parsers';
+
+// Re-export for any historical callers that imported from this module.
+export { stripCurrencyMarkers, tryParseExpenses, tryParseIncome, tryParseDebt, isUndoRequest };
 
 const client = new Anthropic();
 // Sonnet 4.6 for tool routing — Haiku had ~15-30% miss rate on ambiguous
@@ -56,73 +67,8 @@ const MODEL = process.env.CLAUDE_MODEL || 'claude-sonnet-4-6';
 // PATTERN DETECTION — determine user intent from text
 // ═══════════════════════════════════════════════════════════════
 
-// Strip currency markers that follow a digit ("1762тг", "400 ₸", "5000 тенге").
-// Russian-speaking users routinely append currency, but the regex below requires
-// the line to end with digits, so unstripped suffixes produce parser misses.
-// Real prod incident (2026-04-25): Akbota wrote "Супермаркет 1762тг" — bot
-// fell through to Sonnet, which said "Записала!" without recording anything.
-//
-// Stripping ONLY happens in expense parsing — search/list queries with
-// currency-like words are routed by the LLM and don't pass through here.
-const CURRENCY_SUFFIX_RE = /(\d)\s*(?:тенге|тг|kzt|₸)/giu;
-
-export function stripCurrencyMarkers(line: string): string {
-  return line.replace(CURRENCY_SUFFIX_RE, '$1').replace(/\s+/g, ' ').trim();
-}
-
-function tryParseExpenses(text: string): { amount: number; description: string }[] | null {
-  const lines = text.split('\n').map(l => stripCurrencyMarkers(l)).filter(Boolean);
-  const results: { amount: number; description: string }[] = [];
-
-  for (const line of lines) {
-    const match1 = line.match(/^(.+?)\s+(\d[\d\s]*\d|\d+)\s*$/);
-    const match2 = line.match(/^(\d[\d\s]*\d|\d+)\s+(.+?)$/);
-
-    if (match1) {
-      const amount = parseInt(match1[2].replace(/\s/g, ''), 10);
-      if (amount > 0 && amount <= 10_000_000) results.push({ amount, description: match1[1].trim() });
-    } else if (match2) {
-      const amount = parseInt(match2[1].replace(/\s/g, ''), 10);
-      if (amount > 0 && amount <= 10_000_000) results.push({ amount, description: match2[2].trim() });
-    }
-  }
-
-  if (results.length > 0) return results;
-  return null;
-}
-
-function tryParseIncome(text: string): { amount: number; comment: string } | null {
-  const lower = text.toLowerCase();
-  const incomeWords = /зарплат|доход|получил|премия|бонус|фриланс|перевод|вернули/;
-  if (!incomeWords.test(lower)) return null;
-
-  const amountMatch = text.match(/(\d[\d\s]*\d|\d+)/);
-  if (!amountMatch) return null;
-  const amount = parseInt(amountMatch[1].replace(/\s/g, ''), 10);
-  if (amount <= 0) return null;
-
-  const comment = text.replace(amountMatch[0], '').replace(/тенге|тг|₸/gi, '').trim();
-  return { amount, comment: comment || 'доход' };
-}
-
-function tryParseDebt(text: string): { amount: number; name: string } | null {
-  const lower = text.toLowerCase();
-  if (!/взял в долг|занял|одолжил|кредит взял/i.test(lower)) return null;
-
-  const amountMatch = text.match(/(\d[\d\s]*\d|\d+)/);
-  if (!amountMatch) return null;
-  const amount = parseInt(amountMatch[1].replace(/\s/g, ''), 10);
-  if (amount <= 0) return null;
-
-  // Extract name: everything after the amount, or after "у"
-  let name = text.replace(amountMatch[0], '').replace(/взял в долг|занял|одолжил|кредит взял|тенге|тг|₸|у\s/gi, '').trim();
-  if (!name) name = 'без имени';
-  return { amount, name };
-}
-
-function isUndoRequest(text: string): boolean {
-  return /удали|отмени|undo|убери последн|верни назад|отмена/i.test(text);
-}
+// Pattern detection moved to src/lib/parsers.ts so unit tests can import the
+// pure functions without bootstrapping Anthropic + Supabase clients.
 
 // ═══════════════════════════════════════════════════════════════
 // Family context — carried through every handler so we never leak
@@ -1357,13 +1303,12 @@ export async function chat(
 
   const text = userMessage.trim();
 
-  // Short-circuit: ambiguous 1-2 char inputs ("?", "??", "!", ".", "hmm") have no
+  // Short-circuit: ambiguous inputs ("?", "??", "!", ".", "hmm") have no
   // actionable content. Sonnet confronted with these tends to hallucinate from
   // recent conversation history (observed in prod: "?" produced a fabricated
   // reply about the PREVIOUS expense, claiming the user had just logged it).
   // Ask for clarification instead of letting the model guess.
-  const meaningfulChars = text.replace(/[\s?!.,;:]/g, '');
-  if (meaningfulChars.length < 3) {
+  if (!isMeaningfulInput(text)) {
     return textOnly('🤔 Не понял вопрос. Например: "сколько на кофе?", "из чего состоит Разное?", "покажи последние 10 трат".');
   }
 

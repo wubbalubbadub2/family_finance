@@ -39,6 +39,7 @@ export type TransactionSource = 'telegram' | 'web' | 'kaspi_import' | 'recurring
 
 export interface Transaction {
   id: string;
+  family_id: string;
   user_id: string;
   category_id: number | null;
   type: TransactionType;
@@ -54,6 +55,7 @@ export interface Transaction {
 
 export interface MonthlyPlan {
   id: string;
+  family_id: string;
   year: number;
   month: number;
   category_id: number | null;
@@ -65,6 +67,7 @@ export interface MonthlyPlan {
 
 export interface RecurringTransaction {
   id: string;
+  family_id: string;
   category_id: number;
   type: TransactionType;
   amount: number;
