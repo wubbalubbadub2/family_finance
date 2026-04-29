@@ -208,11 +208,22 @@ export function createBot(): Bot {
       if (/^\/start(@\w+)?$/i.test(rawText)) {
         const existing = await getUserByTelegramId(telegramId);
         if (existing) {
+          // Same shape as the invite-arrival welcome (handleInviteArrival) so
+          // re-greeting an existing user feels consistent with first-time onboarding.
+          // No parse_mode (Markdown eats Cyrillic underscores).
           await ctx.reply(
-            `👋 Привет, ${existing.name}! Записывай траты обычным текстом: *кофе 500*, ` +
-            `или спрашивай: *сколько на чипсы?* · *покажи последние 10 трат*.`,
-            { parse_mode: 'Markdown' },
-          ).catch(() => ctx.reply(`👋 Привет, ${existing.name}!`));
+            `👋 Привет, ${existing.name}!\n\n` +
+            `Я веду семейный бюджет — пиши траты обычным текстом, я разберусь сам.\n\n` +
+            `Что попробовать:\n` +
+            `• кофе 500 — записать трату\n` +
+            `• зарплата 500 000 — записать доход\n` +
+            `• взял в долг 100 000 у Аидара — записать долг\n` +
+            `• поставь лимит 80 000 на Продукты — план на категорию\n` +
+            `• сколько на кофе? — поиск\n` +
+            `• итоги месяца — общая сводка\n` +
+            `• хочу накопить 1 000 000 к декабрю — поставить цель\n\n` +
+            `Категории можно менять когда угодно: «переименуй Кафе в Рестораны», «удали категорию Накопления».`,
+          );
         } else {
           await ctx.reply(
             '👋 Этот бот работает по приглашению.\n' +

@@ -242,10 +242,11 @@ describe('isMeaningfulInput — ambiguous-input short-circuit', () => {
     assert.equal(isMeaningfulInput(''), false);
   });
 
-  test('rejects 1-2 character mumbles', () => {
+  test('rejects 1-2 character mumbles (but NOT confirmation words)', () => {
     assert.equal(isMeaningfulInput('a'), false);
-    assert.equal(isMeaningfulInput('ok'), false);
-    assert.equal(isMeaningfulInput('да'), false);
+    assert.equal(isMeaningfulInput('xy'), false);
+    assert.equal(isMeaningfulInput('hm'), false);
+    // "ok" and "да" are now allow-listed as confirmation words (see test below)
   });
 
   test('accepts real questions (>= 3 meaningful chars)', () => {
@@ -257,6 +258,20 @@ describe('isMeaningfulInput — ambiguous-input short-circuit', () => {
 
   test('accepts short-but-meaningful "хлеб 100"', () => {
     assert.equal(isMeaningfulInput('хлеб 100'), true);
+  });
+
+  test('lets confirmation words through (real prod incident: "да" lost)', () => {
+    // Bot suggested moving a transaction, user replied "да", short-circuit
+    // killed it before Sonnet could see the conversation context. Must pass.
+    assert.equal(isMeaningfulInput('да'), true);
+    assert.equal(isMeaningfulInput('Да'), true);
+    assert.equal(isMeaningfulInput('ДА'), true);
+    assert.equal(isMeaningfulInput('нет'), true);
+    assert.equal(isMeaningfulInput('ok'), true);
+    assert.equal(isMeaningfulInput('OK'), true);
+    assert.equal(isMeaningfulInput('yes'), true);
+    assert.equal(isMeaningfulInput('давай'), true);
+    assert.equal(isMeaningfulInput('отмена'), true);
   });
 });
 

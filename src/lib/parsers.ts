@@ -95,8 +95,18 @@ export function isUndoRequest(text: string): boolean {
  * lone "?" in a group chat got back "Похоже, вы написали 'автобус 110'..."
  * referencing a transaction from 30min earlier. We short-circuit these
  * before they reach the LLM and ask the user to be more specific instead.
+ *
+ * Exception: short confirmation words ("да", "нет", "ok", "yes", "no") are
+ * legitimate replies to a bot question. Real prod incident (2026-04-29):
+ * bot offered to move a transaction, user said "да", short-circuit triggered
+ * and the user's confirmation was lost. These pass through to Sonnet which
+ * can use conversation history to interpret them in context.
  */
+const ALWAYS_MEANINGFUL = /^(да|нет|ок|ok|yes|no|yep|nope|sure|конечно|нет\s*спасибо|давай|погнали|ага|угу|sure|готово|done|yep|cancel|отмена)\W*$/i;
+
 export function isMeaningfulInput(text: string): boolean {
-  const meaningfulChars = text.replace(/[\s?!.,;:()\[\]{}<>—–-]/g, '');
+  const trimmed = text.trim();
+  if (ALWAYS_MEANINGFUL.test(trimmed)) return true;
+  const meaningfulChars = trimmed.replace(/[\s?!.,;:()\[\]{}<>—–-]/g, '');
   return meaningfulChars.length >= 3;
 }
