@@ -12,7 +12,15 @@ let handler: ((req: Request) => Promise<Response>) | null = null;
 function getHandler(): (req: Request) => Promise<Response> {
   if (!handler) {
     const bot = createBot();
-    handler = webhookCallback(bot, 'std/http') as (req: Request) => Promise<Response>;
+    // grammy's default webhookCallback timeout is 10 seconds — too tight for our
+    // pipeline once the DB is far from the function region. Each user message
+    // triggers: getUserByTelegramId, getCategoriesForFamily, getRecentMessages,
+    // saveMessage, plus 1-2 Anthropic API calls (~3-5s) and tool-driven DB
+    // queries on top. Mumbai-Supabase ↔ US-East-Vercel round trip is ~250ms
+    // per query, so 8-10 queries blow past 10s easily. We give grammy the full
+    // Vercel maxDuration budget (60s) and rely on our own 45s loop deadline
+    // inside agent.ts to short-circuit before Telegram itself times out.
+    handler = webhookCallback(bot, 'std/http', { timeoutMilliseconds: 55_000 }) as (req: Request) => Promise<Response>;
   }
   return handler;
 }
