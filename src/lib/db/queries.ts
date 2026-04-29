@@ -937,6 +937,16 @@ export async function createFamily(name: string, primaryChatId?: number): Promis
     .select('id')
     .single();
   if (error || !data) throw new Error(`Не удалось создать семью: ${error?.message ?? 'no data'}`);
+
+  // Auto-seed default categories so the family's first expense lands somewhere.
+  // The "create categories before you can log anything" friction was the textbook
+  // onboarding mistake — paying users shouldn't have to do setup work to start.
+  // Idempotent (ON CONFLICT DO NOTHING in the SQL fn) — safe to call repeatedly.
+  // Non-fatal: if seeding fails for any reason, agent.ts has a lazy-seed fallback.
+  await seedDefaultCategoriesForFamily(data.id).catch((e) => {
+    console.error('[createFamily] seed failed for', data.id, e instanceof Error ? e.message : e);
+  });
+
   return data.id;
 }
 

@@ -39,6 +39,7 @@ import {
   topItemsByComment,
   resolveCategoryByName,
   findRecentDuplicate,
+  seedDefaultCategoriesForFamily,
   type ConfirmType,
   type PendingConfirm,
 } from '@/lib/db/queries';
@@ -499,40 +500,14 @@ const READ_TOOLS: Anthropic.Tool[] = [
   },
 ];
 
-/**
- * Quick response for first-run users who try to log expenses before creating
- * any categories. Echo back what they wrote so they know we saw it, then
- * guide to the setup step.
- */
-function firstRunWelcomeExpenseAttempt(expenses: { amount: number; description: string }[]): string {
-  let reply = '👋 Добро пожаловать! Прежде чем записывать траты, создай свои категории расходов.\n\n';
-  reply += 'Напиши, например:\n';
-  reply += '*"создай категории: Продукты 🛒, Транспорт 🚗, Кафе ☕, Жильё 🏠, Личное 🎯, Прочее 🎲"*\n\n';
-  reply += 'Бот предложит создать их все одной кнопкой ✅ Да.\n\n';
-  reply += 'После этого я смогу записать:\n';
-  for (const e of expenses.slice(0, 3)) {
-    reply += `- ${e.description} ${e.amount} ₸\n`;
-  }
-  return reply;
-}
-
-function buildSystemPrompt(firstRun = false): string {
+function buildSystemPrompt(): string {
   const { year, month } = currentMonthAlmaty();
   const today = todayAlmaty();
-
-  const firstRunBlock = firstRun ? `
-⚠️ FIRST RUN: у этой семьи НЕТ категорий. Что бы пользователь ни спрашивал —
-СНАЧАЛА предложи создать стартовый набор категорий. Используй
-propose_create_categories_bulk со списком из 6-8 типичных категорий
-(Продукты 🛒, Транспорт 🚗, Кафе ☕, Жильё 🏠, Здоровье 💊, Личное 🎯, Прочее 🎲),
-либо персонализированный под контекст пользователя. Пока категорий нет,
-ничего другого делать не нужно — только онбординг.
-` : '';
 
   return `Ты — семейный финансовый ассистент. Кратко, на русском.
 
 Сегодня: ${today}. Месяц: ${monthNameRu(month)} ${year}.
-${firstRunBlock}
+
 У тебя ЕСТЬ инструменты чтения и записи. НЕ отказывайся "я не могу изменить" — если
 пользователь просит что-то изменить, найди подходящий propose_* инструмент и вызови
 его. Система спросит у пользователя подтверждение.
@@ -1320,14 +1295,19 @@ export async function chat(
   // already removed). Keeping them there means this file never sees raw
   // slash-commands and can focus on natural-language / parsed intents.
 
-  // ── 0. First-run: family has no categories yet ──
-  // Families are created without default categories — user picks their own.
-  // Until at least one exists, expense parsing fails with "категория не найдена",
-  // so we intercept here and route EVERYTHING through Claude with category-
-  // creation as the primary action. Once ≥1 category exists this branch falls
-  // through and normal deterministic paths take over.
+  // ── 0. Lazy-seed safety net ──
+  // Families are now seeded with default categories at creation time
+  // (createFamily calls seedDefaultCategoriesForFamily). But if seeding ever
+  // fails — old families predating the auto-seed change, transient DB error,
+  // race condition — categorize() would fail with "категория не найдена".
+  // Re-seed on the spot so the user never hits that error. Idempotent.
   const familyCategoriesCheck = await getCategoriesForFamily(ctx.familyId).catch(() => []);
-  const isFirstRun = familyCategoriesCheck.length === 0;
+  if (familyCategoriesCheck.length === 0) {
+    console.warn(`[chat] family ${ctx.familyId} has 0 categories — auto-seeding`);
+    await seedDefaultCategoriesForFamily(ctx.familyId).catch((e) => {
+      console.error('[chat] auto-seed failed:', e instanceof Error ? e.message : e);
+    });
+  }
 
   // ── 1. Undo (deterministic) ──
   if (isUndoRequest(text)) {
@@ -1358,14 +1338,6 @@ export async function chat(
   // ── 4. Expenses (deterministic) ──
   const expenses = tryParseExpenses(text);
   if (expenses) {
-    // First-run guard: can't log an expense without any categories. Guide
-    // the user to set them up first instead of erroring on every line.
-    if (isFirstRun) {
-      const reply = firstRunWelcomeExpenseAttempt(expenses);
-      await saveUserMsg();
-      await saveAssistantMsg(reply);
-      return textOnly(reply);
-    }
     const reply = await handleExpenses(expenses, ctx);
     await saveUserMsg();
     await saveAssistantMsg(reply);
@@ -1423,7 +1395,7 @@ export async function chat(
     const response = await client.messages.create({
       model: MODEL,
       max_tokens: 1024,
-      system: buildSystemPrompt(isFirstRun),
+      system: buildSystemPrompt(),
       tools: [...READ_TOOLS, ...WRITE_TOOLS],
       messages,
     });
