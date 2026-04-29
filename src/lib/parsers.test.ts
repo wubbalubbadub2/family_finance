@@ -7,6 +7,7 @@ import {
   tryParseDebt,
   isUndoRequest,
   isMeaningfulInput,
+  looksLikeNonExpenseIntent,
 } from './parsers';
 
 // These tests cover the parser surface — the deterministic fast path before
@@ -272,6 +273,63 @@ describe('isMeaningfulInput — ambiguous-input short-circuit', () => {
     assert.equal(isMeaningfulInput('yes'), true);
     assert.equal(isMeaningfulInput('давай'), true);
     assert.equal(isMeaningfulInput('отмена'), true);
+  });
+});
+
+describe('looksLikeNonExpenseIntent — guard against expense parser swallowing NL commands', () => {
+  test('"поставь лимит на продукты 100000" — exact dev-test bug repro', () => {
+    // Without this guard, tryParseExpenses matched and logged a 100k expense
+    // in Продукты. User wanted propose_set_monthly_plan instead.
+    assert.equal(looksLikeNonExpenseIntent('поставь лимит на продукты 100000'), true);
+  });
+
+  test('limit/plan/budget command variants', () => {
+    assert.equal(looksLikeNonExpenseIntent('лимит на кафе 50000'), true);
+    assert.equal(looksLikeNonExpenseIntent('Установи лимит 30000 на транспорт'), true);
+    assert.equal(looksLikeNonExpenseIntent('задай план 80000 на жильё'), true);
+    assert.equal(looksLikeNonExpenseIntent('поставь бюджет 200000'), true);
+  });
+
+  test('category management commands', () => {
+    assert.equal(looksLikeNonExpenseIntent('создай категорию Хобби'), true);
+    assert.equal(looksLikeNonExpenseIntent('добавь категории Бензин, Кафе'), true);
+    assert.equal(looksLikeNonExpenseIntent('переименуй категорию Личное в Себе'), true);
+    assert.equal(looksLikeNonExpenseIntent('удали категорию Накопления'), true);
+    assert.equal(looksLikeNonExpenseIntent('объедини категории Кафе и Рестораны'), true);
+  });
+
+  test('reclassify intent', () => {
+    assert.equal(looksLikeNonExpenseIntent('поменяй категорию рыбо на кафе'), true);
+    assert.equal(looksLikeNonExpenseIntent('переклассифицируй последнюю в Кафе'), true);
+    assert.equal(looksLikeNonExpenseIntent('перемести рыбо в категорию Кафе'), true);
+  });
+
+  test('goal intent', () => {
+    assert.equal(looksLikeNonExpenseIntent('хочу накопить 500000'), true);
+    assert.equal(looksLikeNonExpenseIntent('создай цель отпуск 300000'), true);
+  });
+
+  test('question/list intent', () => {
+    assert.equal(looksLikeNonExpenseIntent('покажи последние 10'), true);
+    assert.equal(looksLikeNonExpenseIntent('дай категории'), true);
+    assert.equal(looksLikeNonExpenseIntent('сколько на кофе?'), true);
+    assert.equal(looksLikeNonExpenseIntent('какие у меня категории'), true);
+  });
+
+  test('does NOT match real expenses', () => {
+    assert.equal(looksLikeNonExpenseIntent('Кофе 500'), false);
+    assert.equal(looksLikeNonExpenseIntent('Супермаркет 1762'), false);
+    assert.equal(looksLikeNonExpenseIntent('Хлеб и сэндвич 935'), false);
+    assert.equal(looksLikeNonExpenseIntent('500 кофе'), false);
+    // "лимит" mid-sentence (not at start) — could be a real expense like
+    // "купил лимиты 5000". Allow.
+    assert.equal(looksLikeNonExpenseIntent('купил лимиты 5000'), false);
+  });
+
+  test('does NOT match income/debt phrases', () => {
+    assert.equal(looksLikeNonExpenseIntent('Зарплата 500000'), false);
+    assert.equal(looksLikeNonExpenseIntent('Получил премию 100000'), false);
+    assert.equal(looksLikeNonExpenseIntent('Взял в долг 100000 у Аидар'), false);
   });
 });
 

@@ -52,6 +52,7 @@ import {
   tryParseDebt,
   isUndoRequest,
   isMeaningfulInput,
+  looksLikeNonExpenseIntent,
 } from '@/lib/parsers';
 
 // Re-export for any historical callers that imported from this module.
@@ -500,9 +501,22 @@ const READ_TOOLS: Anthropic.Tool[] = [
   },
 ];
 
-function buildSystemPrompt(): string {
+function buildSystemPrompt(familyCategories: Category[] = []): string {
   const { year, month } = currentMonthAlmaty();
   const today = todayAlmaty();
+
+  // Inject the family's actual current categories so Sonnet answers
+  // "дай категории" / "какие у меня категории" with real data instead of
+  // guessing from a stale hardcoded list. Sorted by sort_order for stable
+  // output. Empty list (shouldn't happen post-Phase-1, but safety net) falls
+  // back to a generic note.
+  const categoriesBlock = familyCategories.length > 0
+    ? familyCategories
+        .slice()
+        .sort((a, b) => a.sort_order - b.sort_order)
+        .map((c) => `  ${c.emoji} ${c.name} (slug: ${c.slug})`)
+        .join('\n')
+    : '  (категории ещё не созданы — будут засеяны автоматически)';
 
   return `Ты — семейный финансовый ассистент. Кратко, на русском.
 
@@ -570,19 +584,13 @@ function buildSystemPrompt(): string {
   1. search_transactions_by_comment(keyword=X) — найти последнюю транзакцию с X
   2. propose_update_transaction_category(transaction_id=<id последней>, new_category_slug=<slug Y>)
 
-Категория-slug маппинги по умолчанию (для твоей семьи после миграции 007):
-  "жильё/квартира/коммуналка" = home
-  "продукты/еда" = food
-  "транспорт/такси/бензин" = transport
-  "кафе/ресторан/выход" = cafe
-  "ребёнок/балапанчик/дети" = baby
-  "здоровье/аптека/врач" = health
-  "кредит/долг" = credit
-  "личное/одежда/стрижка" = personal
-  "сбережения/savings/копилка" = savings
-  "разное/прочее" = misc
-У семьи также могут быть свои категории — используй search_transactions_by_comment
-или задай уточняющий вопрос если slug неясен.
+Категории ЭТОЙ семьи (используй ТОЛЬКО эти slug-и в propose_*):
+${categoriesBlock}
+
+Если пользователь просит "дай категории" / "какие у меня категории" / "покажи
+категории" — выведи список выше дословно (эмодзи + имя), без выдуманных slug-ов
+вроде "baby" или "credit", если их нет в списке. Если упоминается категория,
+которой нет — это новая, предложи propose_create_category.
 
 ПЕРИОДЫ:
 Когда пользователь упоминает период, конвертируй в YYYY-MM-DD:
@@ -1021,7 +1029,12 @@ async function executeConfirmedAction(
         }
       }
 
-      return `🏷 Перекатегоризовано → ${cat.emoji} *${cat.name}*. Запомнил.`;
+      // Show the updated month distribution so the user can immediately see
+      // how the reclassification shifted shares (Image #39 feedback: after
+      // moving "рыбо" Продукты→Кафе the user wanted to see the new split).
+      const { year: rcY, month: rcM } = currentMonthAlmaty();
+      const summary = await getMonthSummary(rcY, rcM, ctx.familyId);
+      return `🏷 Перекатегоризовано → ${cat.emoji} *${cat.name}*. Запомнил.\n\n${buildSummaryText(summary)}`;
     }
     case 'set_monthly_plan': {
       const slug = String(a.category_slug);
@@ -1301,12 +1314,15 @@ export async function chat(
   // fails — old families predating the auto-seed change, transient DB error,
   // race condition — categorize() would fail with "категория не найдена".
   // Re-seed on the spot so the user never hits that error. Idempotent.
-  const familyCategoriesCheck = await getCategoriesForFamily(ctx.familyId).catch(() => []);
+  let familyCategoriesCheck = await getCategoriesForFamily(ctx.familyId).catch(() => []);
   if (familyCategoriesCheck.length === 0) {
     console.warn(`[chat] family ${ctx.familyId} has 0 categories — auto-seeding`);
     await seedDefaultCategoriesForFamily(ctx.familyId).catch((e) => {
       console.error('[chat] auto-seed failed:', e instanceof Error ? e.message : e);
     });
+    // Refetch so the system prompt sees the freshly-seeded categories instead
+    // of falling back to "(категории ещё не созданы…)".
+    familyCategoriesCheck = await getCategoriesForFamily(ctx.familyId).catch(() => []);
   }
 
   // ── 1. Undo (deterministic) ──
@@ -1336,7 +1352,10 @@ export async function chat(
   }
 
   // ── 4. Expenses (deterministic) ──
-  const expenses = tryParseExpenses(text);
+  // Skip if the line looks like a NL command — "поставь лимит на продукты 100000"
+  // matches the expense regex and would otherwise be logged as a 100k expense.
+  // See looksLikeNonExpenseIntent in parsers.ts for the full list of guards.
+  const expenses = looksLikeNonExpenseIntent(text) ? null : tryParseExpenses(text);
   if (expenses) {
     const reply = await handleExpenses(expenses, ctx);
     await saveUserMsg();
@@ -1395,7 +1414,7 @@ export async function chat(
     const response = await client.messages.create({
       model: MODEL,
       max_tokens: 1024,
-      system: buildSystemPrompt(),
+      system: buildSystemPrompt(familyCategoriesCheck),
       tools: [...READ_TOOLS, ...WRITE_TOOLS],
       messages,
     });
