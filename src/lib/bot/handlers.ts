@@ -6,8 +6,44 @@ import {
   getUserByTelegramId,
   createFamily,
   createFamilyInvite,
+  getCategoriesForFamily,
 } from '@/lib/db/queries';
 import { captureError } from '@/lib/observability';
+import type { Category } from '@/types';
+
+/**
+ * Single source of truth for the welcome message. Used by both:
+ *   - handleInviteArrival (brand new user just consumed an invite)
+ *   - bare /start (existing user re-greeting)
+ *
+ * Shows the family's CURRENT categories (not hardcoded defaults) so an
+ * existing user who has customized sees their real setup, and a fresh
+ * user sees the auto-seeded universal defaults.
+ */
+function buildWelcomeText(name: string, categories: Category[]): string {
+  const catList = categories.length > 0
+    ? categories.map((c) => `${c.emoji} ${c.name}`).join(' · ')
+    : '(пока нет — создадутся автоматически на первой трате)';
+
+  return (
+    `👋 Привет, ${name}!\n\n` +
+    `Я веду семейный бюджет — пиши траты обычным текстом, я разберусь сам.\n\n` +
+    `📋 Сейчас у тебя такие категории:\n${catList}\n\n` +
+    `Хочешь свои? Напиши, например:\n` +
+    `«создай категории: Продукты, Бензин, Рестораны, Хобби»\n` +
+    `Можно добавлять, переименовывать, удалять в любой момент. ` +
+    `При удалении категории её траты переедут в Разное.\n\n` +
+    `Что попробовать:\n` +
+    `• кофе 500 — записать трату\n` +
+    `• зарплата 500 000 — записать доход\n` +
+    `• взял в долг 100 000 у Аидара — записать долг\n` +
+    `• поставь лимит 80 000 на Продукты — план на категорию\n` +
+    `• сколько на кофе? — поиск\n` +
+    `• итоги месяца — общая сводка\n` +
+    `• хочу накопить 1 000 000 к декабрю — поставить цель\n\n` +
+    `Просто начни писать.`
+  );
+}
 
 // NOTE: we removed ALLOWED_TELEGRAM_IDS. Allowlist is the `users` table now.
 // Anyone can DM the bot — if they're not in the table, they get a welcome
@@ -157,28 +193,12 @@ async function handleInviteArrival(ctx: Context, code: string): Promise<void> {
   }
 
   // Success — brand new user (or idempotent re-tap).
+  // Fetch the family's actual categories so the welcome reflects whatever was
+  // auto-seeded at family creation (or whatever the user has since customized).
+  const cats = await getCategoriesForFamily(result.familyId).catch(() => [] as Category[]);
   // No parse_mode: bot username + Russian text would trip the legacy Markdown
   // underscore-as-italic bug. Plain text is the most robust render path.
-  await ctx.reply(
-    `👋 Привет, ${name}!\n\n` +
-    `Я веду семейный бюджет — пиши траты обычным текстом, я разберусь сам.\n\n` +
-    `🎨 Хочешь свои категории? Напиши, например:\n` +
-    `«создай категории: Продукты, Бензин, Рестораны, Аренда, Дети, Хобби»\n\n` +
-    `Если не настроишь свои — буду использовать стандартные:\n` +
-    `🛒 Продукты · 🏠 Жильё · 🚗 Транспорт · ☕ Кафе · 💊 Здоровье · 🎯 Личное · 💰 Накопления · 🎲 Разное\n\n` +
-    `Категории можно переименовать или удалить когда угодно:\n` +
-    `• «переименуй Кафе в Рестораны»\n` +
-    `• «удали категорию Накопления» (траты переедут в Разное)\n\n` +
-    `Что ещё можно делать:\n` +
-    `• кофе 500 — записать трату\n` +
-    `• зарплата 500 000 — записать доход\n` +
-    `• взял в долг 100 000 у Аидара — записать долг\n` +
-    `• поставь лимит 80 000 на Продукты — план на категорию\n` +
-    `• сколько на кофе? — поиск\n` +
-    `• итоги месяца — общая сводка\n` +
-    `• хочу накопить 1 000 000 к декабрю — поставить цель\n\n` +
-    `Просто начни писать.`,
-  );
+  await ctx.reply(buildWelcomeText(name, cats));
 }
 
 export function createBot(): Bot {
@@ -208,22 +228,10 @@ export function createBot(): Bot {
       if (/^\/start(@\w+)?$/i.test(rawText)) {
         const existing = await getUserByTelegramId(telegramId);
         if (existing) {
-          // Same shape as the invite-arrival welcome (handleInviteArrival) so
-          // re-greeting an existing user feels consistent with first-time onboarding.
-          // No parse_mode (Markdown eats Cyrillic underscores).
-          await ctx.reply(
-            `👋 Привет, ${existing.name}!\n\n` +
-            `Я веду семейный бюджет — пиши траты обычным текстом, я разберусь сам.\n\n` +
-            `Что попробовать:\n` +
-            `• кофе 500 — записать трату\n` +
-            `• зарплата 500 000 — записать доход\n` +
-            `• взял в долг 100 000 у Аидара — записать долг\n` +
-            `• поставь лимит 80 000 на Продукты — план на категорию\n` +
-            `• сколько на кофе? — поиск\n` +
-            `• итоги месяца — общая сводка\n` +
-            `• хочу накопить 1 000 000 к декабрю — поставить цель\n\n` +
-            `Категории можно менять когда угодно: «переименуй Кафе в Рестораны», «удали категорию Накопления».`,
-          );
+          // Same welcome shape as handleInviteArrival, with the user's CURRENT
+          // categories (which may differ from defaults if they've customized).
+          const cats = await getCategoriesForFamily(existing.family_id).catch(() => [] as Category[]);
+          await ctx.reply(buildWelcomeText(existing.name, cats));
         } else {
           await ctx.reply(
             '👋 Этот бот работает по приглашению.\n' +
