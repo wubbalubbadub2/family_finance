@@ -1262,15 +1262,18 @@ export async function chat(
   userMessage: string,
   telegramId: number,
   userName: string,
-  chatId: number
+  chatId: number,
+  familyId: string,
 ): Promise<BotResponse> {
-  // Resolve family context ONCE per request — never fetched inside handlers.
-  // If this returns null, the user is not whitelisted anywhere and cannot act.
+  // Phase 2: family is resolved BEFORE this function via resolveFamilyForChat()
+  // in the bot handler. We still need the user's row for `userId` (audit trail
+  // — who logged the expense) but we do NOT use the user's `family_id` for
+  // scope. The chat's family is authoritative.
   const user = await getUserByTelegramId(telegramId);
   if (!user) return textOnly('⛔ Пользователь не найден в системе.');
 
   const ctx: FamilyCtx = {
-    familyId: user.family_id,
+    familyId,
     userId: user.id,
     userName,
     chatId,
@@ -1507,12 +1510,15 @@ export async function handleCallback(
   telegramId: number,
   userName: string,
   chatId: number,
+  familyId: string,
 ): Promise<BotResponse> {
+  // Phase 2: same shift as chat() — caller resolves family from the chat,
+  // we only look up the user for the audit trail.
   const user = await getUserByTelegramId(telegramId);
   if (!user) return textOnly('⛔ Пользователь не найден.');
 
   const ctx: FamilyCtx = {
-    familyId: user.family_id,
+    familyId,
     userId: user.id,
     userName,
     chatId,

@@ -48,6 +48,89 @@ export async function getUsersInFamily(familyId: string): Promise<UserWithFamily
   return data ?? [];
 }
 
+// ── Family chats (Phase 2: chat-based family scope) ──
+
+export interface FamilyChatLink {
+  chat_id: number;
+  family_id: string;
+  chat_type: string;
+  linked_at: string;
+  linked_by_user_id: string | null;
+}
+
+/**
+ * Resolve the family scope for an incoming Telegram chat.
+ *
+ * Phase 2 swap: instead of `getUserByTelegramId().family_id` we ask "which
+ * family does THIS CHAT belong to?". A user can DM the bot AND be in a
+ * family group; both must write to the same family ledger, so the chat is
+ * the canonical scope, not the user.
+ *
+ * Returns `{ familyId, firstTimeInChat }` if the chat resolves OR can be
+ * auto-linked via the message sender. Returns `{ error }` otherwise.
+ *
+ * The auto-link path is critical for two flows:
+ *   1. New user registers via /start invite_X — handleInviteArrival creates
+ *      the user row, then their first non-/start message hits this function
+ *      which auto-links the DM (chat_id = telegram_id) to their family.
+ *      (The 012 migration backfills DM links for users that existed before
+ *      Phase 2; new users rely on this auto-link path.)
+ *   2. Existing registered user adds bot to a Telegram group — the first
+ *      message in the group from any registered family member auto-links
+ *      the group to that user's family.
+ */
+export async function resolveFamilyForChat(args: {
+  chatId: number;
+  telegramId: number;
+  chatType: 'private' | 'group' | 'supergroup' | 'channel';
+}): Promise<{ familyId: string; firstTimeInChat: boolean } | { error: string }> {
+  // 1. Existing chat link?
+  const { data: existing } = await supabase
+    .from('family_chats')
+    .select('*')
+    .eq('chat_id', args.chatId)
+    .maybeSingle();
+  if (existing) {
+    return { familyId: existing.family_id, firstTimeInChat: false };
+  }
+
+  // 2. First time bot sees this chat. Try to auto-link via the message sender.
+  //    If the sender is a registered family member, this chat becomes scoped
+  //    to their family. If not, refuse — only paying customers can drive scope.
+  const sender = await getUserByTelegramId(args.telegramId);
+  if (!sender) {
+    return { error: 'unregistered_sender' };
+  }
+
+  // 3. Insert the link. We accept any chat_type the caller passes. The
+  //    'channel' case is included in the type but in practice the bot is
+  //    only added to private/group/supergroup; if Telegram ever delivers a
+  //    channel update, we link it the same way and let the caller decide
+  //    what to do with the firstTimeInChat flag.
+  const { error: linkErr } = await supabase
+    .from('family_chats')
+    .insert({
+      chat_id: args.chatId,
+      family_id: sender.family_id,
+      chat_type: args.chatType,
+      linked_by_user_id: sender.id,
+    });
+  // Race-safe: if a concurrent insert won, treat as success and re-resolve.
+  if (linkErr) {
+    if (/duplicate|conflict/i.test(linkErr.message)) {
+      const { data: raced } = await supabase
+        .from('family_chats')
+        .select('*')
+        .eq('chat_id', args.chatId)
+        .maybeSingle();
+      if (raced) return { familyId: raced.family_id, firstTimeInChat: false };
+    }
+    return { error: `Не удалось связать чат: ${linkErr.message}` };
+  }
+
+  return { familyId: sender.family_id, firstTimeInChat: true };
+}
+
 // ── Families ──
 
 export interface Family {
