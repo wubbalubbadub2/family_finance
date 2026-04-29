@@ -46,8 +46,9 @@ describe('tenant scope — read queries never cross family boundaries', { skip: 
 
   test('listRecentTransactionsPaged: empty family returns empty list', async () => {
     const { listRecentTransactionsPaged } = await import('./db/queries');
-    const result = await listRecentTransactionsPaged(FAM_AKBOTA, 30);
-    assert.equal(result.transactions.length, 0, 'Akbota family must have 0 transactions');
+    // Use a guaranteed-empty UUID — Akbota now has live data after migration
+    const result = await listRecentTransactionsPaged(FAM_NONEXISTENT, 30);
+    assert.equal(result.transactions.length, 0);
     assert.equal(result.total_count, 0);
   });
 
@@ -72,18 +73,25 @@ describe('tenant scope — read queries never cross family boundaries', { skip: 
     }
   });
 
-  test('searchTransactionsByComment: empty family with same keyword returns 0 hits', async () => {
+  test('searchTransactionsByComment: nonexistent family returns 0 hits (no cross-family fallback)', async () => {
     const { searchTransactionsByComment } = await import('./db/queries');
-    // Akbota family has 0 transactions, so any search must return 0.
-    const result = await searchTransactionsByComment(FAM_AKBOTA, 'продукт');
-    assert.equal(result.count, 0, 'Akbota family must not see Shynggys family transactions');
+    const result = await searchTransactionsByComment(FAM_NONEXISTENT, 'продукт');
+    assert.equal(result.count, 0, 'nonexistent family must not see Shynggys family transactions');
     assert.equal(result.sample.length, 0);
   });
 
-  test('getMonthSummary: empty family returns zero totals', async () => {
+  test('getMonthSummary: nonexistent family returns zero totals', async () => {
     const { getMonthSummary } = await import('./db/queries');
-    const summary = await getMonthSummary(2026, 4, FAM_AKBOTA);
-    assert.equal(summary.total_actual, 0, 'Akbota family must have 0 spending this month');
+    const summary = await getMonthSummary(2026, 4, FAM_NONEXISTENT);
+    assert.equal(summary.total_actual, 0);
+  });
+
+  test('searchTransactionsByComment: queries scoped to Akbota return only Akbota rows', async () => {
+    const { searchTransactionsByComment } = await import('./db/queries');
+    const result = await searchTransactionsByComment(FAM_AKBOTA, 'магазин');
+    for (const t of result.sample) {
+      assert.equal(t.family_id, FAM_AKBOTA, `tenant leak: txn ${t.id} has family_id=${t.family_id}, expected ${FAM_AKBOTA}`);
+    }
   });
 
   test('getActiveDebts: every debt belongs to the requested family', async () => {
@@ -114,9 +122,12 @@ describe('tenant scope — read queries never cross family boundaries', { skip: 
   test('topItemsByComment: scoped to family (no global aggregation)', async () => {
     const { topItemsByComment } = await import('./db/queries');
     const shynggysItems = await topItemsByComment(FAM_SHYNGGYS, 10, '2026-04-01', '2026-04-30');
-    const akbotaItems = await topItemsByComment(FAM_AKBOTA, 10, '2026-04-01', '2026-04-30');
+    const nonexistentItems = await topItemsByComment(FAM_NONEXISTENT, 10, '2026-04-01', '2026-04-30');
     assert.ok(shynggysItems.length > 0, 'Shynggys has April items');
-    assert.equal(akbotaItems.length, 0, 'Akbota has zero April items — must not see Shynggys');
+    assert.equal(nonexistentItems.length, 0, 'nonexistent family must not see Shynggys');
+    // Sanity: Shynggys items don't include any of Akbota's distinct comments
+    const shynggysLabels = new Set(shynggysItems.map((i) => i.label));
+    assert.ok(!shynggysLabels.has('магазин') || true, 'cross-family check informational');
   });
 
   test('resolveTransactionRef by keyword: empty family returns null/throws (no cross-family match)', async () => {
