@@ -1325,6 +1325,22 @@ export async function chat(
     familyCategoriesCheck = await getCategoriesForFamily(ctx.familyId).catch(() => []);
   }
 
+  // ── 0.5. Conversation context ──
+  // Fetched once here (not just inside the LLM branch) so we can detect
+  // contextual replies before the deterministic parsers. Real prod incident
+  // (2026-04-29 dev): bot asked "до какой даты хочешь накопить?" for goal
+  // creation; user replied "до конца августа 2026"; the expense parser saw
+  // "<text> <amount>" and logged 2 026 ₸ as a Разное expense. The reply was
+  // contextual to the bot's question and should have gone to Sonnet.
+  let history: { role: string; content: string }[] = [];
+  try { history = await getRecentMessages(chatId, ctx.familyId, 10); } catch { /* */ }
+  const lastAssistant = [...history].reverse().find((m) => m.role === 'assistant');
+  // Treat a trailing "?" as the bot asking a freeform clarifier. Propose-
+  // confirm messages also end in "?" but show inline keyboards — if the user
+  // types text instead of tapping, routing to Sonnet (with full history) is
+  // still the right call: Sonnet can interpret "ну ладно тогда лимит 50000".
+  const awaitingContextualReply = !!lastAssistant?.content.trimEnd().endsWith('?');
+
   // ── 1. Undo (deterministic) ──
   if (isUndoRequest(text)) {
     const reply = await handleUndo(ctx);
@@ -1352,10 +1368,15 @@ export async function chat(
   }
 
   // ── 4. Expenses (deterministic) ──
-  // Skip if the line looks like a NL command — "поставь лимит на продукты 100000"
-  // matches the expense regex and would otherwise be logged as a 100k expense.
-  // See looksLikeNonExpenseIntent in parsers.ts for the full list of guards.
-  const expenses = looksLikeNonExpenseIntent(text) ? null : tryParseExpenses(text);
+  // Skip if:
+  //   (a) the line looks like a NL command — "поставь лимит на продукты 100000"
+  //       matches the expense regex and would otherwise be logged as a 100k
+  //       expense (see looksLikeNonExpenseIntent in parsers.ts), OR
+  //   (b) the bot just asked a question — the user reply is contextual and
+  //       belongs to Sonnet, not the expense parser. "до конца августа 2026"
+  //       in answer to "до какой даты?" was being logged as a 2 026 ₸ expense.
+  const skipExpenseParser = looksLikeNonExpenseIntent(text) || awaitingContextualReply;
+  const expenses = skipExpenseParser ? null : tryParseExpenses(text);
   if (expenses) {
     const reply = await handleExpenses(expenses, ctx);
     await saveUserMsg();
@@ -1372,9 +1393,7 @@ export async function chat(
   // whole evening trying to beat Sonnet with regex parsing; we won't do
   // that again. The search tool itself handles Russian morphology via
   // server-side stemming (see searchTransactionsByComment in queries.ts).
-  let history: { role: string; content: string }[] = [];
-  try { history = await getRecentMessages(chatId, ctx.familyId, 10); } catch { /* */ }
-
+  // history was fetched at the top of chat() (see "Conversation context").
   const messages: Anthropic.MessageParam[] = [];
   for (const msg of history) {
     if (messages.length === 0 && msg.role === 'assistant') continue;
