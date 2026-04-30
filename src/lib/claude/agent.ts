@@ -29,6 +29,8 @@ import {
   addGoalContribution,
   createCategory,
   createCategoriesBulk,
+  replaceCategoriesForFreshFamily,
+  countActiveTransactions,
   renameCategory,
   deleteCategory,
   mergeCategories,
@@ -1090,8 +1092,20 @@ async function buildProposalMessage(
       }
       // Mutate input so execute path uses cleaned data
       (input as Record<string, unknown>).categories = clean;
+
+      // Fresh-setup detection: a family with 0 transactions that asks to
+      // "create categories" almost always means "set my categories to these"
+      // (matches the welcome example "Хочешь свои? Напиши: создай категории
+      // X, Y, Z"). Append behavior is the bug — user ends up with 8 defaults
+      // + 3 customs and a confused mental model. We replace the auto-seeded
+      // defaults instead and stash a flag for the execute path.
+      const txnCount = await countActiveTransactions(ctx.familyId).catch(() => -1);
+      const isFresh = txnCount === 0;
+      (input as Record<string, unknown>)._replace_defaults = isFresh;
+
       const list = clean.map(c => `${c.emoji} ${c.name}`).join(', ');
-      return `🆕 Создать ${clean.length} ${clean.length === 1 ? 'категорию' : 'категорий'}: ${list}?`;
+      const verb = isFresh ? 'Заменить стандартные категории на' : `Создать ${clean.length} ${clean.length === 1 ? 'категорию' : 'категорий'}:`;
+      return `🆕 ${verb} ${list}?`;
     }
     case 'rename_category': {
       const slug = String(input.slug ?? '');
@@ -1215,11 +1229,14 @@ async function executeConfirmedAction(
     }
     case 'create_categories_bulk': {
       const cats = a.categories as Array<{ name: string; emoji: string }>;
-      const { created, skipped } = await createCategoriesBulk({
-        family_id: ctx.familyId,
-        categories: cats,
-      });
-      let reply = `🆕 Создано ${created.length} ${created.length === 1 ? 'категория' : 'категорий'}:\n`;
+      // Re-check fresh-setup at execute time too — defends against the case
+      // where the user logged a transaction between propose and confirm.
+      const wantsReplace = a._replace_defaults === true && (await countActiveTransactions(ctx.familyId).catch(() => -1)) === 0;
+      const { created, skipped } = wantsReplace
+        ? await replaceCategoriesForFreshFamily(ctx.familyId, cats)
+        : await createCategoriesBulk({ family_id: ctx.familyId, categories: cats });
+      const verb = wantsReplace ? 'Заменено стандартных на' : 'Создано';
+      let reply = `🆕 ${verb} ${created.length} ${created.length === 1 ? 'категория' : 'категорий'}:\n`;
       for (const c of created) reply += `- ${c.emoji} ${c.name}\n`;
       if (skipped.length > 0) {
         reply += `\n⚠️ Пропущено ${skipped.length}:\n`;

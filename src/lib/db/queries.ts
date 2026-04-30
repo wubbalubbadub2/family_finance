@@ -393,6 +393,62 @@ export async function seedDefaultCategoriesForFamily(familyId: string): Promise<
  *   "Чипсы/снеки" → "чипсы_снеки"
  *   "Mom's gift"  → "mom_s_gift"
  */
+/**
+ * Count of (non-soft-deleted) transactions in a family. Used to detect
+ * "fresh setup" state — family was just created, hasn't logged anything yet.
+ * In that state, "create categories X, Y, Z" is interpreted as REPLACE the
+ * auto-seeded defaults rather than APPEND, matching the welcome message's
+ * implication.
+ */
+export async function countActiveTransactions(familyId: string): Promise<number> {
+  const { count } = await supabase
+    .from('transactions')
+    .select('id', { count: 'exact', head: true })
+    .eq('family_id', familyId)
+    .is('deleted_at', null);
+  return count ?? 0;
+}
+
+/**
+ * Replace the family's current categories with a brand-new set. Only safe
+ * when the family has zero transactions (fresh setup) — otherwise we'd
+ * orphan transactions or have to invent reassignment targets.
+ *
+ * Soft-deletes all currently-active categories, removes any monthly_plans
+ * pointing at them, then creates the new ones via createCategoriesBulk.
+ */
+export async function replaceCategoriesForFreshFamily(
+  familyId: string,
+  newCategories: { name: string; emoji: string }[],
+): Promise<{ created: Category[]; skipped: { slug: string; reason: string }[] }> {
+  const txnCount = await countActiveTransactions(familyId);
+  if (txnCount > 0) {
+    throw new Error(
+      'Семья уже логировала траты — заменить стандартные нельзя. Создаются как дополнительные.',
+    );
+  }
+
+  // Drop monthly_plans (cascade-safe even if 0 rows)
+  const existing = await getAllCategoriesForFamily(familyId);
+  const existingIds = existing.map((c) => c.id);
+  if (existingIds.length > 0) {
+    await supabase
+      .from('monthly_plans')
+      .delete()
+      .eq('family_id', familyId)
+      .in('category_id', existingIds);
+
+    // Soft-delete all categories — we keep the rows for audit, just flip is_active
+    await supabase
+      .from('categories')
+      .update({ is_active: false })
+      .eq('family_id', familyId)
+      .eq('is_active', true);
+  }
+
+  return await createCategoriesBulk({ family_id: familyId, categories: newCategories });
+}
+
 function slugifyForCategory(name: string): string {
   return name
     .trim()
