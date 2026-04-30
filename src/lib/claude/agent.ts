@@ -52,10 +52,12 @@ import {
   tryParseDebt,
   isUndoRequest,
   isMeaningfulInput,
-  looksLikeNonExpenseIntent,
 } from '@/lib/parsers';
 
 // Re-export for any historical callers that imported from this module.
+// The deterministic parsers are no longer used by chat() — Sonnet handles
+// all intent recognition via log_expense/log_income/log_debt tools — but
+// the pure functions remain available for tests and any out-of-bot caller.
 export { stripCurrencyMarkers, tryParseExpenses, tryParseIncome, tryParseDebt, isUndoRequest };
 
 const client = new Anthropic();
@@ -523,24 +525,22 @@ function buildSystemPrompt(familyCategories: Category[] = []): string {
 Сегодня: ${today}. Месяц: ${monthNameRu(month)} ${year}.
 
 У тебя ЕСТЬ инструменты чтения и записи. НЕ отказывайся "я не могу изменить" — если
-пользователь просит что-то изменить, найди подходящий propose_* инструмент и вызови
-его. Система спросит у пользователя подтверждение.
+пользователь просит что-то изменить, найди подходящий инструмент и вызови его.
 
-Новые траты/доходы/долги уже записываются системой автоматически из сумм+описаний
-("кофе 1200"). Если пользователь просто пишет сумму и описание — не вмешивайся. Но
-если он хочет ИЗМЕНИТЬ уже записанное (поменять категорию, удалить) — это ТВОЯ работа.
+🚨 СЛОТ-СТИТЧИНГ (используй ИСТОРИЮ ПЕРЕПИСКИ):
+Если пользователь в недавнем сообщении уже указал параметры (название категории,
+новое имя, сумму, дату, дедлайн, slug), а в текущем сообщении уточняет лишь часть —
+БЕРИ остальные параметры из истории. НЕ переспрашивай то, что уже было сказано.
 
-🚨 КРИТИЧЕСКОЕ ПРАВИЛО (не нарушать ни при каких условиях):
-Если пользовательское сообщение ВЫГЛЯДИТ как трата (что-то + число), но ты
-видишь его — значит детерминированный парсер пропустил его (странный формат,
-суффикс "тг"/"₸"/"тенге", опечатка). НИКОГДА не отвечай "Записала", "Записано",
-"система зафиксирует", "Зафиксировал", или любой формулировкой, подразумевающей
-что трата сохранена — потому что у тебя НЕТ инструмента создания транзакций,
-и любое такое подтверждение будет ЛОЖЬЮ. Это сломает доверие пользователя к боту.
+Пример (реальный баг 2026-04-30):
+  user: "Поменяй категорию накопления на savings"  ← здесь указано: что (накопления), новое имя (savings)
+  bot:  "Это переименование или перемещение транзакции?"
+  user: "Переименовать"  ← подтвердил тип действия
+  WRONG: bot снова спрашивает "что переименовать? как назвать?" (всё уже было сказано!)
+  RIGHT: bot вызывает propose_rename_category(slug='savings', new_name='Savings')
 
-Вместо этого скажи: "🤔 Не понял формат — напиши проще: «описание сумма» (без 'тг'/'₸').
-Например: «Супермаркет 1762» или «1762 супермаркет»." Дай конкретный пример из
-сообщения пользователя.
+Тот же принцип для целей, лимитов, удалений: собирай аргументы из ВСЕЙ истории
+переписки в этом чате, не только из последнего сообщения.
 
 ЧТЕНИЕ:
 - search_transactions_by_comment(keyword, period?) — поиск по ключевому слову.
@@ -610,6 +610,23 @@ ${categoriesBlock}
 - без упоминания периода → не передавай, ищи за всё время
 
 КОГДА ПИСАТЬ:
+
+ПРЯМАЯ ЗАПИСЬ (выполняется сразу, БЕЗ кнопки подтверждения):
+- "кофе 500", "Супермаркет 1762тг", "хлеб и сэндвич 935", "5000 такси", несколько
+  трат списком → log_expense (передавай items: [{amount, description}, ...])
+- "зарплата 500000", "получил премию 100000", "перевод 30000 от мамы" → log_income
+- "взял в долг 100000 у Аидар", "занял 50000 Жанар" → log_debt
+
+ВАЖНО про log_expense:
+- Если в сообщении явно сумма + что куплено в любом порядке → ВСЕГДА log_expense.
+- Категорию НЕ выбирай сам — система сама подберёт через learned overrides + LLM.
+- Описание = оригинальный текст БЕЗ суммы и валюты ("кофе", "Супермаркет",
+  "хлеб и сэндвич"). Не выдумывай.
+- "купил кофе за 500" / "потратил 500 на кофе" — тоже log_expense.
+- НО если пользователь спрашивает / уточняет / отвечает на вопрос — НЕ log_expense,
+  смотри историю переписки.
+
+ЧЕРЕЗ ПОДТВЕРЖДЕНИЕ (propose_*, бот покажет кнопку ✅ Да / ❌ Отмена):
 - "хочу накопить N к [даты]" или "создай цель" → propose_create_goal
 - "отложил/кинул/добавил N" (без описания расхода) → propose_contribute_to_goal
 - "закрой цель" / "забудь цель" → propose_archive_goal
@@ -622,7 +639,8 @@ ${categoriesBlock}
 - "удали категорию" → propose_delete_category
 - "объедини X в Y" → propose_merge_categories
 
-КРИТИЧЕСКИ ВАЖНО: результаты read-tools — ЭТО УЖЕ ГОТОВЫЙ ТЕКСТ для пользователя.
+КРИТИЧЕСКИ ВАЖНО: результаты read-tools И direct-write tools — ЭТО УЖЕ ГОТОВЫЙ ТЕКСТ
+для пользователя.
 — Выводи ДОСЛОВНО, символ в символ, без изменений.
 — НЕ создавай markdown-таблицы (| Дата | Сумма |). Telegram их не рендерит нормально,
   текст становится мусором из столбиков палок.
@@ -631,7 +649,15 @@ ${categoriesBlock}
 — НЕ убирай значки 📎 и ⚠️ из ответов search — они помечают многопозиционные покупки.
 — Если тебе очень хочется что-то добавить от себя — добавь коротко В КОНЦЕ, после
   полного результата tool. Сам результат НЕ трогай.
-Результаты write-tools обрабатываются системой (показывается кнопка подтверждения пользователю) — тебе после пропозала ничего говорить не нужно.`;
+
+🚨 ПРАВИЛО ОТКАЗА ОТ ВЫДУМЫВАНИЯ ПОДТВЕРЖДЕНИЯ:
+Никогда не пиши "записала", "записано", "сохранил" своими словами. Только инструменты
+log_expense/log_income/log_debt действительно записывают, и они САМИ возвращают текст
+"✅ ..." с реальными данными из БД. Если ты не вызвал инструмент — значит запись не
+произошла, и любое подтверждение будет ложью.
+
+Результаты propose_* tools обрабатываются системой (показывается кнопка подтверждения
+пользователю) — тебе после пропозала ничего говорить не нужно.`;
 }
 
 interface ToolResult {
@@ -821,6 +847,131 @@ const WRITE_TOOLS: Anthropic.Tool[] = [
 ];
 
 const WRITE_TOOL_NAMES = new Set(WRITE_TOOLS.map(t => t.name));
+
+// ═══════════════════════════════════════════════════════════════
+// Direct write tools — Sonnet executes immediately, NO confirm step.
+// Used for the high-volume routine path (log expense/income/debt).
+// Reply is formatted from the DB-row result (reply-from-result), so
+// even if Sonnet calls with wrong args the user sees what was actually
+// recorded and can `undo`. Hallucinated success is impossible because
+// only successful inserts produce the "✅ ..." text.
+// ═══════════════════════════════════════════════════════════════
+
+const DIRECT_WRITE_TOOLS: Anthropic.Tool[] = [
+  {
+    name: 'log_expense',
+    description:
+      'Record one or more expenses immediately. Call this for ANY message that names a thing + amount: ' +
+      '"кофе 500", "Супермаркет 1762тг", "хлеб и сэндвич 935", "5000 такси", multi-line lists. ' +
+      'You categorize via family categories (server uses learned overrides + LLM categorizer). ' +
+      'NO confirmation step — the row is written immediately and the reply shown to the user is built ' +
+      'from the actual DB row, not from your arguments. If the user wants to undo, they say "удали последнюю".',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        items: {
+          type: 'array',
+          description: 'One or more expenses. For "кофе 500\\nтакси 2500" pass two items.',
+          items: {
+            type: 'object',
+            properties: {
+              amount: { type: 'number', description: 'Сумма в тенге, целое > 0, ≤ 10 000 000' },
+              description: { type: 'string', description: 'Что куплено — оригинальный текст пользователя без суммы и валюты' },
+            },
+            required: ['amount', 'description'],
+          },
+        },
+      },
+      required: ['items'],
+    },
+  },
+  {
+    name: 'log_income',
+    description:
+      'Record an income entry immediately. Call for "зарплата 500000", "получил премию 100000", ' +
+      '"перевод 50000 от мамы", "вернули долг 30000". NO confirmation — written immediately, ' +
+      'reply built from the actual DB row.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        amount: { type: 'number', description: 'Сумма в тенге, целое > 0' },
+        comment: { type: 'string', description: 'Источник дохода — короткая фраза, например "Зарплата" или "Премия"' },
+      },
+      required: ['amount', 'comment'],
+    },
+  },
+  {
+    name: 'log_debt',
+    description:
+      'Record a debt the user took on. Call for "взял в долг 100000 у Аидар", "занял 50000 Жанар", ' +
+      '"одолжил 30000 у мамы". NO confirmation — written immediately, reply from DB row.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        amount: { type: 'number', description: 'Сумма долга в тенге, > 0' },
+        name: { type: 'string', description: 'У кого занял — имя человека. Если не указано, передай "без имени".' },
+      },
+      required: ['amount', 'name'],
+    },
+  },
+];
+
+const DIRECT_WRITE_TOOL_NAMES = new Set(DIRECT_WRITE_TOOLS.map(t => t.name));
+
+// ═══════════════════════════════════════════════════════════════
+// Direct-write executor — runs the action immediately, returns the
+// formatted reply (NOT the LLM-args). Reply-from-result discipline:
+// the formatter takes the DB row, so a hallucinated "Записала" is
+// structurally impossible — we only render text when an insert actually
+// returned a row.
+// ═══════════════════════════════════════════════════════════════
+async function executeDirectWriteTool(
+  toolName: string,
+  input: Record<string, unknown>,
+  ctx: FamilyCtx,
+): Promise<string> {
+  switch (toolName) {
+    case 'log_expense': {
+      const items = input.items as Array<{ amount: number; description: string }> | undefined;
+      if (!Array.isArray(items) || items.length === 0) {
+        throw new Error('items пустой — передай хотя бы одну трату');
+      }
+      const cleaned: { amount: number; description: string }[] = [];
+      for (const it of items) {
+        const amount = Number(it.amount);
+        const description = String(it.description ?? '').trim();
+        if (!Number.isFinite(amount) || amount <= 0 || amount > 10_000_000) {
+          throw new Error(`Сумма должна быть > 0 и ≤ 10 000 000 (получено ${it.amount})`);
+        }
+        if (!description) throw new Error('У траты нет описания');
+        cleaned.push({ amount, description });
+      }
+      // handleExpenses inserts each row + builds the month-summary reply.
+      // Its output is built from getMonthSummary post-insert + per-row category
+      // resolution → reply-from-result is preserved.
+      return await handleExpenses(cleaned, ctx);
+    }
+    case 'log_income': {
+      const amount = Number(input.amount);
+      const comment = String(input.comment ?? '').trim();
+      if (!Number.isFinite(amount) || amount <= 0) {
+        throw new Error('Сумма дохода должна быть > 0');
+      }
+      if (!comment) throw new Error('Укажи источник дохода (например, "Зарплата")');
+      return await handleIncome({ amount, comment }, ctx);
+    }
+    case 'log_debt': {
+      const amount = Number(input.amount);
+      const name = String(input.name ?? '').trim() || 'без имени';
+      if (!Number.isFinite(amount) || amount <= 0) {
+        throw new Error('Сумма долга должна быть > 0');
+      }
+      return await handleDebt({ amount, name }, ctx);
+    }
+    default:
+      throw new Error(`Неизвестный direct-write tool: ${toolName}`);
+  }
+}
 
 /**
  * Validate + serialize a write-tool call into a pending_confirm row,
@@ -1328,23 +1479,10 @@ export async function chat(
     familyCategoriesCheck = await getCategoriesForFamily(ctx.familyId).catch(() => []);
   }
 
-  // ── 0.5. Conversation context ──
-  // Fetched once here (not just inside the LLM branch) so we can detect
-  // contextual replies before the deterministic parsers. Real prod incident
-  // (2026-04-29 dev): bot asked "до какой даты хочешь накопить?" for goal
-  // creation; user replied "до конца августа 2026"; the expense parser saw
-  // "<text> <amount>" and logged 2 026 ₸ as a Разное expense. The reply was
-  // contextual to the bot's question and should have gone to Sonnet.
-  let history: { role: string; content: string }[] = [];
-  try { history = await getRecentMessages(chatId, ctx.familyId, 10); } catch { /* */ }
-  const lastAssistant = [...history].reverse().find((m) => m.role === 'assistant');
-  // Treat a trailing "?" as the bot asking a freeform clarifier. Propose-
-  // confirm messages also end in "?" but show inline keyboards — if the user
-  // types text instead of tapping, routing to Sonnet (with full history) is
-  // still the right call: Sonnet can interpret "ну ладно тогда лимит 50000".
-  const awaitingContextualReply = !!lastAssistant?.content.trimEnd().endsWith('?');
-
-  // ── 1. Undo (deterministic) ──
+  // ── 1. Undo fast path (deterministic, single keyword) ──
+  // Kept because it's a single-shot, zero-risk action that benefits from
+  // 50ms response vs 1-2s LLM round trip. Every other intent now goes
+  // through Sonnet via the direct-write tools.
   if (isUndoRequest(text)) {
     const reply = await handleUndo(ctx);
     await saveUserMsg();
@@ -1352,51 +1490,20 @@ export async function chat(
     return textOnly(reply);
   }
 
-  // ── 2. Debt (deterministic) ──
-  const debt = tryParseDebt(text);
-  if (debt) {
-    const reply = await handleDebt(debt, ctx);
-    await saveUserMsg();
-    await saveAssistantMsg(reply);
-    return textOnly(reply);
-  }
-
-  // ── 3. Income (deterministic) ──
-  const income = tryParseIncome(text);
-  if (income) {
-    const reply = await handleIncome(income, ctx);
-    await saveUserMsg();
-    await saveAssistantMsg(reply);
-    return textOnly(reply);
-  }
-
-  // ── 4. Expenses (deterministic) ──
-  // Skip if:
-  //   (a) the line looks like a NL command — "поставь лимит на продукты 100000"
-  //       matches the expense regex and would otherwise be logged as a 100k
-  //       expense (see looksLikeNonExpenseIntent in parsers.ts), OR
-  //   (b) the bot just asked a question — the user reply is contextual and
-  //       belongs to Sonnet, not the expense parser. "до конца августа 2026"
-  //       in answer to "до какой даты?" was being logged as a 2 026 ₸ expense.
-  const skipExpenseParser = looksLikeNonExpenseIntent(text) || awaitingContextualReply;
-  const expenses = skipExpenseParser ? null : tryParseExpenses(text);
-  if (expenses) {
-    const reply = await handleExpenses(expenses, ctx);
-    await saveUserMsg();
-    await saveAssistantMsg(reply);
-    return textOnly(reply);
-  }
-
-  // ── 5. Everything else → Sonnet (read + write tools) ──
+  // ── 2. Everything else → Sonnet (read + direct-write + propose-write) ──
   //
-  // Philosophy: Sonnet 4.6 understands Russian phrasings + morphology much
-  // better than any regex we can write. "сколько потратили на агушу",
-  // "дай расходы на агушу", "hi how much did we spend on chips" — Sonnet
-  // extracts the keyword + intent and picks the right tool. We lost a
-  // whole evening trying to beat Sonnet with regex parsing; we won't do
-  // that again. The search tool itself handles Russian morphology via
-  // server-side stemming (see searchTransactionsByComment in queries.ts).
-  // history was fetched at the top of chat() (see "Conversation context").
+  // Architecture (2026-04-30 cutover): no more regex shape-matching.
+  // Sonnet 4.6 handles ALL intent recognition. Three tool tiers:
+  //   - READ_TOOLS: query the DB, return text
+  //   - DIRECT_WRITE_TOOLS: log_expense / log_income / log_debt — execute
+  //     immediately, reply built from the DB row (reply-from-result discipline
+  //     means a hallucinated "Записала" is structurally impossible)
+  //   - WRITE_TOOLS: propose_* — show user a confirm button before executing.
+  //     Used for high-stakes ops (delete, rename, set monthly plan, goals)
+  // History gives Sonnet the context to disambiguate "до конца августа 2026"
+  // (date reply to a goal-clarifier) from "кофе 500" (fresh expense).
+  let history: { role: string; content: string }[] = [];
+  try { history = await getRecentMessages(chatId, ctx.familyId, 10); } catch { /* */ }
   const messages: Anthropic.MessageParam[] = [];
   for (const msg of history) {
     if (messages.length === 0 && msg.role === 'assistant') continue;
@@ -1437,7 +1544,7 @@ export async function chat(
       model: MODEL,
       max_tokens: 1024,
       system: buildSystemPrompt(familyCategoriesCheck),
-      tools: [...READ_TOOLS, ...WRITE_TOOLS],
+      tools: [...READ_TOOLS, ...DIRECT_WRITE_TOOLS, ...WRITE_TOOLS],
       messages,
     });
 
@@ -1474,6 +1581,29 @@ export async function chat(
           continue;
         }
         break;
+      }
+
+      // DIRECT WRITE tool → execute immediately, return formatted reply built
+      // from the DB row. Sonnet typically echoes the tool result verbatim, but
+      // even if it goes silent we have lastReadResult fallback. Hallucinated
+      // success is impossible because the formatter only renders text when
+      // an insert actually returned a row (reply-from-result discipline).
+      if (DIRECT_WRITE_TOOL_NAMES.has(toolName)) {
+        try {
+          const tStart = Date.now();
+          const result = await executeDirectWriteTool(toolName, input, ctx);
+          console.error(`[chat] direct-write ${toolName} took ${Date.now() - tStart}ms, ${result.length}b`);
+          toolResults.push({ tool_use_id: block.id, content: result });
+          lastReadResult = result;
+        } catch (e) {
+          const errMsg = e instanceof Error ? e.message : String(e);
+          console.warn(`[chat] direct-write ${toolName} threw:`, errMsg);
+          toolResults.push({
+            tool_use_id: block.id,
+            content: `ERROR: ${errMsg}. Не записано. Объясни пользователю что не так и попроси переформулировать.`,
+          });
+        }
+        continue;
       }
 
       // READ tool → execute + feed result back to Claude. Wrap in try/catch
