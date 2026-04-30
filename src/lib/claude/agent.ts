@@ -164,15 +164,24 @@ function buildSummaryText(summary: ReturnType<typeof getMonthSummary> extends Pr
   );
 
   const { year, month } = currentMonthAlmaty();
-  let text = `📊 ${monthNameRu(month)} ${year} — Всего: ${formatTenge(total)}`;
-  if (summary.total_planned > 0) text += ` из ${formatTenge(summary.total_planned)}`;
-  text += '\n\n';
+  // No longer shows "из total_planned" — sum-of-category-limits is not a
+  // monthly budget (limits are per-category, not global). Showing it as
+  // "Всего: X из Y" misled users into thinking Y was their total budget
+  // when it was just the limit on one category. Per-category limit info
+  // moves into each line as remaining-or-exceeded for the category that
+  // actually has a limit.
+  let text = `📊 ${monthNameRu(month)} ${year} — Всего: ${formatTenge(total)}\n\n`;
 
   for (const c of sorted) {
-    const cat = c as { category: { emoji: string; name: string }; actual: number; planned: number; percentage: number };
+    const cat = c as { category: { emoji: string; name: string }; actual: number; planned: number };
     const share = total > 0 ? Math.round((cat.actual / total) * 100) : 0;
     text += `- ${cat.category.emoji} ${cat.category.name}: ${formatTenge(cat.actual)} (${share}%)`;
-    if (cat.planned > 0) text += ` · ${cat.percentage}% плана`;
+    if (cat.planned > 0) {
+      const diff = cat.planned - cat.actual;
+      text += diff >= 0
+        ? ` · осталось ${formatTenge(diff)} из ${formatTenge(cat.planned)}`
+        : ` · превышен на ${formatTenge(-diff)} (лимит ${formatTenge(cat.planned)})`;
+    }
     text += '\n';
   }
 
@@ -188,8 +197,11 @@ async function handleExpenses(
   expenses: { amount: number; description: string }[],
   ctx: FamilyCtx,
 ): Promise<string> {
-  const results: string[] = [];
-  const errors: string[] = [];
+  // Each entry is one line of output. Successes carry their categoryId so we
+  // can decorate with per-category limit info ("осталось X из Y" / "превышен
+  // на Z") computed from the post-insert summary. Failures + dedup-skips
+  // have categoryId=null and pass through unchanged.
+  const entries: { line: string; categoryId: number | null }[] = [];
 
   // Fetch once per request to drive categorizer prompt + slug→id resolution
   const familyCategories = await getCategoriesForFamily(ctx.familyId);
@@ -206,13 +218,19 @@ async function handleExpenses(
     }).catch(() => null);
     if (dupe) {
       const ageMin = Math.max(1, Math.round((Date.now() - new Date(dupe.created_at).getTime()) / 60_000));
-      results.push(`⏭️ ${formatTenge(exp.amount)} (${exp.description}) — пропущено, дубликат записи ${ageMin} мин назад. Если это отдельная трата — добавь уточнение: «${exp.description} 2 ${exp.amount}».`);
+      entries.push({
+        line: `⏭️ ${formatTenge(exp.amount)} (${exp.description}) — пропущено, дубликат записи ${ageMin} мин назад. Если это отдельная трата — добавь уточнение: «${exp.description} 2 ${exp.amount}».`,
+        categoryId: null,
+      });
       continue;
     }
 
     const slug = await categorize(exp.description, familyCategories, ctx.familyId);
     const category = familyCategories.find(c => c.slug === slug) ?? await getCategoryBySlugInFamily(slug, ctx.familyId);
-    if (!category) { errors.push(`❌ ${exp.description}: категория не найдена`); continue; }
+    if (!category) {
+      entries.push({ line: `❌ ${exp.description}: категория не найдена`, categoryId: null });
+      continue;
+    }
 
     try {
       await insertTransaction({
@@ -238,15 +256,38 @@ async function handleExpenses(
         }
       }
 
-      results.push(`✅ ${category.emoji} ${category.name} — ${formatTenge(exp.amount)} (${exp.description})${extra}`);
+      entries.push({
+        line: `✅ ${category.emoji} ${category.name} — ${formatTenge(exp.amount)} (${exp.description})${extra}`,
+        categoryId: category.id,
+      });
     } catch (e) {
-      errors.push(`❌ ${exp.description} ${formatTenge(exp.amount)}: ${e instanceof Error ? e.message : 'ошибка'}`);
+      entries.push({
+        line: `❌ ${exp.description} ${formatTenge(exp.amount)}: ${e instanceof Error ? e.message : 'ошибка'}`,
+        categoryId: null,
+      });
     }
   }
 
   const { year, month } = currentMonthAlmaty();
   const summary = await getMonthSummary(year, month, ctx.familyId);
-  let reply = results.concat(errors).join('\n');
+
+  // Decorate success lines with limit info from the post-insert summary.
+  // The summary's per-category actual already includes everything we just
+  // inserted, so subtraction gives accurate "remaining after this row."
+  // Multiple inserts to the same category in one turn share the same
+  // post-state — the user sees "осталось X" reflecting the final total.
+  const decorated = entries.map((e) => {
+    if (e.categoryId == null) return e.line;
+    const cat = summary.categories.find((c) => c.category.id === e.categoryId);
+    if (!cat || cat.planned <= 0) return e.line;
+    const diff = cat.planned - cat.actual;
+    const limitInfo = diff >= 0
+      ? ` · осталось ${formatTenge(diff)} из ${formatTenge(cat.planned)}`
+      : ` · превышен на ${formatTenge(-diff)} (лимит ${formatTenge(cat.planned)})`;
+    return e.line + limitInfo;
+  });
+
+  let reply = decorated.join('\n');
   reply += '\n\n' + buildSummaryText(summary);
 
   // Goal progress line (kill-switch + try/catch wrapped inside renderGoalProgress)
