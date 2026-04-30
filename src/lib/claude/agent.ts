@@ -1582,6 +1582,14 @@ export async function chat(
   // no text), we fall back to sending the tool output directly instead of
   // saying "Не понял".
   let lastReadResult: string | null = null;
+  // Last direct-write tool's formatted reply. Sonnet has a tendency to
+  // paraphrase tool results on the next turn, dropping details like the
+  // "осталось X из Y" limit info appended by handleExpenses. Real bug
+  // (2026-04-30): user logged "кофе 1000" with a 100k Fun limit; tool
+  // returned "✅ Fun — 1 000 ₸ (кофе) · осталось 97 000 ₸ из 100 000 ₸"
+  // but Sonnet's text output was "✅ 🎉 Fun — 1 000 ₸ (кофе)" — limit
+  // info gone. We force this to win over Sonnet's text after the loop.
+  let directWriteReply: string | null = null;
   // If a write tool is proposed, we exit the loop early with a keyboard reply
   // so the user can tap Да/Отмена. Claude's own natural-language response for
   // that turn is discarded in favor of our structured confirm message.
@@ -1653,6 +1661,10 @@ export async function chat(
           console.error(`[chat] direct-write ${toolName} took ${Date.now() - tStart}ms, ${result.length}b`);
           toolResults.push({ tool_use_id: block.id, content: result });
           lastReadResult = result;
+          // Stash so we can override Sonnet's paraphrased text after the loop —
+          // tool result is the authoritative reply (handleExpenses includes
+          // limit info + month summary + goal progress; Sonnet often drops bits).
+          directWriteReply = result;
         } catch (e) {
           const errMsg = e instanceof Error ? e.message : String(e);
           console.warn(`[chat] direct-write ${toolName} threw:`, errMsg);
@@ -1699,6 +1711,17 @@ export async function chat(
   if (confirmResponse) {
     await saveAssistantMsg(confirmResponse.text);
     return confirmResponse;
+  }
+
+  // If a direct-write tool ran successfully, its result is the canonical
+  // reply (formatted from DB row, includes limit info + summary + goal
+  // progress). Sonnet's text typically paraphrases it and drops details —
+  // override with the tool result.
+  if (directWriteReply) {
+    if (finalReply && finalReply !== directWriteReply) {
+      console.error(`[chat] overriding Sonnet paraphrase with direct-write result (Sonnet: ${finalReply.length}b → tool: ${directWriteReply.length}b)`);
+    }
+    finalReply = directWriteReply;
   }
 
   // If Sonnet produced no text but DID execute a read tool, ship the tool's
