@@ -1,8 +1,14 @@
-// End-to-end smoke test against the dev DB. Creates a fresh family,
+// End-to-end smoke test against the DEV DB. Creates a fresh family,
 // then drives chat() through every regression case we've hit so far.
 // Reports pass/fail per scenario and prints a summary.
 //
-// Usage: node --import tsx --env-file .env.dev.local --env-file .env.local smoke-test.ts
+// Usage: node --import tsx --env-file .env.dev.local smoke-test.ts
+//
+// IMPORTANT: load .env.dev.local ONLY — never .env.local. Loading both
+// causes .env.local's SUPABASE_URL (which points at PROD for Next.js dev
+// mode) to override the dev URL. On 2026-05-01 this misconfig caused the
+// smoke test to write Smoke Family rows to PROD. We now hard-fail with a
+// safety check below if SUPABASE_URL doesn't look like the dev project.
 //
 // Each scenario is single-turn (or sets up history then sends one turn).
 // Multi-turn flows are simulated by inserting into conversation_messages
@@ -11,11 +17,21 @@
 import { createClient } from '@supabase/supabase-js';
 import { chat } from './src/lib/claude/agent';
 
+// Dev project ref — any other URL means we're about to write to the wrong DB.
+const DEV_PROJECT_REF = 'rcpuvqjrtxyuvmnjandm';
 const TG_ID = 9999990001; // synthetic — never collides with real users
 const CHAT_ID = TG_ID;
 const NAME = 'Smoke Tester';
 
-const sb = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_KEY!);
+const supabaseUrl = process.env.SUPABASE_URL ?? '';
+if (!supabaseUrl.includes(DEV_PROJECT_REF)) {
+  console.error(`SAFETY CHECK FAILED: SUPABASE_URL=${supabaseUrl}`);
+  console.error(`Expected to contain "${DEV_PROJECT_REF}" (dev project).`);
+  console.error('Refusing to run — load .env.dev.local ONLY (no .env.local).');
+  process.exit(2);
+}
+
+const sb = createClient(supabaseUrl, process.env.SUPABASE_SERVICE_KEY!);
 
 interface Result {
   name: string;
