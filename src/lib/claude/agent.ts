@@ -1539,7 +1539,7 @@ export async function chat(
     familyCategoriesCheck = await getCategoriesForFamily(ctx.familyId).catch(() => []);
   }
 
-  // ── 1. Undo fast path (deterministic, single keyword) ──
+  // ── 1. Undo fast path (single keyword, zero ambiguity) ──
   if (isUndoRequest(text)) {
     const reply = await handleUndo(ctx);
     await saveUserMsg();
@@ -1548,62 +1548,25 @@ export async function chat(
   }
 
   // ── 2. Conversation context ──
-  // Need the last assistant turn before deciding whether to fast-path the
-  // expense parser. If the bot just asked a question, the user reply is
-  // contextual and belongs to Sonnet (e.g., "до июня 2026" answering "до
-  // какой даты?" must NOT be parsed as a 2026 ₸ Misc expense).
+  // Last assistant turn drives a hint Sonnet gets in the system prompt:
+  // "you just asked X — interpret the user's reply in that context." We
+  // no longer use it to gate parsers because we no longer have parsers.
   let history: { role: string; content: string }[] = [];
   try { history = await getRecentMessages(chatId, ctx.familyId, 10); } catch { /* */ }
-  const lastAssistant = [...history].reverse().find((m) => m.role === 'assistant');
-  // Strip trailing emoji + whitespace before the "?" check — bot questions
-  // often end with "📅" / "🎯" after the punctuation.
-  const lastTrimmed = (lastAssistant?.content ?? '').replace(/[\s\p{Extended_Pictographic}]+$/gu, '');
-  const awaitingContextualReply = lastTrimmed.endsWith('?');
 
-  // ── 3. Deterministic expense fast-path ──
-  // Re-introduced (2026-05-01) after LLM-only architecture produced a
-  // hallucinated confirmation in the first hour of dev testing: Sonnet
-  // returned "✅ 🎉 Fun — 1 000 ₸ (кофе)" without calling log_expense, no
-  // row written, math fabricated from conversation history. Reply-from-
-  // result can't help when the LLM never calls the tool.
+  // ── 3. Everything else → Sonnet (read + direct-write + propose-write) ──
+  // No more shape-matching parsers for log_expense/log_income/log_debt.
+  // Real bug from parser-first design (2026-05-01): "зафиксируй доход
+  // 1000000" matched the expense regex shape (<text> <amount>) and got
+  // logged as a 1M ₸ Развлечение expense, even though "доход" is the
+  // unambiguous income vocabulary marker any LLM picks up instantly.
+  // Re-ordering parsers is whack-a-mole; the right answer is to let the
+  // LLM do intent recognition (which it does well) and rely on the
+  // hallucination guard at the bottom of this function for the
+  // "Sonnet skipped the tool" failure mode.
   //
-  // Strategy: shape-perfect "<word> <amount>" inputs go straight to
-  // handleExpenses, never reach the LLM. Sonnet still gets log_expense as
-  // a tool for the long-tail cases ("купил кофе за 500", multi-line mixed
-  // intents) but the high-volume happy path is hallucination-impossible.
-  //
-  // Skip the fast-path when:
-  //   (a) user input looks like a NL command ("поставь лимит 100k") —
-  //       parser would log it as expense
-  //   (b) bot just asked a question — user reply is contextual
-  const skipExpenseParser = looksLikeNonExpenseIntent(text) || awaitingContextualReply;
-  const expenses = skipExpenseParser ? null : tryParseExpenses(text);
-  if (expenses) {
-    const reply = await handleExpenses(expenses, ctx);
-    await saveUserMsg();
-    await saveAssistantMsg(reply);
-    return textOnly(reply);
-  }
-
-  // ── 4. Income fast-path (income vocabulary is unambiguous) ──
-  const income = !awaitingContextualReply ? tryParseIncome(text) : null;
-  if (income) {
-    const reply = await handleIncome(income, ctx);
-    await saveUserMsg();
-    await saveAssistantMsg(reply);
-    return textOnly(reply);
-  }
-
-  // ── 5. Debt fast-path ──
-  const debt = !awaitingContextualReply ? tryParseDebt(text) : null;
-  if (debt) {
-    const reply = await handleDebt(debt, ctx);
-    await saveUserMsg();
-    await saveAssistantMsg(reply);
-    return textOnly(reply);
-  }
-
-  // ── 6. Everything else → Sonnet (read + direct-write + propose-write) ──
+  // Kept up-stack: isUndoRequest (single keyword, can't misclassify),
+  // isMeaningfulInput (short-circuits "?", "...", "hmm" before LLM cost).
   const messages: Anthropic.MessageParam[] = [];
   for (const msg of history) {
     if (messages.length === 0 && msg.role === 'assistant') continue;
