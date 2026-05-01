@@ -55,7 +55,6 @@ import {
   tryParseDebt,
   isUndoRequest,
   isMeaningfulInput,
-  looksLikeNonExpenseIntent,
 } from '@/lib/parsers';
 
 // Re-export for any historical callers that imported from this module.
