@@ -1743,21 +1743,68 @@ export async function chat(
     finalReply = '🤔 Не понял. Попробуй переформулировать — например: "сколько на X?" или "покажи последние 10 трат".';
   }
 
-  // ── Hallucination guard ──
+  // ── Hallucination guard + parser recovery ──
   // If no direct-write tool ran but Sonnet's reply looks like a successful
-  // expense log ("✅ ... NNN ₸ ..."), it's a fabricated confirmation. Real
-  // bug (2026-05-01): user typed "кофе 1000" amid conversational confusion,
+  // log ("✅ ... NNN ₸ ..."), it's a fabricated confirmation. Real bug
+  // (2026-05-01): user typed "кофе 1000" amid conversational confusion,
   // Sonnet pattern-matched the previous "✅ Fun — 1 000 ₸ (кофе)" reply in
-  // history and produced an identical-looking text without calling
-  // log_expense. Nothing was written; user thought it was. Reject the fake.
-  if (!directWriteReply && /^\s*✅[^\n]*\d[\d\s]*\s*₸/m.test(finalReply)) {
-    console.error('[chat] HALLUCINATION GUARD: Sonnet produced ✅+₸ reply without calling log tool. Rejecting.');
-    await captureError(new Error('hallucinated_confirmation'), {
-      source: 'chat:hallucination_guard',
-      userTgId: telegramId,
-      context: { user_message: text.slice(0, 200), sonnet_reply: finalReply.slice(0, 400) },
-    }).catch(() => { /* */ });
-    finalReply = '🤔 Не получилось разобрать формат. Напиши проще, например: «кофе 500» или «такси 2500».';
+  // history and produced an identical-looking text without calling any
+  // tool. Nothing was written; user thought it was.
+  //
+  // Recovery: deterministic parsers run as a SAFETY NET (not preemption —
+  // Sonnet always gets first chance above). Order matters: income → debt
+  // → expense, because expense regex matches everything shape-perfect and
+  // would steal "зарплата 500000" if it ran first.
+  // Patterns that indicate Sonnet THINKS a write happened. Each one matches
+  // the format of a real handler reply (handleExpenses, handleIncome, handleDebt).
+  // Real bug 2026-05-01: Sonnet hallucinated "🤝 Долг записан: 100 000 ₸ (у Аидара)"
+  // without calling log_debt — the previous regex only matched the expense
+  // emoji ✅ so this debt-shaped hallucination slipped through.
+  const looksLikeFakeConfirmation = !directWriteReply && (
+    /^\s*✅[^\n]*\d[\d\s]*\s*₸/m.test(finalReply) ||      // expense: "✅ Cat — N ₸"
+    /💰\s*Доход\s+записан/i.test(finalReply) ||            // income: handleIncome's exact prefix
+    /🤝\s*Долг\s+записан/i.test(finalReply) ||             // debt:   handleDebt's exact prefix
+    /(записал[аои]?|сохранил[аои]?|зафиксировал[аои]?)\s*[:.]?\s*\d/i.test(finalReply)
+  );
+  if (looksLikeFakeConfirmation) {
+    console.error('[chat] hallucination detected — Sonnet returned a "записал" reply without tool; trying parser recovery');
+    let recovered = false;
+
+    const incomeParse = tryParseIncome(text);
+    if (incomeParse) {
+      console.warn('[chat] parser recovery: log_income');
+      finalReply = await handleIncome(incomeParse, ctx);
+      recovered = true;
+    }
+
+    if (!recovered) {
+      const debtParse = tryParseDebt(text);
+      if (debtParse) {
+        console.warn('[chat] parser recovery: log_debt');
+        finalReply = await handleDebt(debtParse, ctx);
+        recovered = true;
+      }
+    }
+
+    if (!recovered) {
+      const expenseParse = tryParseExpenses(text);
+      if (expenseParse) {
+        console.warn('[chat] parser recovery: log_expense');
+        finalReply = await handleExpenses(expenseParse, ctx);
+        recovered = true;
+      }
+    }
+
+    if (!recovered) {
+      // Sonnet hallucinated AND parsers can't make sense of the input —
+      // honest error is the only safe choice.
+      await captureError(new Error('hallucinated_confirmation'), {
+        source: 'chat:hallucination_guard',
+        userTgId: telegramId,
+        context: { user_message: text.slice(0, 200), sonnet_reply: finalReply.slice(0, 400) },
+      }).catch(() => { /* */ });
+      finalReply = '🤔 Не получилось разобрать формат. Напиши проще, например: «кофе 500» или «такси 2500».';
+    }
   }
 
   await saveAssistantMsg(finalReply);
