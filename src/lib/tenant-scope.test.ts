@@ -140,3 +140,139 @@ describe('tenant scope — read queries never cross family boundaries', { skip: 
     );
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 2: chat-based family scope (resolveFamilyForChat)
+//
+// Why integration not unit: same logic as the rest of this file — mocking
+// supabase per-query tests the mock not the code. We run against the real
+// dev DB, using sentinel chat_id ranges that don't collide with real users
+// (Telegram IDs are positive ints; we use a very large positive range that
+// no real human will ever hold). Each test cleans up its own rows.
+//
+// Skips cleanly if SUPABASE env is absent.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('resolveFamilyForChat — Phase 2 chat-based scoping', { skip: SKIP ? SKIP_REASON : undefined }, () => {
+  // Sentinel chat_id range — collides with no real Telegram IDs. Each test
+  // picks a unique one inside this range and cleans up after itself.
+  const TEST_CHAT_BASE = 9_999_900_000;
+
+  async function cleanupChat(chatId: number) {
+    const { supabase } = await import('./db/supabase');
+    await supabase.from('family_chats').delete().eq('chat_id', chatId);
+  }
+
+  test('existing chat link → returns linked family with firstTimeInChat=false', async () => {
+    const { resolveFamilyForChat } = await import('./db/queries');
+    const { supabase } = await import('./db/supabase');
+    const chatId = TEST_CHAT_BASE + 1;
+    try {
+      // Pre-seed a link
+      await supabase.from('family_chats').insert({
+        chat_id: chatId,
+        family_id: FAM_SHYNGGYS,
+        chat_type: 'group',
+        linked_by_user_id: null,
+      });
+      // telegramId here is irrelevant — link already exists, sender is never queried
+      const result = await resolveFamilyForChat({
+        chatId,
+        telegramId: 0,
+        chatType: 'group',
+      });
+      assert.ok(!('error' in result), `expected success, got error: ${JSON.stringify(result)}`);
+      if ('error' in result) return;
+      assert.equal(result.familyId, FAM_SHYNGGYS);
+      assert.equal(result.firstTimeInChat, false);
+    } finally {
+      await cleanupChat(chatId);
+    }
+  });
+
+  test('unregistered sender in private chat → returns unregistered_sender error', async () => {
+    const { resolveFamilyForChat } = await import('./db/queries');
+    const chatId = TEST_CHAT_BASE + 2;
+    try {
+      const result = await resolveFamilyForChat({
+        chatId,
+        telegramId: chatId, // private chat: chat_id == telegram_id, both unknown
+        chatType: 'private',
+      });
+      assert.ok('error' in result, `expected error, got: ${JSON.stringify(result)}`);
+      if (!('error' in result)) return;
+      assert.equal(result.error, 'unregistered_sender');
+    } finally {
+      // Defensive — we shouldn't have inserted anything but in case logic regresses
+      await cleanupChat(chatId);
+    }
+  });
+
+  test('registered sender in NEW group chat → auto-links + firstTimeInChat=true', async () => {
+    const { resolveFamilyForChat, getUsersInFamily } = await import('./db/queries');
+    const { supabase } = await import('./db/supabase');
+
+    // Find a real registered user in Shynggys family to act as sender
+    const users = await getUsersInFamily(FAM_SHYNGGYS);
+    assert.ok(users.length > 0, 'expected Shynggys family to have at least 1 user');
+    const sender = users[0];
+
+    const chatId = TEST_CHAT_BASE + 3;
+    try {
+      const result = await resolveFamilyForChat({
+        chatId,
+        telegramId: sender.telegram_id,
+        chatType: 'group',
+      });
+      assert.ok(!('error' in result), `expected success, got error: ${JSON.stringify(result)}`);
+      if ('error' in result) return;
+      assert.equal(result.familyId, FAM_SHYNGGYS);
+      assert.equal(result.firstTimeInChat, true, 'first message in new chat must flag firstTimeInChat');
+
+      // Verify the row was actually persisted with the right shape
+      const { data: link } = await supabase
+        .from('family_chats')
+        .select('*')
+        .eq('chat_id', chatId)
+        .single();
+      assert.ok(link, 'family_chats row should exist after resolve');
+      assert.equal(link.family_id, FAM_SHYNGGYS);
+      assert.equal(link.chat_type, 'group');
+      assert.equal(link.linked_by_user_id, sender.id);
+
+      // Second call should now return firstTimeInChat=false (idempotent)
+      const second = await resolveFamilyForChat({
+        chatId,
+        telegramId: sender.telegram_id,
+        chatType: 'group',
+      });
+      assert.ok(!('error' in second));
+      if ('error' in second) return;
+      assert.equal(second.firstTimeInChat, false, 'subsequent calls must NOT flag first-time');
+    } finally {
+      await cleanupChat(chatId);
+    }
+  });
+
+  test('two different chats linked to same family → both resolve to same family', async () => {
+    const { resolveFamilyForChat, getUsersInFamily } = await import('./db/queries');
+    const users = await getUsersInFamily(FAM_SHYNGGYS);
+    assert.ok(users.length > 0);
+    const sender = users[0];
+
+    const chatA = TEST_CHAT_BASE + 4;
+    const chatB = TEST_CHAT_BASE + 5;
+    try {
+      const a = await resolveFamilyForChat({ chatId: chatA, telegramId: sender.telegram_id, chatType: 'group' });
+      const b = await resolveFamilyForChat({ chatId: chatB, telegramId: sender.telegram_id, chatType: 'supergroup' });
+      assert.ok(!('error' in a) && !('error' in b));
+      if ('error' in a || 'error' in b) return;
+      assert.equal(a.familyId, FAM_SHYNGGYS);
+      assert.equal(b.familyId, FAM_SHYNGGYS);
+      assert.equal(a.familyId, b.familyId, 'both chats must resolve to the same family');
+    } finally {
+      await cleanupChat(chatA);
+      await cleanupChat(chatB);
+    }
+  });
+});

@@ -29,6 +29,8 @@ import {
   addGoalContribution,
   createCategory,
   createCategoriesBulk,
+  replaceCategoriesForFreshFamily,
+  countActiveTransactions,
   renameCategory,
   deleteCategory,
   mergeCategories,
@@ -39,11 +41,13 @@ import {
   topItemsByComment,
   resolveCategoryByName,
   findRecentDuplicate,
+  seedDefaultCategoriesForFamily,
   type ConfirmType,
   type PendingConfirm,
 } from '@/lib/db/queries';
 import { todayAlmaty, currentMonthAlmaty, monthNameRu, formatTenge } from '@/lib/utils';
 import { renderGoalProgress } from '@/lib/goals';
+import { captureError } from '@/lib/observability';
 import {
   stripCurrencyMarkers,
   tryParseExpenses,
@@ -54,6 +58,9 @@ import {
 } from '@/lib/parsers';
 
 // Re-export for any historical callers that imported from this module.
+// The deterministic parsers are no longer used by chat() — Sonnet handles
+// all intent recognition via log_expense/log_income/log_debt tools — but
+// the pure functions remain available for tests and any out-of-bot caller.
 export { stripCurrencyMarkers, tryParseExpenses, tryParseIncome, tryParseDebt, isUndoRequest };
 
 const client = new Anthropic();
@@ -158,15 +165,24 @@ function buildSummaryText(summary: ReturnType<typeof getMonthSummary> extends Pr
   );
 
   const { year, month } = currentMonthAlmaty();
-  let text = `📊 ${monthNameRu(month)} ${year} — Всего: ${formatTenge(total)}`;
-  if (summary.total_planned > 0) text += ` из ${formatTenge(summary.total_planned)}`;
-  text += '\n\n';
+  // No longer shows "из total_planned" — sum-of-category-limits is not a
+  // monthly budget (limits are per-category, not global). Showing it as
+  // "Всего: X из Y" misled users into thinking Y was their total budget
+  // when it was just the limit on one category. Per-category limit info
+  // moves into each line as remaining-or-exceeded for the category that
+  // actually has a limit.
+  let text = `📊 ${monthNameRu(month)} ${year} — Всего: ${formatTenge(total)}\n\n`;
 
   for (const c of sorted) {
-    const cat = c as { category: { emoji: string; name: string }; actual: number; planned: number; percentage: number };
+    const cat = c as { category: { emoji: string; name: string }; actual: number; planned: number };
     const share = total > 0 ? Math.round((cat.actual / total) * 100) : 0;
     text += `- ${cat.category.emoji} ${cat.category.name}: ${formatTenge(cat.actual)} (${share}%)`;
-    if (cat.planned > 0) text += ` · ${cat.percentage}% плана`;
+    if (cat.planned > 0) {
+      const diff = cat.planned - cat.actual;
+      text += diff >= 0
+        ? ` · осталось ${formatTenge(diff)} из ${formatTenge(cat.planned)}`
+        : ` · превышен на ${formatTenge(-diff)} (лимит ${formatTenge(cat.planned)})`;
+    }
     text += '\n';
   }
 
@@ -182,8 +198,11 @@ async function handleExpenses(
   expenses: { amount: number; description: string }[],
   ctx: FamilyCtx,
 ): Promise<string> {
-  const results: string[] = [];
-  const errors: string[] = [];
+  // Each entry is one line of output. Successes carry their categoryId so we
+  // can decorate with per-category limit info ("осталось X из Y" / "превышен
+  // на Z") computed from the post-insert summary. Failures + dedup-skips
+  // have categoryId=null and pass through unchanged.
+  const entries: { line: string; categoryId: number | null }[] = [];
 
   // Fetch once per request to drive categorizer prompt + slug→id resolution
   const familyCategories = await getCategoriesForFamily(ctx.familyId);
@@ -200,13 +219,19 @@ async function handleExpenses(
     }).catch(() => null);
     if (dupe) {
       const ageMin = Math.max(1, Math.round((Date.now() - new Date(dupe.created_at).getTime()) / 60_000));
-      results.push(`⏭️ ${formatTenge(exp.amount)} (${exp.description}) — пропущено, дубликат записи ${ageMin} мин назад. Если это отдельная трата — добавь уточнение: «${exp.description} 2 ${exp.amount}».`);
+      entries.push({
+        line: `⏭️ ${formatTenge(exp.amount)} (${exp.description}) — пропущено, дубликат записи ${ageMin} мин назад. Если это отдельная трата — добавь уточнение: «${exp.description} 2 ${exp.amount}».`,
+        categoryId: null,
+      });
       continue;
     }
 
     const slug = await categorize(exp.description, familyCategories, ctx.familyId);
     const category = familyCategories.find(c => c.slug === slug) ?? await getCategoryBySlugInFamily(slug, ctx.familyId);
-    if (!category) { errors.push(`❌ ${exp.description}: категория не найдена`); continue; }
+    if (!category) {
+      entries.push({ line: `❌ ${exp.description}: категория не найдена`, categoryId: null });
+      continue;
+    }
 
     try {
       await insertTransaction({
@@ -232,15 +257,38 @@ async function handleExpenses(
         }
       }
 
-      results.push(`✅ ${category.emoji} ${category.name} — ${formatTenge(exp.amount)} (${exp.description})${extra}`);
+      entries.push({
+        line: `✅ ${category.emoji} ${category.name} — ${formatTenge(exp.amount)} (${exp.description})${extra}`,
+        categoryId: category.id,
+      });
     } catch (e) {
-      errors.push(`❌ ${exp.description} ${formatTenge(exp.amount)}: ${e instanceof Error ? e.message : 'ошибка'}`);
+      entries.push({
+        line: `❌ ${exp.description} ${formatTenge(exp.amount)}: ${e instanceof Error ? e.message : 'ошибка'}`,
+        categoryId: null,
+      });
     }
   }
 
   const { year, month } = currentMonthAlmaty();
   const summary = await getMonthSummary(year, month, ctx.familyId);
-  let reply = results.concat(errors).join('\n');
+
+  // Decorate success lines with limit info from the post-insert summary.
+  // The summary's per-category actual already includes everything we just
+  // inserted, so subtraction gives accurate "remaining after this row."
+  // Multiple inserts to the same category in one turn share the same
+  // post-state — the user sees "осталось X" reflecting the final total.
+  const decorated = entries.map((e) => {
+    if (e.categoryId == null) return e.line;
+    const cat = summary.categories.find((c) => c.category.id === e.categoryId);
+    if (!cat || cat.planned <= 0) return e.line;
+    const diff = cat.planned - cat.actual;
+    const limitInfo = diff >= 0
+      ? ` · осталось ${formatTenge(diff)} из ${formatTenge(cat.planned)}`
+      : ` · превышен на ${formatTenge(-diff)} (лимит ${formatTenge(cat.planned)})`;
+    return e.line + limitInfo;
+  });
+
+  let reply = decorated.join('\n');
   reply += '\n\n' + buildSummaryText(summary);
 
   // Goal progress line (kill-switch + try/catch wrapped inside renderGoalProgress)
@@ -499,59 +547,44 @@ const READ_TOOLS: Anthropic.Tool[] = [
   },
 ];
 
-/**
- * Quick response for first-run users who try to log expenses before creating
- * any categories. Echo back what they wrote so they know we saw it, then
- * guide to the setup step.
- */
-function firstRunWelcomeExpenseAttempt(expenses: { amount: number; description: string }[]): string {
-  let reply = '👋 Добро пожаловать! Прежде чем записывать траты, создай свои категории расходов.\n\n';
-  reply += 'Напиши, например:\n';
-  reply += '*"создай категории: Продукты 🛒, Транспорт 🚗, Кафе ☕, Жильё 🏠, Личное 🎯, Прочее 🎲"*\n\n';
-  reply += 'Бот предложит создать их все одной кнопкой ✅ Да.\n\n';
-  reply += 'После этого я смогу записать:\n';
-  for (const e of expenses.slice(0, 3)) {
-    reply += `- ${e.description} ${e.amount} ₸\n`;
-  }
-  return reply;
-}
-
-function buildSystemPrompt(firstRun = false): string {
+function buildSystemPrompt(familyCategories: Category[] = []): string {
   const { year, month } = currentMonthAlmaty();
   const today = todayAlmaty();
 
-  const firstRunBlock = firstRun ? `
-⚠️ FIRST RUN: у этой семьи НЕТ категорий. Что бы пользователь ни спрашивал —
-СНАЧАЛА предложи создать стартовый набор категорий. Используй
-propose_create_categories_bulk со списком из 6-8 типичных категорий
-(Продукты 🛒, Транспорт 🚗, Кафе ☕, Жильё 🏠, Здоровье 💊, Личное 🎯, Прочее 🎲),
-либо персонализированный под контекст пользователя. Пока категорий нет,
-ничего другого делать не нужно — только онбординг.
-` : '';
+  // Inject the family's actual current categories so Sonnet answers
+  // "дай категории" / "какие у меня категории" with real data instead of
+  // guessing from a stale hardcoded list. Sorted by sort_order for stable
+  // output. Empty list (shouldn't happen post-Phase-1, but safety net) falls
+  // back to a generic note.
+  const categoriesBlock = familyCategories.length > 0
+    ? familyCategories
+        .slice()
+        .sort((a, b) => a.sort_order - b.sort_order)
+        .map((c) => `  ${c.emoji} ${c.name} (slug: ${c.slug})`)
+        .join('\n')
+    : '  (категории ещё не созданы — будут засеяны автоматически)';
 
   return `Ты — семейный финансовый ассистент. Кратко, на русском.
 
 Сегодня: ${today}. Месяц: ${monthNameRu(month)} ${year}.
-${firstRunBlock}
+
 У тебя ЕСТЬ инструменты чтения и записи. НЕ отказывайся "я не могу изменить" — если
-пользователь просит что-то изменить, найди подходящий propose_* инструмент и вызови
-его. Система спросит у пользователя подтверждение.
+пользователь просит что-то изменить, найди подходящий инструмент и вызови его.
 
-Новые траты/доходы/долги уже записываются системой автоматически из сумм+описаний
-("кофе 1200"). Если пользователь просто пишет сумму и описание — не вмешивайся. Но
-если он хочет ИЗМЕНИТЬ уже записанное (поменять категорию, удалить) — это ТВОЯ работа.
+🚨 СЛОТ-СТИТЧИНГ (используй ИСТОРИЮ ПЕРЕПИСКИ):
+Если пользователь в недавнем сообщении уже указал параметры (название категории,
+новое имя, сумму, дату, дедлайн, slug), а в текущем сообщении уточняет лишь часть —
+БЕРИ остальные параметры из истории. НЕ переспрашивай то, что уже было сказано.
 
-🚨 КРИТИЧЕСКОЕ ПРАВИЛО (не нарушать ни при каких условиях):
-Если пользовательское сообщение ВЫГЛЯДИТ как трата (что-то + число), но ты
-видишь его — значит детерминированный парсер пропустил его (странный формат,
-суффикс "тг"/"₸"/"тенге", опечатка). НИКОГДА не отвечай "Записала", "Записано",
-"система зафиксирует", "Зафиксировал", или любой формулировкой, подразумевающей
-что трата сохранена — потому что у тебя НЕТ инструмента создания транзакций,
-и любое такое подтверждение будет ЛОЖЬЮ. Это сломает доверие пользователя к боту.
+Пример (реальный баг 2026-04-30):
+  user: "Поменяй категорию накопления на savings"  ← здесь указано: что (накопления), новое имя (savings)
+  bot:  "Это переименование или перемещение транзакции?"
+  user: "Переименовать"  ← подтвердил тип действия
+  WRONG: bot снова спрашивает "что переименовать? как назвать?" (всё уже было сказано!)
+  RIGHT: bot вызывает propose_rename_category(slug='savings', new_name='Savings')
 
-Вместо этого скажи: "🤔 Не понял формат — напиши проще: «описание сумма» (без 'тг'/'₸').
-Например: «Супермаркет 1762» или «1762 супермаркет»." Дай конкретный пример из
-сообщения пользователя.
+Тот же принцип для целей, лимитов, удалений: собирай аргументы из ВСЕЙ истории
+переписки в этом чате, не только из последнего сообщения.
 
 ЧТЕНИЕ:
 - search_transactions_by_comment(keyword, period?) — поиск по ключевому слову.
@@ -595,19 +628,13 @@ ${firstRunBlock}
   1. search_transactions_by_comment(keyword=X) — найти последнюю транзакцию с X
   2. propose_update_transaction_category(transaction_id=<id последней>, new_category_slug=<slug Y>)
 
-Категория-slug маппинги по умолчанию (для твоей семьи после миграции 007):
-  "жильё/квартира/коммуналка" = home
-  "продукты/еда" = food
-  "транспорт/такси/бензин" = transport
-  "кафе/ресторан/выход" = cafe
-  "ребёнок/балапанчик/дети" = baby
-  "здоровье/аптека/врач" = health
-  "кредит/долг" = credit
-  "личное/одежда/стрижка" = personal
-  "сбережения/savings/копилка" = savings
-  "разное/прочее" = misc
-У семьи также могут быть свои категории — используй search_transactions_by_comment
-или задай уточняющий вопрос если slug неясен.
+Категории ЭТОЙ семьи (используй ТОЛЬКО эти slug-и в propose_*):
+${categoriesBlock}
+
+Если пользователь просит "дай категории" / "какие у меня категории" / "покажи
+категории" — выведи список выше дословно (эмодзи + имя), без выдуманных slug-ов
+вроде "baby" или "credit", если их нет в списке. Если упоминается категория,
+которой нет — это новая, предложи propose_create_category.
 
 ПЕРИОДЫ:
 Когда пользователь упоминает период, конвертируй в YYYY-MM-DD:
@@ -627,6 +654,23 @@ ${firstRunBlock}
 - без упоминания периода → не передавай, ищи за всё время
 
 КОГДА ПИСАТЬ:
+
+ПРЯМАЯ ЗАПИСЬ (выполняется сразу, БЕЗ кнопки подтверждения):
+- "кофе 500", "Супермаркет 1762тг", "хлеб и сэндвич 935", "5000 такси", несколько
+  трат списком → log_expense (передавай items: [{amount, description}, ...])
+- "зарплата 500000", "получил премию 100000", "перевод 30000 от мамы" → log_income
+- "взял в долг 100000 у Аидар", "занял 50000 Жанар" → log_debt
+
+ВАЖНО про log_expense:
+- Если в сообщении явно сумма + что куплено в любом порядке → ВСЕГДА log_expense.
+- Категорию НЕ выбирай сам — система сама подберёт через learned overrides + LLM.
+- Описание = оригинальный текст БЕЗ суммы и валюты ("кофе", "Супермаркет",
+  "хлеб и сэндвич"). Не выдумывай.
+- "купил кофе за 500" / "потратил 500 на кофе" — тоже log_expense.
+- НО если пользователь спрашивает / уточняет / отвечает на вопрос — НЕ log_expense,
+  смотри историю переписки.
+
+ЧЕРЕЗ ПОДТВЕРЖДЕНИЕ (propose_*, бот покажет кнопку ✅ Да / ❌ Отмена):
 - "хочу накопить N к [даты]" или "создай цель" → propose_create_goal
 - "отложил/кинул/добавил N" (без описания расхода) → propose_contribute_to_goal
 - "закрой цель" / "забудь цель" → propose_archive_goal
@@ -639,7 +683,8 @@ ${firstRunBlock}
 - "удали категорию" → propose_delete_category
 - "объедини X в Y" → propose_merge_categories
 
-КРИТИЧЕСКИ ВАЖНО: результаты read-tools — ЭТО УЖЕ ГОТОВЫЙ ТЕКСТ для пользователя.
+КРИТИЧЕСКИ ВАЖНО: результаты read-tools И direct-write tools — ЭТО УЖЕ ГОТОВЫЙ ТЕКСТ
+для пользователя.
 — Выводи ДОСЛОВНО, символ в символ, без изменений.
 — НЕ создавай markdown-таблицы (| Дата | Сумма |). Telegram их не рендерит нормально,
   текст становится мусором из столбиков палок.
@@ -648,7 +693,15 @@ ${firstRunBlock}
 — НЕ убирай значки 📎 и ⚠️ из ответов search — они помечают многопозиционные покупки.
 — Если тебе очень хочется что-то добавить от себя — добавь коротко В КОНЦЕ, после
   полного результата tool. Сам результат НЕ трогай.
-Результаты write-tools обрабатываются системой (показывается кнопка подтверждения пользователю) — тебе после пропозала ничего говорить не нужно.`;
+
+🚨 ПРАВИЛО ОТКАЗА ОТ ВЫДУМЫВАНИЯ ПОДТВЕРЖДЕНИЯ:
+Никогда не пиши "записала", "записано", "сохранил" своими словами. Только инструменты
+log_expense/log_income/log_debt действительно записывают, и они САМИ возвращают текст
+"✅ ..." с реальными данными из БД. Если ты не вызвал инструмент — значит запись не
+произошла, и любое подтверждение будет ложью.
+
+Результаты propose_* tools обрабатываются системой (показывается кнопка подтверждения
+пользователю) — тебе после пропозала ничего говорить не нужно.`;
 }
 
 interface ToolResult {
@@ -839,6 +892,131 @@ const WRITE_TOOLS: Anthropic.Tool[] = [
 
 const WRITE_TOOL_NAMES = new Set(WRITE_TOOLS.map(t => t.name));
 
+// ═══════════════════════════════════════════════════════════════
+// Direct write tools — Sonnet executes immediately, NO confirm step.
+// Used for the high-volume routine path (log expense/income/debt).
+// Reply is formatted from the DB-row result (reply-from-result), so
+// even if Sonnet calls with wrong args the user sees what was actually
+// recorded and can `undo`. Hallucinated success is impossible because
+// only successful inserts produce the "✅ ..." text.
+// ═══════════════════════════════════════════════════════════════
+
+const DIRECT_WRITE_TOOLS: Anthropic.Tool[] = [
+  {
+    name: 'log_expense',
+    description:
+      'Record one or more expenses immediately. Call this for ANY message that names a thing + amount: ' +
+      '"кофе 500", "Супермаркет 1762тг", "хлеб и сэндвич 935", "5000 такси", multi-line lists. ' +
+      'You categorize via family categories (server uses learned overrides + LLM categorizer). ' +
+      'NO confirmation step — the row is written immediately and the reply shown to the user is built ' +
+      'from the actual DB row, not from your arguments. If the user wants to undo, they say "удали последнюю".',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        items: {
+          type: 'array',
+          description: 'One or more expenses. For "кофе 500\\nтакси 2500" pass two items.',
+          items: {
+            type: 'object',
+            properties: {
+              amount: { type: 'number', description: 'Сумма в тенге, целое > 0, ≤ 10 000 000' },
+              description: { type: 'string', description: 'Что куплено — оригинальный текст пользователя без суммы и валюты' },
+            },
+            required: ['amount', 'description'],
+          },
+        },
+      },
+      required: ['items'],
+    },
+  },
+  {
+    name: 'log_income',
+    description:
+      'Record an income entry immediately. Call for "зарплата 500000", "получил премию 100000", ' +
+      '"перевод 50000 от мамы", "вернули долг 30000". NO confirmation — written immediately, ' +
+      'reply built from the actual DB row.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        amount: { type: 'number', description: 'Сумма в тенге, целое > 0' },
+        comment: { type: 'string', description: 'Источник дохода — короткая фраза, например "Зарплата" или "Премия"' },
+      },
+      required: ['amount', 'comment'],
+    },
+  },
+  {
+    name: 'log_debt',
+    description:
+      'Record a debt the user took on. Call for "взял в долг 100000 у Аидар", "занял 50000 Жанар", ' +
+      '"одолжил 30000 у мамы". NO confirmation — written immediately, reply from DB row.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        amount: { type: 'number', description: 'Сумма долга в тенге, > 0' },
+        name: { type: 'string', description: 'У кого занял — имя человека. Если не указано, передай "без имени".' },
+      },
+      required: ['amount', 'name'],
+    },
+  },
+];
+
+const DIRECT_WRITE_TOOL_NAMES = new Set(DIRECT_WRITE_TOOLS.map(t => t.name));
+
+// ═══════════════════════════════════════════════════════════════
+// Direct-write executor — runs the action immediately, returns the
+// formatted reply (NOT the LLM-args). Reply-from-result discipline:
+// the formatter takes the DB row, so a hallucinated "Записала" is
+// structurally impossible — we only render text when an insert actually
+// returned a row.
+// ═══════════════════════════════════════════════════════════════
+async function executeDirectWriteTool(
+  toolName: string,
+  input: Record<string, unknown>,
+  ctx: FamilyCtx,
+): Promise<string> {
+  switch (toolName) {
+    case 'log_expense': {
+      const items = input.items as Array<{ amount: number; description: string }> | undefined;
+      if (!Array.isArray(items) || items.length === 0) {
+        throw new Error('items пустой — передай хотя бы одну трату');
+      }
+      const cleaned: { amount: number; description: string }[] = [];
+      for (const it of items) {
+        const amount = Number(it.amount);
+        const description = String(it.description ?? '').trim();
+        if (!Number.isFinite(amount) || amount <= 0 || amount > 10_000_000) {
+          throw new Error(`Сумма должна быть > 0 и ≤ 10 000 000 (получено ${it.amount})`);
+        }
+        if (!description) throw new Error('У траты нет описания');
+        cleaned.push({ amount, description });
+      }
+      // handleExpenses inserts each row + builds the month-summary reply.
+      // Its output is built from getMonthSummary post-insert + per-row category
+      // resolution → reply-from-result is preserved.
+      return await handleExpenses(cleaned, ctx);
+    }
+    case 'log_income': {
+      const amount = Number(input.amount);
+      const comment = String(input.comment ?? '').trim();
+      if (!Number.isFinite(amount) || amount <= 0) {
+        throw new Error('Сумма дохода должна быть > 0');
+      }
+      if (!comment) throw new Error('Укажи источник дохода (например, "Зарплата")');
+      return await handleIncome({ amount, comment }, ctx);
+    }
+    case 'log_debt': {
+      const amount = Number(input.amount);
+      const name = String(input.name ?? '').trim() || 'без имени';
+      if (!Number.isFinite(amount) || amount <= 0) {
+        throw new Error('Сумма долга должна быть > 0');
+      }
+      return await handleDebt({ amount, name }, ctx);
+    }
+    default:
+      throw new Error(`Неизвестный direct-write tool: ${toolName}`);
+  }
+}
+
 /**
  * Validate + serialize a write-tool call into a pending_confirm row,
  * then return the confirm message + inline keyboard for the bot to send.
@@ -956,8 +1134,20 @@ async function buildProposalMessage(
       }
       // Mutate input so execute path uses cleaned data
       (input as Record<string, unknown>).categories = clean;
+
+      // Fresh-setup detection: a family with 0 transactions that asks to
+      // "create categories" almost always means "set my categories to these"
+      // (matches the welcome example "Хочешь свои? Напиши: создай категории
+      // X, Y, Z"). Append behavior is the bug — user ends up with 8 defaults
+      // + 3 customs and a confused mental model. We replace the auto-seeded
+      // defaults instead and stash a flag for the execute path.
+      const txnCount = await countActiveTransactions(ctx.familyId).catch(() => -1);
+      const isFresh = txnCount === 0;
+      (input as Record<string, unknown>)._replace_defaults = isFresh;
+
       const list = clean.map(c => `${c.emoji} ${c.name}`).join(', ');
-      return `🆕 Создать ${clean.length} ${clean.length === 1 ? 'категорию' : 'категорий'}: ${list}?`;
+      const verb = isFresh ? 'Заменить стандартные категории на' : `Создать ${clean.length} ${clean.length === 1 ? 'категорию' : 'категорий'}:`;
+      return `🆕 ${verb} ${list}?`;
     }
     case 'rename_category': {
       const slug = String(input.slug ?? '');
@@ -1046,7 +1236,12 @@ async function executeConfirmedAction(
         }
       }
 
-      return `🏷 Перекатегоризовано → ${cat.emoji} *${cat.name}*. Запомнил.`;
+      // Show the updated month distribution so the user can immediately see
+      // how the reclassification shifted shares (Image #39 feedback: after
+      // moving "рыбо" Продукты→Кафе the user wanted to see the new split).
+      const { year: rcY, month: rcM } = currentMonthAlmaty();
+      const summary = await getMonthSummary(rcY, rcM, ctx.familyId);
+      return `🏷 Перекатегоризовано → ${cat.emoji} *${cat.name}*. Запомнил.\n\n${buildSummaryText(summary)}`;
     }
     case 'set_monthly_plan': {
       const slug = String(a.category_slug);
@@ -1076,11 +1271,14 @@ async function executeConfirmedAction(
     }
     case 'create_categories_bulk': {
       const cats = a.categories as Array<{ name: string; emoji: string }>;
-      const { created, skipped } = await createCategoriesBulk({
-        family_id: ctx.familyId,
-        categories: cats,
-      });
-      let reply = `🆕 Создано ${created.length} ${created.length === 1 ? 'категория' : 'категорий'}:\n`;
+      // Re-check fresh-setup at execute time too — defends against the case
+      // where the user logged a transaction between propose and confirm.
+      const wantsReplace = a._replace_defaults === true && (await countActiveTransactions(ctx.familyId).catch(() => -1)) === 0;
+      const { created, skipped } = wantsReplace
+        ? await replaceCategoriesForFreshFamily(ctx.familyId, cats)
+        : await createCategoriesBulk({ family_id: ctx.familyId, categories: cats });
+      const verb = wantsReplace ? 'Заменено стандартных на' : 'Создано';
+      let reply = `🆕 ${verb} ${created.length} ${created.length === 1 ? 'категория' : 'категорий'}:\n`;
       for (const c of created) reply += `- ${c.emoji} ${c.name}\n`;
       if (skipped.length > 0) {
         reply += `\n⚠️ Пропущено ${skipped.length}:\n`;
@@ -1287,15 +1485,18 @@ export async function chat(
   userMessage: string,
   telegramId: number,
   userName: string,
-  chatId: number
+  chatId: number,
+  familyId: string,
 ): Promise<BotResponse> {
-  // Resolve family context ONCE per request — never fetched inside handlers.
-  // If this returns null, the user is not whitelisted anywhere and cannot act.
+  // Phase 2: family is resolved BEFORE this function via resolveFamilyForChat()
+  // in the bot handler. We still need the user's row for `userId` (audit trail
+  // — who logged the expense) but we do NOT use the user's `family_id` for
+  // scope. The chat's family is authoritative.
   const user = await getUserByTelegramId(telegramId);
   if (!user) return textOnly('⛔ Пользователь не найден в системе.');
 
   const ctx: FamilyCtx = {
-    familyId: user.family_id,
+    familyId,
     userId: user.id,
     userName,
     chatId,
@@ -1320,16 +1521,24 @@ export async function chat(
   // already removed). Keeping them there means this file never sees raw
   // slash-commands and can focus on natural-language / parsed intents.
 
-  // ── 0. First-run: family has no categories yet ──
-  // Families are created without default categories — user picks their own.
-  // Until at least one exists, expense parsing fails with "категория не найдена",
-  // so we intercept here and route EVERYTHING through Claude with category-
-  // creation as the primary action. Once ≥1 category exists this branch falls
-  // through and normal deterministic paths take over.
-  const familyCategoriesCheck = await getCategoriesForFamily(ctx.familyId).catch(() => []);
-  const isFirstRun = familyCategoriesCheck.length === 0;
+  // ── 0. Lazy-seed safety net ──
+  // Families are now seeded with default categories at creation time
+  // (createFamily calls seedDefaultCategoriesForFamily). But if seeding ever
+  // fails — old families predating the auto-seed change, transient DB error,
+  // race condition — categorize() would fail with "категория не найдена".
+  // Re-seed on the spot so the user never hits that error. Idempotent.
+  let familyCategoriesCheck = await getCategoriesForFamily(ctx.familyId).catch(() => []);
+  if (familyCategoriesCheck.length === 0) {
+    console.warn(`[chat] family ${ctx.familyId} has 0 categories — auto-seeding`);
+    await seedDefaultCategoriesForFamily(ctx.familyId).catch((e) => {
+      console.error('[chat] auto-seed failed:', e instanceof Error ? e.message : e);
+    });
+    // Refetch so the system prompt sees the freshly-seeded categories instead
+    // of falling back to "(категории ещё не созданы…)".
+    familyCategoriesCheck = await getCategoriesForFamily(ctx.familyId).catch(() => []);
+  }
 
-  // ── 1. Undo (deterministic) ──
+  // ── 1. Undo fast path (single keyword, zero ambiguity) ──
   if (isUndoRequest(text)) {
     const reply = await handleUndo(ctx);
     await saveUserMsg();
@@ -1337,53 +1546,26 @@ export async function chat(
     return textOnly(reply);
   }
 
-  // ── 2. Debt (deterministic) ──
-  const debt = tryParseDebt(text);
-  if (debt) {
-    const reply = await handleDebt(debt, ctx);
-    await saveUserMsg();
-    await saveAssistantMsg(reply);
-    return textOnly(reply);
-  }
-
-  // ── 3. Income (deterministic) ──
-  const income = tryParseIncome(text);
-  if (income) {
-    const reply = await handleIncome(income, ctx);
-    await saveUserMsg();
-    await saveAssistantMsg(reply);
-    return textOnly(reply);
-  }
-
-  // ── 4. Expenses (deterministic) ──
-  const expenses = tryParseExpenses(text);
-  if (expenses) {
-    // First-run guard: can't log an expense without any categories. Guide
-    // the user to set them up first instead of erroring on every line.
-    if (isFirstRun) {
-      const reply = firstRunWelcomeExpenseAttempt(expenses);
-      await saveUserMsg();
-      await saveAssistantMsg(reply);
-      return textOnly(reply);
-    }
-    const reply = await handleExpenses(expenses, ctx);
-    await saveUserMsg();
-    await saveAssistantMsg(reply);
-    return textOnly(reply);
-  }
-
-  // ── 5. Everything else → Sonnet (read + write tools) ──
-  //
-  // Philosophy: Sonnet 4.6 understands Russian phrasings + morphology much
-  // better than any regex we can write. "сколько потратили на агушу",
-  // "дай расходы на агушу", "hi how much did we spend on chips" — Sonnet
-  // extracts the keyword + intent and picks the right tool. We lost a
-  // whole evening trying to beat Sonnet with regex parsing; we won't do
-  // that again. The search tool itself handles Russian morphology via
-  // server-side stemming (see searchTransactionsByComment in queries.ts).
+  // ── 2. Conversation context ──
+  // Last assistant turn drives a hint Sonnet gets in the system prompt:
+  // "you just asked X — interpret the user's reply in that context." We
+  // no longer use it to gate parsers because we no longer have parsers.
   let history: { role: string; content: string }[] = [];
   try { history = await getRecentMessages(chatId, ctx.familyId, 10); } catch { /* */ }
 
+  // ── 3. Everything else → Sonnet (read + direct-write + propose-write) ──
+  // No more shape-matching parsers for log_expense/log_income/log_debt.
+  // Real bug from parser-first design (2026-05-01): "зафиксируй доход
+  // 1000000" matched the expense regex shape (<text> <amount>) and got
+  // logged as a 1M ₸ Развлечение expense, even though "доход" is the
+  // unambiguous income vocabulary marker any LLM picks up instantly.
+  // Re-ordering parsers is whack-a-mole; the right answer is to let the
+  // LLM do intent recognition (which it does well) and rely on the
+  // hallucination guard at the bottom of this function for the
+  // "Sonnet skipped the tool" failure mode.
+  //
+  // Kept up-stack: isUndoRequest (single keyword, can't misclassify),
+  // isMeaningfulInput (short-circuits "?", "...", "hmm" before LLM cost).
   const messages: Anthropic.MessageParam[] = [];
   for (const msg of history) {
     if (messages.length === 0 && msg.role === 'assistant') continue;
@@ -1404,6 +1586,14 @@ export async function chat(
   // no text), we fall back to sending the tool output directly instead of
   // saying "Не понял".
   let lastReadResult: string | null = null;
+  // Last direct-write tool's formatted reply. Sonnet has a tendency to
+  // paraphrase tool results on the next turn, dropping details like the
+  // "осталось X из Y" limit info appended by handleExpenses. Real bug
+  // (2026-04-30): user logged "кофе 1000" with a 100k Fun limit; tool
+  // returned "✅ Fun — 1 000 ₸ (кофе) · осталось 97 000 ₸ из 100 000 ₸"
+  // but Sonnet's text output was "✅ 🎉 Fun — 1 000 ₸ (кофе)" — limit
+  // info gone. We force this to win over Sonnet's text after the loop.
+  let directWriteReply: string | null = null;
   // If a write tool is proposed, we exit the loop early with a keyboard reply
   // so the user can tap Да/Отмена. Claude's own natural-language response for
   // that turn is discarded in favor of our structured confirm message.
@@ -1423,8 +1613,8 @@ export async function chat(
     const response = await client.messages.create({
       model: MODEL,
       max_tokens: 1024,
-      system: buildSystemPrompt(isFirstRun),
-      tools: [...READ_TOOLS, ...WRITE_TOOLS],
+      system: buildSystemPrompt(familyCategoriesCheck),
+      tools: [...READ_TOOLS, ...DIRECT_WRITE_TOOLS, ...WRITE_TOOLS],
       messages,
     });
 
@@ -1461,6 +1651,33 @@ export async function chat(
           continue;
         }
         break;
+      }
+
+      // DIRECT WRITE tool → execute immediately, return formatted reply built
+      // from the DB row. Sonnet typically echoes the tool result verbatim, but
+      // even if it goes silent we have lastReadResult fallback. Hallucinated
+      // success is impossible because the formatter only renders text when
+      // an insert actually returned a row (reply-from-result discipline).
+      if (DIRECT_WRITE_TOOL_NAMES.has(toolName)) {
+        try {
+          const tStart = Date.now();
+          const result = await executeDirectWriteTool(toolName, input, ctx);
+          console.error(`[chat] direct-write ${toolName} took ${Date.now() - tStart}ms, ${result.length}b`);
+          toolResults.push({ tool_use_id: block.id, content: result });
+          lastReadResult = result;
+          // Stash so we can override Sonnet's paraphrased text after the loop —
+          // tool result is the authoritative reply (handleExpenses includes
+          // limit info + month summary + goal progress; Sonnet often drops bits).
+          directWriteReply = result;
+        } catch (e) {
+          const errMsg = e instanceof Error ? e.message : String(e);
+          console.warn(`[chat] direct-write ${toolName} threw:`, errMsg);
+          toolResults.push({
+            tool_use_id: block.id,
+            content: `ERROR: ${errMsg}. Не записано. Объясни пользователю что не так и попроси переформулировать.`,
+          });
+        }
+        continue;
       }
 
       // READ tool → execute + feed result back to Claude. Wrap in try/catch
@@ -1500,6 +1717,17 @@ export async function chat(
     return confirmResponse;
   }
 
+  // If a direct-write tool ran successfully, its result is the canonical
+  // reply (formatted from DB row, includes limit info + summary + goal
+  // progress). Sonnet's text typically paraphrases it and drops details —
+  // override with the tool result.
+  if (directWriteReply) {
+    if (finalReply && finalReply !== directWriteReply) {
+      console.error(`[chat] overriding Sonnet paraphrase with direct-write result (Sonnet: ${finalReply.length}b → tool: ${directWriteReply.length}b)`);
+    }
+    finalReply = directWriteReply;
+  }
+
   // If Sonnet produced no text but DID execute a read tool, ship the tool's
   // output directly. Read-tool outputs are designed to be user-ready, so this
   // is strictly better than "Не понял" when the user asked for information
@@ -1514,6 +1742,72 @@ export async function chat(
     console.error('[chat] empty finalReply after loop — falling back to "не понял"');
     finalReply = '🤔 Не понял. Попробуй переформулировать — например: "сколько на X?" или "покажи последние 10 трат".';
   }
+
+  // ── Hallucination guard + parser recovery ──
+  // If no direct-write tool ran but Sonnet's reply looks like a successful
+  // log ("✅ ... NNN ₸ ..."), it's a fabricated confirmation. Real bug
+  // (2026-05-01): user typed "кофе 1000" amid conversational confusion,
+  // Sonnet pattern-matched the previous "✅ Fun — 1 000 ₸ (кофе)" reply in
+  // history and produced an identical-looking text without calling any
+  // tool. Nothing was written; user thought it was.
+  //
+  // Recovery: deterministic parsers run as a SAFETY NET (not preemption —
+  // Sonnet always gets first chance above). Order matters: income → debt
+  // → expense, because expense regex matches everything shape-perfect and
+  // would steal "зарплата 500000" if it ran first.
+  // Patterns that indicate Sonnet THINKS a write happened. Each matches a
+  // real handler-reply format. Two real bugs both caught here:
+  //   - 2026-05-01a: "🤝 Долг записан: 100 000 ₸ (у Аидара)" without log_debt
+  //   - 2026-05-01b: "✅ Записано 3 траты:" without log_expense (multi-line)
+  // Russian has both active ("записал") and passive ("записан") past forms;
+  // earlier regex caught only active. Match both via [лн] inside the stem.
+  const looksLikeFakeConfirmation = !directWriteReply && (
+    /^\s*✅[^\n]*\d[\d\s]*\s*₸/m.test(finalReply) ||      // expense: "✅ Cat — N ₸"
+    /💰\s*Доход\s+записан/i.test(finalReply) ||            // income: handleIncome's exact prefix
+    /🤝\s*Долг\s+записан/i.test(finalReply) ||             // debt:   handleDebt's exact prefix
+    /(записа[лн][аоыи]?|сохран(?:ил|ен)[аоыи]?|зафиксирова(?:л|н)[аоыи]?)\s*[:.]?\s*\d/i.test(finalReply)
+  );
+  if (looksLikeFakeConfirmation) {
+    console.error('[chat] hallucination detected — Sonnet returned a "записал" reply without tool; trying parser recovery');
+    let recovered = false;
+
+    const incomeParse = tryParseIncome(text);
+    if (incomeParse) {
+      console.warn('[chat] parser recovery: log_income');
+      finalReply = await handleIncome(incomeParse, ctx);
+      recovered = true;
+    }
+
+    if (!recovered) {
+      const debtParse = tryParseDebt(text);
+      if (debtParse) {
+        console.warn('[chat] parser recovery: log_debt');
+        finalReply = await handleDebt(debtParse, ctx);
+        recovered = true;
+      }
+    }
+
+    if (!recovered) {
+      const expenseParse = tryParseExpenses(text);
+      if (expenseParse) {
+        console.warn('[chat] parser recovery: log_expense');
+        finalReply = await handleExpenses(expenseParse, ctx);
+        recovered = true;
+      }
+    }
+
+    if (!recovered) {
+      // Sonnet hallucinated AND parsers can't make sense of the input —
+      // honest error is the only safe choice.
+      await captureError(new Error('hallucinated_confirmation'), {
+        source: 'chat:hallucination_guard',
+        userTgId: telegramId,
+        context: { user_message: text.slice(0, 200), sonnet_reply: finalReply.slice(0, 400) },
+      }).catch(() => { /* */ });
+      finalReply = '🤔 Не получилось разобрать формат. Напиши проще, например: «кофе 500» или «такси 2500».';
+    }
+  }
+
   await saveAssistantMsg(finalReply);
   return textOnly(finalReply);
 }
@@ -1535,12 +1829,15 @@ export async function handleCallback(
   telegramId: number,
   userName: string,
   chatId: number,
+  familyId: string,
 ): Promise<BotResponse> {
+  // Phase 2: same shift as chat() — caller resolves family from the chat,
+  // we only look up the user for the audit trail.
   const user = await getUserByTelegramId(telegramId);
   if (!user) return textOnly('⛔ Пользователь не найден.');
 
   const ctx: FamilyCtx = {
-    familyId: user.family_id,
+    familyId,
     userId: user.id,
     userName,
     chatId,

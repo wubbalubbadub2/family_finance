@@ -6,8 +6,47 @@ import {
   getUserByTelegramId,
   createFamily,
   createFamilyInvite,
+  getCategoriesForFamily,
+  resolveFamilyForChat,
+  getOrCreateUserInFamily,
+  getFamilyById,
 } from '@/lib/db/queries';
 import { captureError } from '@/lib/observability';
+import type { Category } from '@/types';
+
+/**
+ * Single source of truth for the welcome message. Used by both:
+ *   - handleInviteArrival (brand new user just consumed an invite)
+ *   - bare /start (existing user re-greeting)
+ *
+ * Shows the family's CURRENT categories (not hardcoded defaults) so an
+ * existing user who has customized sees their real setup, and a fresh
+ * user sees the auto-seeded universal defaults.
+ */
+function buildWelcomeText(name: string, categories: Category[]): string {
+  const catList = categories.length > 0
+    ? categories.map((c) => `${c.emoji} ${c.name}`).join(' · ')
+    : '(пока нет — создадутся автоматически на первой трате)';
+
+  return (
+    `👋 Привет, ${name}!\n\n` +
+    `Я веду семейный бюджет — пиши траты обычным текстом, я разберусь сам.\n\n` +
+    `📋 Сейчас у тебя такие категории:\n${catList}\n\n` +
+    `Хочешь свои? Напиши, например:\n` +
+    `«создай категории: Продукты, Бензин, Рестораны, Хобби»\n` +
+    `Можно добавлять, переименовывать, удалять в любой момент. ` +
+    `При удалении категории её траты переедут в Разное.\n\n` +
+    `Что попробовать:\n` +
+    `• кофе 500 — записать трату\n` +
+    `• зарплата 500 000 — записать доход\n` +
+    `• взял в долг 100 000 у Аидара — записать долг\n` +
+    `• поставь лимит 80 000 на Продукты — план на категорию\n` +
+    `• сколько на кофе? — поиск\n` +
+    `• итоги месяца — общая сводка\n` +
+    `• хочу накопить 1 000 000 к декабрю — поставить цель\n\n` +
+    `Просто начни писать.`
+  );
+}
 
 // NOTE: we removed ALLOWED_TELEGRAM_IDS. Allowlist is the `users` table now.
 // Anyone can DM the bot — if they're not in the table, they get a welcome
@@ -105,33 +144,16 @@ async function handleNewFamilyCommand(
     // which legacy Markdown treats as italic markers — they get eaten and the
     // link breaks. Plain text preserves the URL verbatim and Telegram still
     // auto-links it client-side.
+    // Phase 2: clearer message that explains the full flow — admin creates
+    // the family, customer taps the link to register, and after that they
+    // can add the bot to a Telegram group to share with the rest of the
+    // household. No /invite step needed.
     await ctx.reply(
       `✅ Создал семью "${name.trim()}".\n\n` +
-      `📎 Ссылка-приглашение (14 дней, одноразовая):\n${link}\n\n` +
-      `Перешли её первому члену семьи. Когда они кликнут — их аккаунт добавится автоматически.`,
-    );
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    await ctx.reply(`❌ ${msg}`);
-  }
-}
-
-/**
- * Admin command: generate an invite link for the CALLER's own family.
- * Adds a new member (spouse, kid, etc.) to the existing family.
- */
-async function handleInviteCommand(ctx: Context, callerFamilyId: string, callerUserId: string): Promise<void> {
-  try {
-    const invite = await createFamilyInvite({
-      family_id: callerFamilyId,
-      created_by_user_id: callerUserId,
-      uses: 1,
-      expires_in_days: 14,
-    });
-    const link = await buildInviteLink(ctx, invite.code);
-    await ctx.reply(
-      `📎 Ссылка для приглашения в твою семью (14 дней, одноразовая):\n${link}\n\n` +
-      `Перешли тому, кого хочешь добавить. Они кликнут и автоматически присоединятся.`,
+      `📎 Перешли клиенту эту ссылку (14 дней, одноразовая):\n${link}\n\n` +
+      `Когда они кликнут — они станут первым членом семьи. ` +
+      `Дальше они могут писать боту в личке ИЛИ добавить бота в свою семейную Telegram-группу — ` +
+      `всё попадёт в один и тот же бюджет.`,
     );
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -156,18 +178,13 @@ async function handleInviteArrival(ctx: Context, code: string): Promise<void> {
     return;
   }
 
-  // Success — brand new user (or idempotent re-tap)
-  await ctx.reply(
-    `👋 Привет, ${name}! Ты теперь в семейном боте.\n\n` +
-    '**Первый шаг** — создай свои категории расходов. Напиши, например:\n\n' +
-    '*"создай категории: Продукты 🛒, Транспорт 🚗, Кафе ☕, Жильё 🏠, Личное 🎯, Прочее 🎲"*\n\n' +
-    'Бот предложит создать их все одной кнопкой ✅ Да.\n\n' +
-    'После этого записывай траты: `кофе 500`, `такси 2500`, и т.д.',
-    { parse_mode: 'Markdown' },
-  ).catch(async () => {
-    // Fall back to plain if Markdown parse fails
-    await ctx.reply(`👋 Привет, ${name}! Ты теперь в семейном боте. Напиши "создай категории: Продукты 🛒, Транспорт 🚗, Кафе ☕" чтобы начать.`);
-  });
+  // Success — brand new user (or idempotent re-tap).
+  // Fetch the family's actual categories so the welcome reflects whatever was
+  // auto-seeded at family creation (or whatever the user has since customized).
+  const cats = await getCategoriesForFamily(result.familyId).catch(() => [] as Category[]);
+  // No parse_mode: bot username + Russian text would trip the legacy Markdown
+  // underscore-as-italic bug. Plain text is the most robust render path.
+  await ctx.reply(buildWelcomeText(name, cats));
 }
 
 export function createBot(): Bot {
@@ -184,24 +201,35 @@ export function createBot(): Bot {
     const rawText = ctx.message.text.trim();
     if (!rawText) return;
 
+    // Phase 2: chat-based scope. The chat (DM or group) decides which family
+    // these messages write to. We resolve the chat AFTER handling onboarding
+    // paths (invite arrival, bare /start) because those create the user row
+    // that the auto-link path depends on.
+    const chatType = ctx.chat.type;  // 'private' | 'group' | 'supergroup' | 'channel'
+    const isPrivate = chatType === 'private';
+    const isGroup = chatType === 'group' || chatType === 'supergroup';
+
     try {
-      // Path 1: invite deep-link — anyone can submit, no prior registration needed
+      // Path 1: invite deep-link — only valid in private chat (Telegram only
+      // delivers /start with a payload via the deep-link click, which always
+      // opens a DM). Anyone can submit; no prior registration needed.
       const inviteCode = parseInvitePayload(rawText);
       if (inviteCode) {
+        if (!isPrivate) return;  // ignore in groups — not a real flow
         await handleInviteArrival(ctx, inviteCode);
         return;
       }
 
-      // Path 2: bare /start — welcome message for existing users,
-      // or "ask for invite" for strangers
-      if (/^\/start(@\w+)?$/i.test(rawText)) {
+      // Path 2: bare /start in DM — welcome for existing users, or invite gate.
+      // In groups Telegram lets users type /start@bot but we don't treat it as
+      // anything special; let it fall through to the normal flow.
+      if (isPrivate && /^\/start(@\w+)?$/i.test(rawText)) {
         const existing = await getUserByTelegramId(telegramId);
         if (existing) {
-          await ctx.reply(
-            `👋 Привет, ${existing.name}! Записывай траты обычным текстом: *кофе 500*, ` +
-            `или спрашивай: *сколько на чипсы?* · *покажи последние 10 трат*.`,
-            { parse_mode: 'Markdown' },
-          ).catch(() => ctx.reply(`👋 Привет, ${existing.name}!`));
+          // Same welcome shape as handleInviteArrival, with the user's CURRENT
+          // categories (which may differ from defaults if they've customized).
+          const cats = await getCategoriesForFamily(existing.family_id).catch(() => [] as Category[]);
+          await ctx.reply(buildWelcomeText(existing.name, cats));
         } else {
           await ctx.reply(
             '👋 Этот бот работает по приглашению.\n' +
@@ -211,26 +239,86 @@ export function createBot(): Bot {
         return;
       }
 
-      // Path 3: unknown users get a polite gate
-      const user = await getUserByTelegramId(telegramId);
-      if (!user) {
-        await ctx.reply(
-          '👋 Этот бот работает только по приглашению.\n' +
-          'Попроси у админа семьи ссылку-приглашение.',
-        );
+      // Path 3: chat-based family resolution. This is the new central gate.
+      //   - Existing chat → returns the linked family
+      //   - DM from a registered user that hasn't been linked yet → auto-links
+      //   - Group with a registered family member sending the first message
+      //     → auto-links the group to their family
+      //   - Anyone unregistered → 'unregistered_sender' error
+      const resolved = await resolveFamilyForChat({
+        chatId: ctx.chat.id,
+        telegramId,
+        chatType: chatType as 'private' | 'group' | 'supergroup' | 'channel',
+      });
+
+      if ('error' in resolved) {
+        if (resolved.error === 'unregistered_sender') {
+          // In DM: show the polite invite gate (existing behaviour).
+          // In a group: silently ignore — strangers might be in the group with
+          // the bot via a member who already left, and we don't want to spam
+          // the group with "you need an invite" on every message.
+          if (isPrivate) {
+            await ctx.reply(
+              '👋 Этот бот работает только по приглашению.\n' +
+              'Попроси у админа семьи ссылку-приглашение.',
+            );
+          }
+          return;
+        }
+        // Other errors (DB failure inserting the link, etc.) — log + bail
+        // quietly in groups; surface in DM so the user knows something broke.
+        await captureError(new Error(resolved.error), {
+          source: 'webhook:resolveFamilyForChat',
+          userTgId: telegramId,
+          context: { chat_id: ctx.chat.id, chat_type: chatType },
+        });
+        if (isPrivate) await ctx.reply(`😔 ${resolved.error}`);
         return;
       }
 
-      // Path 3.5: admin slash commands that can't survive the clean-text strip.
-      // These must be handled with the RAW text because the stripping logic
-      // below removes the leading /command from what chat() ultimately sees.
-      const newFamMatch = rawText.match(/^\/newfamily(?:@\w+)?(?:\s+(.+?))?\s*$/i);
-      if (newFamMatch) {
-        await handleNewFamilyCommand(ctx, newFamMatch[1] ?? null, user.id);
+      const { familyId, firstTimeInChat } = resolved;
+
+      // First-time group link: confirm to the group so members know it's
+      // wired up. We deliberately DON'T do this in DM because the welcome
+      // message from handleInviteArrival already explains things, and a
+      // backfilled DM (existing user pre-Phase 2) shouldn't suddenly get
+      // a "linked!" message out of nowhere.
+      if (firstTimeInChat && isGroup) {
+        const fam = await getFamilyById(familyId).catch(() => null);
+        const famName = fam?.name ?? 'вашей семьёй';
+        await ctx.reply(
+          `🔗 Связал эту группу с семьёй "${famName}". ` +
+          `Любой участник может писать траты — всё попадёт в один и тот же бюджет.`,
+        ).catch(() => { /* group might restrict bot replies — ignore */ });
+        // Fall through and process the message itself too; the user might
+        // already be writing "кофе 500" expecting the bot to log it.
+      }
+
+      // We need the user row for transaction audit (logged_by). Per the doc's
+      // group security stance, anyone writing in a bound group is authorized
+      // to log into that family — auto-register them on first sight rather
+      // than silently ignoring (real bug 2026-05-01: bot ignored every group
+      // member except the original linker).
+      // In DMs the chat link IS the user record, so this just looks them up;
+      // in groups it auto-creates a user row when a new member first chats.
+      const senderName = ctx.from?.first_name || 'User';
+      const userResult = await getOrCreateUserInFamily(telegramId, familyId, senderName);
+      if ('error' in userResult) {
+        if (isPrivate) {
+          await ctx.reply(`😔 ${userResult.error}`);
+        }
         return;
       }
-      if (/^\/invite(?:@\w+)?\s*$/i.test(rawText)) {
-        await handleInviteCommand(ctx, user.family_id, user.id);
+      const user = { id: userResult.id, family_id: userResult.family_id, name: senderName };
+
+      // Path 3.5: admin slash commands. These must be handled with the RAW
+      // text because the clean-text strip below removes the leading /command.
+      // /newfamily is the only admin command in Phase 2 — /invite was removed
+      // because adding the bot to a group is the new way to share access.
+      const newFamMatch = rawText.match(/^\/newfamily(?:@\w+)?(?:\s+(.+?))?\s*$/i);
+      if (newFamMatch) {
+        // Only the caller's identity matters — chat resolution above is fine.
+        await handleNewFamilyCommand(ctx, newFamMatch[1] ?? null, user.id);
         return;
       }
 
@@ -241,9 +329,9 @@ export function createBot(): Bot {
         .trim();
       if (!cleanText) return;
 
-      await ctx.replyWithChatAction('typing');
+      await ctx.replyWithChatAction('typing').catch(() => { /* groups can disallow */ });
       const userName = ctx.from?.first_name || user.name || 'User';
-      const response = await chat(cleanText, telegramId, userName, ctx.chat.id);
+      const response = await chat(cleanText, telegramId, userName, ctx.chat.id, familyId);
       await sendChunked(ctx, response);
     } catch (error) {
       const errMsg = error instanceof Error ? error.message : String(error);
@@ -252,7 +340,11 @@ export function createBot(): Bot {
         userTgId: telegramId,
         context: { text: rawText.slice(0, 200), chat_type: ctx.chat?.type },
       });
-      await ctx.reply(`😔 Ошибка: ${errMsg.slice(0, 200)}`);
+      // In groups, swallow user-facing error noise to avoid spamming the group
+      // when something internal breaks. The error is captured server-side.
+      if (isPrivate) {
+        await ctx.reply(`😔 Ошибка: ${errMsg.slice(0, 200)}`);
+      }
     }
   });
 
@@ -264,17 +356,33 @@ export function createBot(): Bot {
       return;
     }
 
-    // Unknown users can't have pending confirmations, so fail fast
-    const user = await getUserByTelegramId(telegramId);
-    if (!user) {
+    // Phase 2: scope by the chat the keyboard lives in. The user might tap
+    // a confirm button from a group's expense proposal; that confirm needs
+    // to write to the group's linked family, not the user's personal family.
+    const resolved = await resolveFamilyForChat({
+      chatId: ctx.chat.id,
+      telegramId,
+      chatType: ctx.chat.type as 'private' | 'group' | 'supergroup' | 'channel',
+    });
+    if ('error' in resolved) {
+      await ctx.answerCallbackQuery({ text: '⛔ Требуется приглашение' });
+      return;
+    }
+    const { familyId } = resolved;
+
+    // Auto-register the tapper if they're a new group member (same logic
+    // as the message handler — chat_id is the trust boundary).
+    const senderName = ctx.from?.first_name || 'User';
+    const userResult = await getOrCreateUserInFamily(telegramId, familyId, senderName);
+    if ('error' in userResult) {
       await ctx.answerCallbackQuery({ text: '⛔ Требуется приглашение' });
       return;
     }
 
     const data = ctx.callbackQuery.data;
     try {
-      const userName = ctx.from?.first_name || user.name || 'User';
-      const response = await handleCallback(data, telegramId, userName, ctx.chat.id);
+      const userName = senderName;
+      const response = await handleCallback(data, telegramId, userName, ctx.chat.id, familyId);
 
       await ctx.answerCallbackQuery();
       try { await ctx.editMessageReplyMarkup({ reply_markup: undefined }); } catch { /* too old */ }
@@ -288,6 +396,45 @@ export function createBot(): Bot {
       });
       try { await ctx.answerCallbackQuery({ text: '😔 Ошибка' }); } catch { /* already answered */ }
       await ctx.reply(`😔 Ошибка: ${errMsg.slice(0, 200)}`);
+    }
+  });
+
+  // ── my_chat_member: bot was added/removed from a chat ──
+  // We don't auto-link here (we still need a registered family member to
+  // send the first message — that's the canonical "claim this group for
+  // family X" signal). But we log the events so we have visibility into
+  // when groups appear/disappear, and we send a friendly nudge when the
+  // bot is added to a group so members know what to do next.
+  bot.on('my_chat_member', async (ctx) => {
+    try {
+      const update = ctx.myChatMember;
+      const newStatus = update.new_chat_member.status;
+      const oldStatus = update.old_chat_member.status;
+      const chatType = ctx.chat.type;
+
+      // Bot was just added to a group (status went from left/kicked → member/admin).
+      const wasAbsent = oldStatus === 'left' || oldStatus === 'kicked';
+      const nowPresent = newStatus === 'member' || newStatus === 'administrator';
+      if (wasAbsent && nowPresent && (chatType === 'group' || chatType === 'supergroup')) {
+        await ctx.reply(
+          '👋 Привет! Я веду семейный бюджет.\n' +
+          'Любой зарегистрированный член семьи может написать сюда первое сообщение — ' +
+          'и я свяжу эту группу с вашим бюджетом. После этого все участники смогут писать траты.',
+        ).catch(() => { /* might lack send permissions until promoted */ });
+      }
+
+      // Bot was kicked/removed — capture for visibility (no DB cleanup;
+      // family_chats row stays so re-add Just Works).
+      const wasPresent = oldStatus === 'member' || oldStatus === 'administrator';
+      const nowAbsent = newStatus === 'left' || newStatus === 'kicked';
+      if (wasPresent && nowAbsent) {
+        await captureError(new Error('bot removed from chat'), {
+          source: 'webhook:my_chat_member:removed',
+          context: { chat_id: ctx.chat.id, chat_type: chatType, by_user: ctx.from?.id ?? null },
+        });
+      }
+    } catch (error) {
+      await captureError(error, { source: 'webhook:my_chat_member' });
     }
   });
 

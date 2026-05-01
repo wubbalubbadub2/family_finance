@@ -48,6 +48,123 @@ export async function getUsersInFamily(familyId: string): Promise<UserWithFamily
   return data ?? [];
 }
 
+// ── Family chats (Phase 2: chat-based family scope) ──
+
+export interface FamilyChatLink {
+  chat_id: number;
+  family_id: string;
+  chat_type: string;
+  linked_at: string;
+  linked_by_user_id: string | null;
+}
+
+/**
+ * Resolve the family scope for an incoming Telegram chat.
+ *
+ * Phase 2 swap: instead of `getUserByTelegramId().family_id` we ask "which
+ * family does THIS CHAT belong to?". A user can DM the bot AND be in a
+ * family group; both must write to the same family ledger, so the chat is
+ * the canonical scope, not the user.
+ *
+ * Returns `{ familyId, firstTimeInChat }` if the chat resolves OR can be
+ * auto-linked via the message sender. Returns `{ error }` otherwise.
+ *
+ * The auto-link path is critical for two flows:
+ *   1. New user registers via /start invite_X — handleInviteArrival creates
+ *      the user row, then their first non-/start message hits this function
+ *      which auto-links the DM (chat_id = telegram_id) to their family.
+ *      (The 012 migration backfills DM links for users that existed before
+ *      Phase 2; new users rely on this auto-link path.)
+ *   2. Existing registered user adds bot to a Telegram group — the first
+ *      message in the group from any registered family member auto-links
+ *      the group to that user's family.
+ */
+/**
+ * Find or create a user record for `telegramId` inside `familyId`. Used by the
+ * group-routing path: when a non-Shynggys family member writes in a bound
+ * group, the chat is already scoped to the family but the sender has no user
+ * row yet. Per the doc's group security stance ("trust boundary is the group
+ * itself, established at bind time"), anyone in the bound group is authorized
+ * to log. Auto-create their user row so we have a real id for transaction
+ * attribution (logged_by).
+ *
+ * Idempotent: if the telegram_id already exists with the same family, returns
+ * it. If it exists with a DIFFERENT family, refuses (cross-family write would
+ * leak). If it doesn't exist, inserts.
+ */
+export async function getOrCreateUserInFamily(
+  telegramId: number,
+  familyId: string,
+  name: string,
+): Promise<{ id: string; family_id: string } | { error: string }> {
+  const existing = await getUserByTelegramId(telegramId);
+  if (existing) {
+    if (existing.family_id !== familyId) {
+      return { error: `User already linked to a different family.` };
+    }
+    return { id: existing.id, family_id: existing.family_id };
+  }
+  const { data, error } = await supabase
+    .from('users')
+    .insert({ telegram_id: telegramId, name: name || 'User', family_id: familyId })
+    .select('id, family_id')
+    .single();
+  if (error || !data) return { error: `Не удалось зарегистрировать: ${error?.message}` };
+  return { id: data.id, family_id: data.family_id };
+}
+
+export async function resolveFamilyForChat(args: {
+  chatId: number;
+  telegramId: number;
+  chatType: 'private' | 'group' | 'supergroup' | 'channel';
+}): Promise<{ familyId: string; firstTimeInChat: boolean } | { error: string }> {
+  // 1. Existing chat link?
+  const { data: existing } = await supabase
+    .from('family_chats')
+    .select('*')
+    .eq('chat_id', args.chatId)
+    .maybeSingle();
+  if (existing) {
+    return { familyId: existing.family_id, firstTimeInChat: false };
+  }
+
+  // 2. First time bot sees this chat. Try to auto-link via the message sender.
+  //    If the sender is a registered family member, this chat becomes scoped
+  //    to their family. If not, refuse — only paying customers can drive scope.
+  const sender = await getUserByTelegramId(args.telegramId);
+  if (!sender) {
+    return { error: 'unregistered_sender' };
+  }
+
+  // 3. Insert the link. We accept any chat_type the caller passes. The
+  //    'channel' case is included in the type but in practice the bot is
+  //    only added to private/group/supergroup; if Telegram ever delivers a
+  //    channel update, we link it the same way and let the caller decide
+  //    what to do with the firstTimeInChat flag.
+  const { error: linkErr } = await supabase
+    .from('family_chats')
+    .insert({
+      chat_id: args.chatId,
+      family_id: sender.family_id,
+      chat_type: args.chatType,
+      linked_by_user_id: sender.id,
+    });
+  // Race-safe: if a concurrent insert won, treat as success and re-resolve.
+  if (linkErr) {
+    if (/duplicate|conflict/i.test(linkErr.message)) {
+      const { data: raced } = await supabase
+        .from('family_chats')
+        .select('*')
+        .eq('chat_id', args.chatId)
+        .maybeSingle();
+      if (raced) return { familyId: raced.family_id, firstTimeInChat: false };
+    }
+    return { error: `Не удалось связать чат: ${linkErr.message}` };
+  }
+
+  return { familyId: sender.family_id, firstTimeInChat: true };
+}
+
 // ── Families ──
 
 export interface Family {
@@ -310,6 +427,62 @@ export async function seedDefaultCategoriesForFamily(familyId: string): Promise<
  *   "Чипсы/снеки" → "чипсы_снеки"
  *   "Mom's gift"  → "mom_s_gift"
  */
+/**
+ * Count of (non-soft-deleted) transactions in a family. Used to detect
+ * "fresh setup" state — family was just created, hasn't logged anything yet.
+ * In that state, "create categories X, Y, Z" is interpreted as REPLACE the
+ * auto-seeded defaults rather than APPEND, matching the welcome message's
+ * implication.
+ */
+export async function countActiveTransactions(familyId: string): Promise<number> {
+  const { count } = await supabase
+    .from('transactions')
+    .select('id', { count: 'exact', head: true })
+    .eq('family_id', familyId)
+    .is('deleted_at', null);
+  return count ?? 0;
+}
+
+/**
+ * Replace the family's current categories with a brand-new set. Only safe
+ * when the family has zero transactions (fresh setup) — otherwise we'd
+ * orphan transactions or have to invent reassignment targets.
+ *
+ * Soft-deletes all currently-active categories, removes any monthly_plans
+ * pointing at them, then creates the new ones via createCategoriesBulk.
+ */
+export async function replaceCategoriesForFreshFamily(
+  familyId: string,
+  newCategories: { name: string; emoji: string }[],
+): Promise<{ created: Category[]; skipped: { slug: string; reason: string }[] }> {
+  const txnCount = await countActiveTransactions(familyId);
+  if (txnCount > 0) {
+    throw new Error(
+      'Семья уже логировала траты — заменить стандартные нельзя. Создаются как дополнительные.',
+    );
+  }
+
+  // Drop monthly_plans (cascade-safe even if 0 rows)
+  const existing = await getAllCategoriesForFamily(familyId);
+  const existingIds = existing.map((c) => c.id);
+  if (existingIds.length > 0) {
+    await supabase
+      .from('monthly_plans')
+      .delete()
+      .eq('family_id', familyId)
+      .in('category_id', existingIds);
+
+    // Soft-delete all categories — we keep the rows for audit, just flip is_active
+    await supabase
+      .from('categories')
+      .update({ is_active: false })
+      .eq('family_id', familyId)
+      .eq('is_active', true);
+  }
+
+  return await createCategoriesBulk({ family_id: familyId, categories: newCategories });
+}
+
 function slugifyForCategory(name: string): string {
   return name
     .trim()
@@ -937,6 +1110,16 @@ export async function createFamily(name: string, primaryChatId?: number): Promis
     .select('id')
     .single();
   if (error || !data) throw new Error(`Не удалось создать семью: ${error?.message ?? 'no data'}`);
+
+  // Auto-seed default categories so the family's first expense lands somewhere.
+  // The "create categories before you can log anything" friction was the textbook
+  // onboarding mistake — paying users shouldn't have to do setup work to start.
+  // Idempotent (ON CONFLICT DO NOTHING in the SQL fn) — safe to call repeatedly.
+  // Non-fatal: if seeding fails for any reason, agent.ts has a lazy-seed fallback.
+  await seedDefaultCategoriesForFamily(data.id).catch((e) => {
+    console.error('[createFamily] seed failed for', data.id, e instanceof Error ? e.message : e);
+  });
+
   return data.id;
 }
 

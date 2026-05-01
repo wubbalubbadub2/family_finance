@@ -86,6 +86,32 @@ export function isUndoRequest(text: string): boolean {
   return /удали|отмени|undo|убери последн|верни назад|отмена/i.test(text);
 }
 
+// Intents the deterministic parsers must NOT swallow as expenses. These read
+// like "<verb-phrase> <number>" and trivially match tryParseExpenses, so without
+// this short-circuit Sonnet never sees them.
+//
+// Real prod incident (2026-04-29, dev test): "поставь лимит на продукты 100000"
+// got logged as a 100 000 ₸ expense in the Продукты category. The user wanted
+// propose_set_monthly_plan, not an expense.
+//
+// Keep this list narrow — false positives here mean a real expense gets routed
+// to the LLM (slow, costs tokens) instead of being recorded directly.
+//
+// NOTE: do NOT use \b boundary anchors around Cyrillic words — JS regex treats
+// Cyrillic letters as non-word chars, so \b matches BETWEEN them. We use \s
+// or end-of-string anchors instead.
+export function looksLikeNonExpenseIntent(text: string): boolean {
+  return /^\s*(поставь|установи|сделай|задай)\s+лимит(\s|$)/i.test(text)
+    || /^\s*лимит\s+на(\s|$)/i.test(text)
+    || /^\s*(установи|задай|сделай|поставь)\s+(план|бюджет)(\s|$)/i.test(text)
+    || /^\s*(создай|добавь|сделай|заведи)\s+(категор|цел)/i.test(text)
+    || /^\s*(переименуй|удали|объедини)\s+категор/i.test(text)
+    || /^\s*переклассифицируй(\s|$)/i.test(text)
+    || /^\s*(поменяй|измени|перенеси|перемести)\s.*катего[рp]/i.test(text)
+    || /^\s*(хочу\s+)?(накопить|накоплю)(\s|$)/i.test(text)
+    || /^\s*(покажи|дай|выведи|сколько|где|какие|какой|какая)(\s|\?|$)/i.test(text);
+}
+
 /**
  * Has the user actually said anything meaningful, or is this just punctuation?
  *
@@ -95,8 +121,18 @@ export function isUndoRequest(text: string): boolean {
  * lone "?" in a group chat got back "Похоже, вы написали 'автобус 110'..."
  * referencing a transaction from 30min earlier. We short-circuit these
  * before they reach the LLM and ask the user to be more specific instead.
+ *
+ * Exception: short confirmation words ("да", "нет", "ok", "yes", "no") are
+ * legitimate replies to a bot question. Real prod incident (2026-04-29):
+ * bot offered to move a transaction, user said "да", short-circuit triggered
+ * and the user's confirmation was lost. These pass through to Sonnet which
+ * can use conversation history to interpret them in context.
  */
+const ALWAYS_MEANINGFUL = /^(да|нет|ок|ok|yes|no|yep|nope|sure|конечно|нет\s*спасибо|давай|погнали|ага|угу|sure|готово|done|yep|cancel|отмена)\W*$/i;
+
 export function isMeaningfulInput(text: string): boolean {
-  const meaningfulChars = text.replace(/[\s?!.,;:()\[\]{}<>—–-]/g, '');
+  const trimmed = text.trim();
+  if (ALWAYS_MEANINGFUL.test(trimmed)) return true;
+  const meaningfulChars = trimmed.replace(/[\s?!.,;:()\[\]{}<>—–-]/g, '');
   return meaningfulChars.length >= 3;
 }
