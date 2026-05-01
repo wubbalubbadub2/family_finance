@@ -79,6 +79,40 @@ export interface FamilyChatLink {
  *      message in the group from any registered family member auto-links
  *      the group to that user's family.
  */
+/**
+ * Find or create a user record for `telegramId` inside `familyId`. Used by the
+ * group-routing path: when a non-Shynggys family member writes in a bound
+ * group, the chat is already scoped to the family but the sender has no user
+ * row yet. Per the doc's group security stance ("trust boundary is the group
+ * itself, established at bind time"), anyone in the bound group is authorized
+ * to log. Auto-create their user row so we have a real id for transaction
+ * attribution (logged_by).
+ *
+ * Idempotent: if the telegram_id already exists with the same family, returns
+ * it. If it exists with a DIFFERENT family, refuses (cross-family write would
+ * leak). If it doesn't exist, inserts.
+ */
+export async function getOrCreateUserInFamily(
+  telegramId: number,
+  familyId: string,
+  name: string,
+): Promise<{ id: string; family_id: string } | { error: string }> {
+  const existing = await getUserByTelegramId(telegramId);
+  if (existing) {
+    if (existing.family_id !== familyId) {
+      return { error: `User already linked to a different family.` };
+    }
+    return { id: existing.id, family_id: existing.family_id };
+  }
+  const { data, error } = await supabase
+    .from('users')
+    .insert({ telegram_id: telegramId, name: name || 'User', family_id: familyId })
+    .select('id, family_id')
+    .single();
+  if (error || !data) return { error: `Не удалось зарегистрировать: ${error?.message}` };
+  return { id: data.id, family_id: data.family_id };
+}
+
 export async function resolveFamilyForChat(args: {
   chatId: number;
   telegramId: number;

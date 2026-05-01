@@ -8,6 +8,7 @@ import {
   createFamilyInvite,
   getCategoriesForFamily,
   resolveFamilyForChat,
+  getOrCreateUserInFamily,
   getFamilyById,
 } from '@/lib/db/queries';
 import { captureError } from '@/lib/observability';
@@ -293,23 +294,22 @@ export function createBot(): Bot {
         // already be writing "кофе 500" expecting the bot to log it.
       }
 
-      // We still need the user row for the audit trail (userId on transactions
-      // etc.). resolveFamilyForChat already validated the sender is registered
-      // (otherwise we'd have hit the error branch above) — but in the
-      // pre-existing-link case we never looked them up. Fetch now.
-      const user = await getUserByTelegramId(telegramId);
-      if (!user) {
-        // Edge case: chat is linked to a family, but the sender isn't a
-        // registered user. Could happen in a group when a non-member chats.
-        // Silently ignore in groups; politely gate in DM (shouldn't happen).
+      // We need the user row for transaction audit (logged_by). Per the doc's
+      // group security stance, anyone writing in a bound group is authorized
+      // to log into that family — auto-register them on first sight rather
+      // than silently ignoring (real bug 2026-05-01: bot ignored every group
+      // member except the original linker).
+      // In DMs the chat link IS the user record, so this just looks them up;
+      // in groups it auto-creates a user row when a new member first chats.
+      const senderName = ctx.from?.first_name || 'User';
+      const userResult = await getOrCreateUserInFamily(telegramId, familyId, senderName);
+      if ('error' in userResult) {
         if (isPrivate) {
-          await ctx.reply(
-            '👋 Этот бот работает только по приглашению.\n' +
-            'Попроси у админа семьи ссылку-приглашение.',
-          );
+          await ctx.reply(`😔 ${userResult.error}`);
         }
         return;
       }
+      const user = { id: userResult.id, family_id: userResult.family_id, name: senderName };
 
       // Path 3.5: admin slash commands. These must be handled with the RAW
       // text because the clean-text strip below removes the leading /command.
@@ -370,16 +370,18 @@ export function createBot(): Bot {
     }
     const { familyId } = resolved;
 
-    // Still need the user row for the audit trail.
-    const user = await getUserByTelegramId(telegramId);
-    if (!user) {
+    // Auto-register the tapper if they're a new group member (same logic
+    // as the message handler — chat_id is the trust boundary).
+    const senderName = ctx.from?.first_name || 'User';
+    const userResult = await getOrCreateUserInFamily(telegramId, familyId, senderName);
+    if ('error' in userResult) {
       await ctx.answerCallbackQuery({ text: '⛔ Требуется приглашение' });
       return;
     }
 
     const data = ctx.callbackQuery.data;
     try {
-      const userName = ctx.from?.first_name || user.name || 'User';
+      const userName = senderName;
       const response = await handleCallback(data, telegramId, userName, ctx.chat.id, familyId);
 
       await ctx.answerCallbackQuery();
