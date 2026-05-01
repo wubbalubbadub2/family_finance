@@ -47,6 +47,7 @@ import {
 } from '@/lib/db/queries';
 import { todayAlmaty, currentMonthAlmaty, monthNameRu, formatTenge } from '@/lib/utils';
 import { renderGoalProgress } from '@/lib/goals';
+import { captureError } from '@/lib/observability';
 import {
   stripCurrencyMarkers,
   tryParseExpenses,
@@ -54,6 +55,7 @@ import {
   tryParseDebt,
   isUndoRequest,
   isMeaningfulInput,
+  looksLikeNonExpenseIntent,
 } from '@/lib/parsers';
 
 // Re-export for any historical callers that imported from this module.
@@ -1538,9 +1540,6 @@ export async function chat(
   }
 
   // ── 1. Undo fast path (deterministic, single keyword) ──
-  // Kept because it's a single-shot, zero-risk action that benefits from
-  // 50ms response vs 1-2s LLM round trip. Every other intent now goes
-  // through Sonnet via the direct-write tools.
   if (isUndoRequest(text)) {
     const reply = await handleUndo(ctx);
     await saveUserMsg();
@@ -1548,20 +1547,63 @@ export async function chat(
     return textOnly(reply);
   }
 
-  // ── 2. Everything else → Sonnet (read + direct-write + propose-write) ──
-  //
-  // Architecture (2026-04-30 cutover): no more regex shape-matching.
-  // Sonnet 4.6 handles ALL intent recognition. Three tool tiers:
-  //   - READ_TOOLS: query the DB, return text
-  //   - DIRECT_WRITE_TOOLS: log_expense / log_income / log_debt — execute
-  //     immediately, reply built from the DB row (reply-from-result discipline
-  //     means a hallucinated "Записала" is structurally impossible)
-  //   - WRITE_TOOLS: propose_* — show user a confirm button before executing.
-  //     Used for high-stakes ops (delete, rename, set monthly plan, goals)
-  // History gives Sonnet the context to disambiguate "до конца августа 2026"
-  // (date reply to a goal-clarifier) from "кофе 500" (fresh expense).
+  // ── 2. Conversation context ──
+  // Need the last assistant turn before deciding whether to fast-path the
+  // expense parser. If the bot just asked a question, the user reply is
+  // contextual and belongs to Sonnet (e.g., "до июня 2026" answering "до
+  // какой даты?" must NOT be parsed as a 2026 ₸ Misc expense).
   let history: { role: string; content: string }[] = [];
   try { history = await getRecentMessages(chatId, ctx.familyId, 10); } catch { /* */ }
+  const lastAssistant = [...history].reverse().find((m) => m.role === 'assistant');
+  // Strip trailing emoji + whitespace before the "?" check — bot questions
+  // often end with "📅" / "🎯" after the punctuation.
+  const lastTrimmed = (lastAssistant?.content ?? '').replace(/[\s\p{Extended_Pictographic}]+$/gu, '');
+  const awaitingContextualReply = lastTrimmed.endsWith('?');
+
+  // ── 3. Deterministic expense fast-path ──
+  // Re-introduced (2026-05-01) after LLM-only architecture produced a
+  // hallucinated confirmation in the first hour of dev testing: Sonnet
+  // returned "✅ 🎉 Fun — 1 000 ₸ (кофе)" without calling log_expense, no
+  // row written, math fabricated from conversation history. Reply-from-
+  // result can't help when the LLM never calls the tool.
+  //
+  // Strategy: shape-perfect "<word> <amount>" inputs go straight to
+  // handleExpenses, never reach the LLM. Sonnet still gets log_expense as
+  // a tool for the long-tail cases ("купил кофе за 500", multi-line mixed
+  // intents) but the high-volume happy path is hallucination-impossible.
+  //
+  // Skip the fast-path when:
+  //   (a) user input looks like a NL command ("поставь лимит 100k") —
+  //       parser would log it as expense
+  //   (b) bot just asked a question — user reply is contextual
+  const skipExpenseParser = looksLikeNonExpenseIntent(text) || awaitingContextualReply;
+  const expenses = skipExpenseParser ? null : tryParseExpenses(text);
+  if (expenses) {
+    const reply = await handleExpenses(expenses, ctx);
+    await saveUserMsg();
+    await saveAssistantMsg(reply);
+    return textOnly(reply);
+  }
+
+  // ── 4. Income fast-path (income vocabulary is unambiguous) ──
+  const income = !awaitingContextualReply ? tryParseIncome(text) : null;
+  if (income) {
+    const reply = await handleIncome(income, ctx);
+    await saveUserMsg();
+    await saveAssistantMsg(reply);
+    return textOnly(reply);
+  }
+
+  // ── 5. Debt fast-path ──
+  const debt = !awaitingContextualReply ? tryParseDebt(text) : null;
+  if (debt) {
+    const reply = await handleDebt(debt, ctx);
+    await saveUserMsg();
+    await saveAssistantMsg(reply);
+    return textOnly(reply);
+  }
+
+  // ── 6. Everything else → Sonnet (read + direct-write + propose-write) ──
   const messages: Anthropic.MessageParam[] = [];
   for (const msg of history) {
     if (messages.length === 0 && msg.role === 'assistant') continue;
@@ -1738,6 +1780,24 @@ export async function chat(
     console.error('[chat] empty finalReply after loop — falling back to "не понял"');
     finalReply = '🤔 Не понял. Попробуй переформулировать — например: "сколько на X?" или "покажи последние 10 трат".';
   }
+
+  // ── Hallucination guard ──
+  // If no direct-write tool ran but Sonnet's reply looks like a successful
+  // expense log ("✅ ... NNN ₸ ..."), it's a fabricated confirmation. Real
+  // bug (2026-05-01): user typed "кофе 1000" amid conversational confusion,
+  // Sonnet pattern-matched the previous "✅ Fun — 1 000 ₸ (кофе)" reply in
+  // history and produced an identical-looking text without calling
+  // log_expense. Nothing was written; user thought it was. Reject the fake.
+  if (!directWriteReply && /^\s*✅[^\n]*\d[\d\s]*\s*₸/m.test(finalReply)) {
+    console.error('[chat] HALLUCINATION GUARD: Sonnet produced ✅+₸ reply without calling log tool. Rejecting.');
+    await captureError(new Error('hallucinated_confirmation'), {
+      source: 'chat:hallucination_guard',
+      userTgId: telegramId,
+      context: { user_message: text.slice(0, 200), sonnet_reply: finalReply.slice(0, 400) },
+    }).catch(() => { /* */ });
+    finalReply = '🤔 Не получилось разобрать формат. Напиши проще, например: «кофе 500» или «такси 2500».';
+  }
+
   await saveAssistantMsg(finalReply);
   return textOnly(finalReply);
 }
