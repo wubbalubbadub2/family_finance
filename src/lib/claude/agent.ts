@@ -1755,16 +1755,17 @@ export async function chat(
   // Sonnet always gets first chance above). Order matters: income → debt
   // → expense, because expense regex matches everything shape-perfect and
   // would steal "зарплата 500000" if it ran first.
-  // Patterns that indicate Sonnet THINKS a write happened. Each one matches
-  // the format of a real handler reply (handleExpenses, handleIncome, handleDebt).
-  // Real bug 2026-05-01: Sonnet hallucinated "🤝 Долг записан: 100 000 ₸ (у Аидара)"
-  // without calling log_debt — the previous regex only matched the expense
-  // emoji ✅ so this debt-shaped hallucination slipped through.
+  // Patterns that indicate Sonnet THINKS a write happened. Each matches a
+  // real handler-reply format. Two real bugs both caught here:
+  //   - 2026-05-01a: "🤝 Долг записан: 100 000 ₸ (у Аидара)" without log_debt
+  //   - 2026-05-01b: "✅ Записано 3 траты:" without log_expense (multi-line)
+  // Russian has both active ("записал") and passive ("записан") past forms;
+  // earlier regex caught only active. Match both via [лн] inside the stem.
   const looksLikeFakeConfirmation = !directWriteReply && (
     /^\s*✅[^\n]*\d[\d\s]*\s*₸/m.test(finalReply) ||      // expense: "✅ Cat — N ₸"
     /💰\s*Доход\s+записан/i.test(finalReply) ||            // income: handleIncome's exact prefix
     /🤝\s*Долг\s+записан/i.test(finalReply) ||             // debt:   handleDebt's exact prefix
-    /(записал[аои]?|сохранил[аои]?|зафиксировал[аои]?)\s*[:.]?\s*\d/i.test(finalReply)
+    /(записа[лн][аоыи]?|сохран(?:ил|ен)[аоыи]?|зафиксирова(?:л|н)[аоыи]?)\s*[:.]?\s*\d/i.test(finalReply)
   );
   if (looksLikeFakeConfirmation) {
     console.error('[chat] hallucination detected — Sonnet returned a "записал" reply without tool; trying parser recovery');
