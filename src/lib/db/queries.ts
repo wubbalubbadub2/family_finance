@@ -1836,6 +1836,7 @@ export type ConfirmType =
   | 'delete_transaction'
   | 'update_transaction_category'
   | 'set_monthly_plan'
+  | 'set_monthly_plans_bulk'
   | 'create_category'
   | 'create_categories_bulk'
   | 'rename_category'
