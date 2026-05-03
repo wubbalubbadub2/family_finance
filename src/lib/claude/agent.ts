@@ -1859,15 +1859,37 @@ export async function handleCallback(
   // Clear regardless of action — stop the confirm window from lingering
   await clearPendingConfirm(ctx.familyId);
 
+  // CRITICAL: persist BOTH the user's tap AND the bot's resulting text into
+  // conversation_messages. Without this, Sonnet on the next user turn sees
+  // a proposal with no confirmation/cancellation outcome, treats it as still
+  // pending, and (per the slot-stitching rule) re-proposes the same thing —
+  // even if the user's new message is unrelated.
+  //
+  // Real prod incident (2026-05-03, Family-finance group): user asked for
+  // 7 limits at once; bot proposed Балапанчик 93k; user confirmed; user then
+  // wrote "лимит на Жилье 340к"; bot re-proposed Балапанчик 93k. Cascaded
+  // into READ requests too — "покажи категории с лимитами" got hijacked into
+  // "Поставить лимит 35k на Кафе?".
+  const tapText = action === 'cancel'
+    ? `[${userName}]: ❌ отменил`
+    : `[${userName}]: ✅ подтвердил`;
+  await saveMessage(ctx.chatId, ctx.familyId, 'user', tapText).catch(() => {});
+
   if (action === 'cancel') {
-    return textOnly('❌ Отменено.');
+    const reply = '❌ Отменено.';
+    await saveMessage(ctx.chatId, ctx.familyId, 'assistant', reply).catch(() => {});
+    return textOnly(reply);
   }
 
   // Execute the proposed action
   try {
-    return textOnly(await executeConfirmedAction(pending, ctx));
+    const reply = await executeConfirmedAction(pending, ctx);
+    await saveMessage(ctx.chatId, ctx.familyId, 'assistant', reply).catch(() => {});
+    return textOnly(reply);
   } catch (e) {
     const msg = e instanceof Error ? e.message : 'ошибка';
-    return textOnly(`❌ ${msg}`);
+    const reply = `❌ ${msg}`;
+    await saveMessage(ctx.chatId, ctx.familyId, 'assistant', reply).catch(() => {});
+    return textOnly(reply);
   }
 }
