@@ -12,6 +12,7 @@ import {
   getFamilyById,
 } from '@/lib/db/queries';
 import { captureError } from '@/lib/observability';
+import { enforcePaidStatus } from '@/lib/bot/paywall';
 import type { Category } from '@/types';
 
 /**
@@ -278,6 +279,13 @@ export function createBot(): Bot {
 
       const { familyId, firstTimeInChat } = resolved;
 
+      // Trial / paid gate. Sits before the firstTimeInChat confirmation so an
+      // expired family doesn't get "🔗 linked!" followed immediately by the
+      // paywall message. Invite redemption (path 1) and bare /start (path 2)
+      // already returned above — they bypass the gate intentionally.
+      const paid = await enforcePaidStatus(ctx, familyId, { isGroup });
+      if (!paid.allowed) return;
+
       // First-time group link: confirm to the group so members know it's
       // wired up. We deliberately DON'T do this in DM because the welcome
       // message from handleInviteArrival already explains things, and a
@@ -369,6 +377,15 @@ export function createBot(): Bot {
       return;
     }
     const { familyId } = resolved;
+
+    // Trial / paid gate. answerCallbackQuery first so the user sees the
+    // toast, then enforcePaidStatus sends the paywall reply (rate-limited).
+    const isGroup = ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
+    const paid = await enforcePaidStatus(ctx, familyId, { isGroup });
+    if (!paid.allowed) {
+      await ctx.answerCallbackQuery({ text: '⏸ Подписка приостановлена' }).catch(() => undefined);
+      return;
+    }
 
     // Auto-register the tapper if they're a new group member (same logic
     // as the message handler — chat_id is the trust boundary).

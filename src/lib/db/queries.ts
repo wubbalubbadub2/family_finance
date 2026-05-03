@@ -171,6 +171,7 @@ export interface Family {
   id: string;
   name: string;
   created_at: string;
+  paid_until: string;  // ISO timestamp; 2099-01-01 = effectively unlimited
 }
 
 export async function getFamilyById(familyId: string): Promise<Family | null> {
@@ -180,6 +181,71 @@ export async function getFamilyById(familyId: string): Promise<Family | null> {
     .eq('id', familyId)
     .single();
   return data;
+}
+
+// ── Trial / paid status (migration 013) ──
+
+/**
+ * Read paid_until + family name for the bot gate. One PK lookup per inbound
+ * message — fresh each time, no memoization. Cost is negligible (~5ms) and
+ * the alternative is stale gating after an admin extends a paid_until.
+ */
+export async function getPaidStatus(
+  familyId: string,
+): Promise<{ paidUntil: Date; familyName: string } | null> {
+  const { data } = await supabase
+    .from('families')
+    .select('name, paid_until')
+    .eq('id', familyId)
+    .single();
+  if (!data) return null;
+  return { paidUntil: new Date(data.paid_until), familyName: data.name };
+}
+
+/**
+ * Admin dashboard listing — all families with their paid status + member count.
+ * Member count comes from a separate query (no FK relationship sugar in the
+ * supabase-js types we have here).
+ */
+export async function listFamiliesWithPaidStatus(): Promise<Array<{
+  id: string;
+  name: string;
+  created_at: string;
+  paid_until: string;
+  member_count: number;
+}>> {
+  const { data: families } = await supabase
+    .from('families')
+    .select('id, name, created_at, paid_until')
+    .order('created_at', { ascending: false });
+  if (!families) return [];
+
+  const { data: users } = await supabase
+    .from('users')
+    .select('family_id');
+  const counts = new Map<string, number>();
+  for (const u of users ?? []) counts.set(u.family_id, (counts.get(u.family_id) ?? 0) + 1);
+
+  return families.map((f) => ({
+    id: f.id,
+    name: f.name,
+    created_at: f.created_at,
+    paid_until: f.paid_until,
+    member_count: counts.get(f.id) ?? 0,
+  }));
+}
+
+/**
+ * Admin dashboard write. Sets paid_until to a specific instant. The API
+ * passes an absolute ISO date from the client (so double-clicks are
+ * idempotent — same value sent twice = same row state).
+ */
+export async function setPaidUntil(familyId: string, paidUntil: Date): Promise<void> {
+  const { error } = await supabase
+    .from('families')
+    .update({ paid_until: paidUntil.toISOString() })
+    .eq('id', familyId);
+  if (error) throw new Error(`setPaidUntil failed: ${error.message}`);
 }
 
 // ── Categories (per-family since migration 007) ──
@@ -1089,10 +1155,10 @@ export async function getMonthSummary(year: number, month: number, familyId: str
 // Families (admin ops)
 // ─────────────────────────────────────────────────────────────────────────────
 
-export async function getAllFamilies(): Promise<{ id: string; name: string; primary_chat_id: number | null }[]> {
+export async function getAllFamilies(): Promise<{ id: string; name: string; primary_chat_id: number | null; paid_until: string }[]> {
   const { data } = await supabase
     .from('families')
-    .select('id, name, primary_chat_id')
+    .select('id, name, primary_chat_id, paid_until')
     .order('created_at');
   return data ?? [];
 }
@@ -1104,9 +1170,11 @@ export async function getAllFamilies(): Promise<{ id: string; name: string; prim
  */
 export async function createFamily(name: string, primaryChatId?: number): Promise<string> {
   if (!name || !name.trim()) throw new Error('Укажи название семьи.');
+  // 3-day trial, set explicitly per migration 013 (no DB default by design).
+  const trialEnd = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString();
   const { data, error } = await supabase
     .from('families')
-    .insert({ name: name.trim(), primary_chat_id: primaryChatId ?? null })
+    .insert({ name: name.trim(), primary_chat_id: primaryChatId ?? null, paid_until: trialEnd })
     .select('id')
     .single();
   if (error || !data) throw new Error(`Не удалось создать семью: ${error?.message ?? 'no data'}`);
