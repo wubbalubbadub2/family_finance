@@ -614,7 +614,8 @@ function buildSystemPrompt(familyCategories: Category[] = []): string {
 - propose_archive_goal()
 - propose_delete_transaction(transaction_id)
 - propose_update_transaction_category(transaction_id, new_category_slug) ⬅
-- propose_set_monthly_plan(category_slug, amount, year?, month?)
+- propose_set_monthly_plan(category_slug, amount, year?, month?) — ОДИН лимит
+- propose_set_monthly_plans_bulk(plans: [{category_slug, amount}, ...]) — несколько лимитов за раз, одна кнопка ✅ (используй ВСЕГДА если в сообщении ≥2 лимитов)
 - propose_create_category(name, emoji) — одна категория
 - propose_create_categories_bulk(categories: [{name, emoji}, ...]) — несколько за раз, одна кнопка ✅ (используй при онбординге)
 - propose_rename_category(slug, new_name, new_emoji?)
@@ -676,7 +677,8 @@ ${categoriesBlock}
 - "закрой цель" / "забудь цель" → propose_archive_goal
 - "удали трату N" (где N — описание) → сначала list_recent_transactions найти её, потом propose_delete_transaction с ID
 - "это было не Х, а Y" / "поменяй категорию на Y" / "переклассифицируй в Y" → найди транзакцию через list_recent или search, потом propose_update_transaction_category
-- "поставь лимит N на [категорию]" → propose_set_monthly_plan
+- "поставь лимит N на [категорию]" (ОДНА категория) → propose_set_monthly_plan
+- "поставь лимиты на категории: A 10к, B 20к, C 30к" / "поставь оставшиеся лимиты" / любое сообщение с ≥2 лимитов → propose_set_monthly_plans_bulk (ОДНА кнопка подтверждения на все)
 - "создай категорию X" (одна) → propose_create_category
 - "создай категории X, Y, Z" / "добавь 5 категорий" / "стартовый набор" → propose_create_categories_bulk
 - "переименуй X в Y" / "поменяй название" → propose_rename_category
@@ -793,8 +795,9 @@ const WRITE_TOOLS: Anthropic.Tool[] = [
   {
     name: 'propose_set_monthly_plan',
     description:
-      'Propose setting a monthly spending limit for a category. ' +
-      'Call when user says "поставь лимит Х на Y", "set Y budget to Х", "bu ayn kafeye X tenge".',
+      'Propose setting a monthly spending limit for ONE category. ' +
+      'Call when user says "поставь лимит Х на Y" for a SINGLE category. ' +
+      'For multiple limits at once use propose_set_monthly_plans_bulk — one confirm covers all.',
     input_schema: {
       type: 'object' as const,
       properties: {
@@ -804,6 +807,36 @@ const WRITE_TOOLS: Anthropic.Tool[] = [
         month: { type: 'number', description: '1-12 (default: current)' },
       },
       required: ['category_slug', 'amount'],
+    },
+  },
+  {
+    name: 'propose_set_monthly_plans_bulk',
+    description:
+      'Propose setting MULTIPLE monthly limits at once — one confirm covers all. ' +
+      'Use whenever the user lists ≥2 categories with amounts in a single message ' +
+      '("поставь лимиты на категории: A 10к, B 20к, C 30к" or similar). Avoids the ' +
+      'per-category confirm loop entirely. ' +
+      'If the user later says "поставь оставшиеся" / "remaining" / "недостающие" ' +
+      'after a categories-with-limits read, use this tool with the still-missing ones.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        plans: {
+          type: 'array',
+          description: 'List of monthly limits. Each entry has category_slug + amount.',
+          items: {
+            type: 'object',
+            properties: {
+              category_slug: { type: 'string' },
+              amount: { type: 'number' },
+            },
+            required: ['category_slug', 'amount'],
+          },
+        },
+        year: { type: 'number', description: 'Year (default: current)' },
+        month: { type: 'number', description: '1-12 (default: current)' },
+      },
+      required: ['plans'],
     },
   },
   {
@@ -1113,6 +1146,29 @@ async function buildProposalMessage(
       const m = (input.month as number) ?? month;
       return `📊 Поставить лимит ${formatTenge(amount)} на ${cat.emoji} ${cat.name} за ${monthNameRu(m)} ${y}?`;
     }
+    case 'set_monthly_plans_bulk': {
+      const plans = (input.plans as Array<{ category_slug?: string; amount?: number }> | undefined) ?? [];
+      if (plans.length === 0) throw new Error('Пустой список лимитов.');
+      const { year: curY, month: curM } = currentMonthAlmaty();
+      const y = (input.year as number) ?? curY;
+      const m = (input.month as number) ?? curM;
+      // Resolve every category up-front so the confirm dialog shows real names
+      // and we surface "category not found" before the user taps ✅.
+      const resolved: Array<{ slug: string; cat: { id: number; emoji: string; name: string }; amount: number }> = [];
+      for (const p of plans) {
+        const slug = String(p.category_slug ?? '');
+        const amount = Number(p.amount);
+        if (!slug) throw new Error('У одного из лимитов не указана категория.');
+        if (!Number.isFinite(amount) || amount < 0) throw new Error(`Неверная сумма для '${slug}'.`);
+        const cat = await getCategoryBySlugInFamily(slug, ctx.familyId);
+        if (!cat) throw new Error(`Категория '${slug}' не найдена.`);
+        resolved.push({ slug, cat, amount });
+      }
+      // Mutate input so execute path uses the validated/normalized list.
+      (input as Record<string, unknown>).plans = resolved.map(r => ({ category_slug: r.slug, amount: r.amount }));
+      const list = resolved.map(r => `- ${r.cat.emoji} ${r.cat.name}: ${formatTenge(r.amount)}`).join('\n');
+      return `📊 Поставить ${resolved.length} ${resolved.length === 1 ? 'лимит' : 'лимитов'} за ${monthNameRu(m)} ${y}:\n${list}\n\nПодтвердить?`;
+    }
     case 'create_category': {
       const name = String(input.name ?? '').trim();
       const emoji = String(input.emoji ?? '').trim();
@@ -1260,6 +1316,30 @@ async function executeConfirmedAction(
         created_by: ctx.userId,
       });
       return `📊 Лимит ${formatTenge(Number(a.amount))} на ${cat.emoji} ${cat.name} установлен.`;
+    }
+    case 'set_monthly_plans_bulk': {
+      const plans = a.plans as Array<{ category_slug: string; amount: number }>;
+      const { year: curY, month: curM } = currentMonthAlmaty();
+      const y = (a.year as number) ?? curY;
+      const m = (a.month as number) ?? curM;
+      const lines: string[] = [];
+      for (const p of plans) {
+        const cat = await getCategoryBySlugInFamily(p.category_slug, ctx.familyId);
+        // Categories are validated at propose time; if one disappeared between
+        // propose and confirm, fail loudly rather than skipping silently.
+        if (!cat) throw new Error(`Категория '${p.category_slug}' пропала между proposal и confirm.`);
+        await upsertMonthlyPlan({
+          family_id: ctx.familyId,
+          year: y,
+          month: m,
+          category_id: cat.id,
+          plan_type: 'expense',
+          amount: Number(p.amount),
+          created_by: ctx.userId,
+        });
+        lines.push(`- ${cat.emoji} ${cat.name}: ${formatTenge(Number(p.amount))}`);
+      }
+      return `📊 Установлено ${plans.length} ${plans.length === 1 ? 'лимит' : 'лимитов'} за ${monthNameRu(m)} ${y}:\n${lines.join('\n')}`;
     }
     case 'create_category': {
       const cat = await createCategory({
