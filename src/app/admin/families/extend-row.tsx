@@ -15,6 +15,9 @@ interface Props {
   createdAt: string;
   paidUntil: string;
   memberCount: number;
+  txCount: number;
+  lastTxAt: string | null;
+  distinctDays: number;
   serverNow: number; // ms; passed from server to avoid hydration mismatch
 }
 
@@ -35,6 +38,9 @@ export default function ExtendRow({
   createdAt,
   paidUntil,
   memberCount,
+  txCount,
+  lastTxAt,
+  distinctDays,
   serverNow,
 }: Props) {
   const [busy, setBusy] = useState(false);
@@ -48,6 +54,23 @@ export default function ExtendRow({
     if (days <= 0) badgeColor = '#c33';
     else if (days <= 3) badgeColor = '#d68a00';
     else badgeColor = '#2a7';
+  }
+
+  // Activity status: classifies the family for at-a-glance triage.
+  const daysSinceLastTx = lastTxAt
+    ? Math.floor((serverNow - new Date(lastTxAt).getTime()) / DAY_MS)
+    : null;
+  let status: { label: string; color: string };
+  if (memberCount === 0) {
+    status = { label: 'не активирован', color: 'var(--ink-4)' };
+  } else if (txCount === 0) {
+    status = { label: 'нет транзакций', color: '#d68a00' };
+  } else if (daysSinceLastTx !== null && daysSinceLastTx <= 1) {
+    status = { label: 'активен', color: '#2a7' };
+  } else if (daysSinceLastTx !== null && daysSinceLastTx <= 7) {
+    status = { label: `${daysSinceLastTx}д назад`, color: 'var(--ink-2)' };
+  } else {
+    status = { label: `молчит ${daysSinceLastTx}д`, color: '#c33' };
   }
 
   async function extend(deltaDays: number | 'custom') {
@@ -118,6 +141,26 @@ export default function ExtendRow({
       </td>
       <td className="py-3 pr-4" style={{ color: 'var(--ink-2)' }}>
         {memberCount}
+      </td>
+      <td className="py-3 pr-4" style={{ color: 'var(--ink-2)' }}>
+        {txCount > 0 ? (
+          <>
+            <div>{txCount} тр.</div>
+            <div className="text-[11px] mt-0.5" style={{ color: 'var(--ink-4)' }}>
+              {distinctDays} акт. дн.
+            </div>
+          </>
+        ) : (
+          <span style={{ color: 'var(--ink-4)' }}>—</span>
+        )}
+      </td>
+      <td className="py-3 pr-4">
+        <div style={{ color: status.color }}>{status.label}</div>
+        {lastTxAt && (
+          <div className="text-[11px] mt-0.5" style={{ color: 'var(--ink-4)' }}>
+            {formatDate(lastTxAt)}
+          </div>
+        )}
       </td>
       <td className="py-3 text-right">
         <div className="flex justify-end gap-2 flex-wrap">

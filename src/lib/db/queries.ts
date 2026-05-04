@@ -203,9 +203,12 @@ export async function getPaidStatus(
 }
 
 /**
- * Admin dashboard listing — all families with their paid status + member count.
- * Member count comes from a separate query (no FK relationship sugar in the
- * supabase-js types we have here).
+ * Admin dashboard listing — all families with paid status + member count +
+ * activity stats (tx_count, last_tx_at, distinct_days).
+ *
+ * Pulls live transactions in one shot and aggregates in JS. Fine at current
+ * scale (<1k tx total); when prod grows past ~10k rows, swap for a Postgres
+ * view or RPC that does the GROUP BY server-side.
  */
 export async function listFamiliesWithPaidStatus(): Promise<Array<{
   id: string;
@@ -213,6 +216,9 @@ export async function listFamiliesWithPaidStatus(): Promise<Array<{
   created_at: string;
   paid_until: string;
   member_count: number;
+  tx_count: number;
+  last_tx_at: string | null;
+  distinct_days: number;
 }>> {
   const { data: families } = await supabase
     .from('families')
@@ -223,15 +229,36 @@ export async function listFamiliesWithPaidStatus(): Promise<Array<{
   const { data: users } = await supabase
     .from('users')
     .select('family_id');
-  const counts = new Map<string, number>();
-  for (const u of users ?? []) counts.set(u.family_id, (counts.get(u.family_id) ?? 0) + 1);
+  const memberCounts = new Map<string, number>();
+  for (const u of users ?? []) {
+    memberCounts.set(u.family_id, (memberCounts.get(u.family_id) ?? 0) + 1);
+  }
+
+  const { data: txns } = await supabase
+    .from('transactions')
+    .select('family_id, created_at, transaction_date')
+    .is('deleted_at', null);
+  const txCounts = new Map<string, number>();
+  const lastTxAt = new Map<string, string>();
+  const distinctDays = new Map<string, Set<string>>();
+  for (const t of txns ?? []) {
+    txCounts.set(t.family_id, (txCounts.get(t.family_id) ?? 0) + 1);
+    const prev = lastTxAt.get(t.family_id);
+    if (!prev || t.created_at > prev) lastTxAt.set(t.family_id, t.created_at);
+    let days = distinctDays.get(t.family_id);
+    if (!days) { days = new Set(); distinctDays.set(t.family_id, days); }
+    days.add(t.transaction_date);
+  }
 
   return families.map((f) => ({
     id: f.id,
     name: f.name,
     created_at: f.created_at,
     paid_until: f.paid_until,
-    member_count: counts.get(f.id) ?? 0,
+    member_count: memberCounts.get(f.id) ?? 0,
+    tx_count: txCounts.get(f.id) ?? 0,
+    last_tx_at: lastTxAt.get(f.id) ?? null,
+    distinct_days: distinctDays.get(f.id)?.size ?? 0,
   }));
 }
 

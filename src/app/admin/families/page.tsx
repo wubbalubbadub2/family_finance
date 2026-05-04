@@ -40,6 +40,12 @@ export default async function AdminFamiliesPage() {
                 <th className="text-left py-3 pr-4 font-medium" style={{ color: 'var(--ink-3)' }}>
                   Участники
                 </th>
+                <th className="text-left py-3 pr-4 font-medium" style={{ color: 'var(--ink-3)' }}>
+                  Активность
+                </th>
+                <th className="text-left py-3 pr-4 font-medium" style={{ color: 'var(--ink-3)' }}>
+                  Статус
+                </th>
                 <th className="text-right py-3 font-medium" style={{ color: 'var(--ink-3)' }}>
                   Продлить
                 </th>
@@ -54,6 +60,9 @@ export default async function AdminFamiliesPage() {
                   createdAt={f.created_at}
                   paidUntil={f.paid_until}
                   memberCount={f.member_count}
+                  txCount={f.tx_count}
+                  lastTxAt={f.last_tx_at}
+                  distinctDays={f.distinct_days}
                   serverNow={now}
                 />
               ))}
