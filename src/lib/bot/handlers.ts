@@ -10,6 +10,7 @@ import {
   resolveFamilyForChat,
   getOrCreateUserInFamily,
   getFamilyById,
+  markUpdateSeen,
 } from '@/lib/db/queries';
 import { captureError } from '@/lib/observability';
 import { enforcePaidStatus } from '@/lib/bot/paywall';
@@ -193,6 +194,24 @@ export function createBot(): Bot {
   if (!token) throw new Error('Missing TELEGRAM_BOT_TOKEN');
 
   const bot = new Bot(token);
+
+  // ── Idempotency: drop Telegram retries before any handler runs ──
+  // Telegram retries on 5xx/timeout with the same update_id. Without this gate,
+  // a slow Sonnet call that the webhook times out on would get the user's
+  // expense logged twice. We mark each update_id in the DB; PRIMARY KEY
+  // collision = retry, drop it. Fail-open if the DB is unreachable.
+  bot.use(async (ctx, next) => {
+    const updateId = ctx.update.update_id;
+    if (typeof updateId !== 'number') return next();
+    const chatId = ctx.chat?.id ?? ctx.from?.id ?? 0;
+    const messageId = ctx.msg?.message_id ?? null;
+    const { alreadyProcessed } = await markUpdateSeen(updateId, chatId, messageId);
+    if (alreadyProcessed) {
+      console.log(`[idempotency] dropped retry update_id=${updateId} chat=${chatId}`);
+      return;
+    }
+    return next();
+  });
 
   // ── Text messages ──
   bot.on('message:text', async (ctx) => {

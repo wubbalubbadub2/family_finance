@@ -69,7 +69,22 @@ export async function GET(req: NextRequest) {
     await captureError(e, { source: 'cron:cleanup:error_log_purge' });
   }
 
-  // 4. Error-spike alert. If anomalous activity in last 24h, DM admin with a
+  // 4. Purge telegram_updates_processed rows older than 24h. Telegram retry
+  //    windows are well under an hour; we keep 24h for safety. Index on
+  //    processed_at makes this cheap.
+  let updatesPurged = 0;
+  try {
+    const updateCutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const { count: c } = await supabase
+      .from('telegram_updates_processed')
+      .delete({ count: 'exact' })
+      .lt('processed_at', updateCutoff);
+    updatesPurged = c ?? 0;
+  } catch (e) {
+    await captureError(e, { source: 'cron:cleanup:tg_updates_purge' });
+  }
+
+  // 5. Error-spike alert. If anomalous activity in last 24h, DM admin with a
   //    summary by source. One DM/day max — this cron runs daily.
   let alertSent = false;
   try {
@@ -92,6 +107,7 @@ export async function GET(req: NextRequest) {
     conversation_messages_deleted: count ?? 0,
     stale_pending_reset: stalePendingReset,
     error_log_purged: errorLogPurged,
+    tg_updates_purged: updatesPurged,
     alert_sent: alertSent,
     cutoff,
   });

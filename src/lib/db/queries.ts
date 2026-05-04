@@ -1097,6 +1097,30 @@ export async function saveMessage(
   });
 }
 
+/**
+ * Webhook-level idempotency. Returns alreadyProcessed=true if this Telegram
+ * update_id was seen before — caller drops the retry without re-running the
+ * bot logic.
+ *
+ * Race-safe via PRIMARY KEY conflict (Postgres serializes the unique-index
+ * check). Fail-open on unexpected errors: better to process a message twice
+ * than to drop it entirely (the soft duplicate detection in findRecentDuplicate
+ * catches most accidental doubles for expenses anyway).
+ */
+export async function markUpdateSeen(
+  updateId: number,
+  chatId: number,
+  messageId: number | null,
+): Promise<{ alreadyProcessed: boolean }> {
+  const { error } = await supabase
+    .from('telegram_updates_processed')
+    .insert({ update_id: updateId, chat_id: chatId, message_id: messageId });
+  if (!error) return { alreadyProcessed: false };
+  if (error.code === '23505') return { alreadyProcessed: true };
+  console.error(`[idempotency] mark failed for update_id=${updateId}:`, error.message);
+  return { alreadyProcessed: false };
+}
+
 // ── Aggregations ──
 
 export async function getMonthSummary(year: number, month: number, familyId: string) {
