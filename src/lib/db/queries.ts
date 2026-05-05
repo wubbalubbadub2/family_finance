@@ -1262,7 +1262,8 @@ export interface FamilyInvite {
   created_by: string | null;
   created_at: string;
   expires_at: string | null;
-  uses_remaining: number;
+  // NULL = unlimited / multi-use (per migration 015). Public link uses NULL.
+  uses_remaining: number | null;
 }
 
 /**
@@ -1304,17 +1305,22 @@ export async function createFamilyInvite(input: {
 }
 
 /**
- * Consume an invite code: validate, create the user row, decrement uses.
- * Returns the new user's family_id + name on success, null if the invite
- * is invalid/expired/exhausted OR the telegram_id already exists.
+ * Consume an invite code. Two flavors based on the invite's uses_remaining:
+ *
+ * 1. Single-use (uses_remaining is a number ≥ 1): legacy flow — attach the
+ *    user to the pre-existing family the invite points at, decrement counter.
+ * 2. Multi-use (uses_remaining IS NULL, per migration 015): public-link flow —
+ *    create a FRESH family for this redeemer using their Telegram name, set
+ *    the 3-day trial, then attach the user. No counter to decrement.
+ *
+ * Returns the resulting family_id + user_id on success. Idempotent: if the
+ * Telegram user is already registered, returns their existing family.
  */
 export async function consumeFamilyInvite(
   code: string,
   telegramId: number,
   name: string,
 ): Promise<{ familyId: string; userId: string } | { error: string }> {
-  // If the user is already registered, don't re-add — just return their family.
-  // This keeps the invite flow idempotent for users who tap the link twice.
   const existing = await getUserByTelegramId(telegramId);
   if (existing) return { familyId: existing.family_id, userId: existing.id };
 
@@ -1325,18 +1331,34 @@ export async function consumeFamilyInvite(
     .single();
 
   if (!invite) return { error: 'Приглашение не найдено.' };
-  if (invite.uses_remaining <= 0) return { error: 'Приглашение уже использовано.' };
   if (invite.expires_at && new Date(invite.expires_at) < new Date()) {
     return { error: 'Срок приглашения истёк.' };
   }
 
-  // Create user
+  const isMultiUse = invite.uses_remaining === null;
+  if (!isMultiUse && invite.uses_remaining <= 0) {
+    return { error: 'Приглашение уже использовано.' };
+  }
+
+  // Resolve the family: existing one for single-use, freshly created for multi-use.
+  let familyId: string;
+  if (isMultiUse) {
+    try {
+      familyId = await createFamily(`${name || 'User'}'s family`);
+    } catch (e) {
+      return { error: e instanceof Error ? e.message : 'Не удалось создать семью.' };
+    }
+  } else {
+    familyId = invite.family_id;
+  }
+
+  // Create the user row, link to the resolved family.
   const { data: newUser, error: userErr } = await supabase
     .from('users')
     .insert({
       telegram_id: telegramId,
       name: name || 'User',
-      family_id: invite.family_id,
+      family_id: familyId,
     })
     .select('id, family_id')
     .single();
@@ -1345,11 +1367,13 @@ export async function consumeFamilyInvite(
     return { error: `Не удалось создать пользователя: ${userErr?.message ?? 'no data'}` };
   }
 
-  // Decrement uses (non-fatal if this fails — user is already registered)
-  await supabase
-    .from('family_invites')
-    .update({ uses_remaining: invite.uses_remaining - 1 })
-    .eq('code', code);
+  // Decrement only for single-use invites; NULL stays NULL forever.
+  if (!isMultiUse) {
+    await supabase
+      .from('family_invites')
+      .update({ uses_remaining: invite.uses_remaining - 1 })
+      .eq('code', code);
+  }
 
   return { familyId: newUser.family_id, userId: newUser.id };
 }
