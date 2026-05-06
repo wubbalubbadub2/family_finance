@@ -10,8 +10,10 @@ import {
   resolveFamilyForChat,
   getOrCreateUserInFamily,
   getFamilyById,
+  markUpdateSeen,
 } from '@/lib/db/queries';
 import { captureError } from '@/lib/observability';
+import { enforcePaidStatus } from '@/lib/bot/paywall';
 import type { Category } from '@/types';
 
 /**
@@ -170,7 +172,7 @@ async function handleInviteArrival(ctx: Context, code: string): Promise<void> {
   const name = ctx.from?.first_name || 'User';
   if (!telegramId) { await ctx.reply('⛔ Не могу определить твой Telegram ID.'); return; }
 
-  const result = await consumeFamilyInvite(code, telegramId, name);
+  const result = await consumeFamilyInvite(code, telegramId, name, ctx.from?.username ?? null);
   if ('error' in result) {
     await ctx.reply(
       `❌ ${result.error}\n\nПопроси у админа семьи свежую ссылку-приглашение.`,
@@ -187,11 +189,67 @@ async function handleInviteArrival(ctx: Context, code: string): Promise<void> {
   await ctx.reply(buildWelcomeText(name, cats));
 }
 
+/**
+ * Onboard a fresh DM user with no prior registration: spin up a new family
+ * (using their Telegram first_name), insert their user row, welcome them.
+ * Used by the bare-/start path and also when an unregistered user sends any
+ * first message in DM. The 3-day trial is set inside createFamily.
+ *
+ * Idempotent: callers should check the user doesn't already exist before
+ * invoking this — but if a race creates a duplicate user row, the unique
+ * constraint on telegram_id will surface it as an error and the second
+ * attempt will hit the existing-user path on retry.
+ */
+async function onboardFreshDmUser(ctx: Context): Promise<void> {
+  const telegramId = ctx.from?.id;
+  const name = ctx.from?.first_name || 'User';
+  if (!telegramId) { await ctx.reply('⛔ Не могу определить твой Telegram ID.'); return; }
+
+  let familyId: string;
+  try {
+    familyId = await createFamily(`${name}'s family`);
+  } catch (e) {
+    await captureError(e, { source: 'onboardFreshDmUser:createFamily', userTgId: telegramId });
+    await ctx.reply('😔 Не удалось создать семью. Попробуй ещё раз через минуту.');
+    return;
+  }
+
+  const userRes = await getOrCreateUserInFamily(telegramId, familyId, name, ctx.from?.username ?? null);
+  if ('error' in userRes) {
+    await captureError(new Error(userRes.error), {
+      source: 'onboardFreshDmUser:getOrCreateUser', userTgId: telegramId,
+    });
+    await ctx.reply('😔 Не удалось зарегистрировать тебя. Попробуй ещё раз.');
+    return;
+  }
+
+  const cats = await getCategoriesForFamily(familyId).catch(() => [] as Category[]);
+  await ctx.reply(buildWelcomeText(name, cats));
+}
+
 export function createBot(): Bot {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   if (!token) throw new Error('Missing TELEGRAM_BOT_TOKEN');
 
   const bot = new Bot(token);
+
+  // ── Idempotency: drop Telegram retries before any handler runs ──
+  // Telegram retries on 5xx/timeout with the same update_id. Without this gate,
+  // a slow Sonnet call that the webhook times out on would get the user's
+  // expense logged twice. We mark each update_id in the DB; PRIMARY KEY
+  // collision = retry, drop it. Fail-open if the DB is unreachable.
+  bot.use(async (ctx, next) => {
+    const updateId = ctx.update.update_id;
+    if (typeof updateId !== 'number') return next();
+    const chatId = ctx.chat?.id ?? ctx.from?.id ?? 0;
+    const messageId = ctx.msg?.message_id ?? null;
+    const { alreadyProcessed } = await markUpdateSeen(updateId, chatId, messageId);
+    if (alreadyProcessed) {
+      console.log(`[idempotency] dropped retry update_id=${updateId} chat=${chatId}`);
+      return;
+    }
+    return next();
+  });
 
   // ── Text messages ──
   bot.on('message:text', async (ctx) => {
@@ -220,21 +278,18 @@ export function createBot(): Bot {
         return;
       }
 
-      // Path 2: bare /start in DM — welcome for existing users, or invite gate.
-      // In groups Telegram lets users type /start@bot but we don't treat it as
-      // anything special; let it fall through to the normal flow.
+      // Path 2: bare /start in DM. Existing users get a welcome with their
+      // current categories. NEW users (never seen before) auto-onboard into
+      // a fresh family with a 3-day trial — no invite code needed. This is
+      // the public-link entry point: just `t.me/<bot>` works, no payload.
+      // In groups we ignore /start@bot specifically (let it fall through).
       if (isPrivate && /^\/start(@\w+)?$/i.test(rawText)) {
         const existing = await getUserByTelegramId(telegramId);
         if (existing) {
-          // Same welcome shape as handleInviteArrival, with the user's CURRENT
-          // categories (which may differ from defaults if they've customized).
           const cats = await getCategoriesForFamily(existing.family_id).catch(() => [] as Category[]);
           await ctx.reply(buildWelcomeText(existing.name, cats));
         } else {
-          await ctx.reply(
-            '👋 Этот бот работает по приглашению.\n' +
-            'Попроси у админа семьи ссылку вида `t.me/<имя_бота>?start=invite_XXX` — после клика тебя добавят автоматически.',
-          );
+          await onboardFreshDmUser(ctx);
         }
         return;
       }
@@ -253,15 +308,17 @@ export function createBot(): Bot {
 
       if ('error' in resolved) {
         if (resolved.error === 'unregistered_sender') {
-          // In DM: show the polite invite gate (existing behaviour).
-          // In a group: silently ignore — strangers might be in the group with
-          // the bot via a member who already left, and we don't want to spam
-          // the group with "you need an invite" on every message.
+          // DM from someone we've never seen — onboard them into a fresh
+          // family with a 3-day trial. They typed something other than /start
+          // (e.g. "кофе 500" right out of the gate); we welcome them rather
+          // than processing the message, because the welcome is more useful
+          // than a guessed transaction. They can re-send after.
+          //
+          // In a group: silently ignore. Strangers might be in the group via
+          // a member who already left; we don't auto-onboard random group
+          // participants into new solo families.
           if (isPrivate) {
-            await ctx.reply(
-              '👋 Этот бот работает только по приглашению.\n' +
-              'Попроси у админа семьи ссылку-приглашение.',
-            );
+            await onboardFreshDmUser(ctx);
           }
           return;
         }
@@ -277,6 +334,13 @@ export function createBot(): Bot {
       }
 
       const { familyId, firstTimeInChat } = resolved;
+
+      // Trial / paid gate. Sits before the firstTimeInChat confirmation so an
+      // expired family doesn't get "🔗 linked!" followed immediately by the
+      // paywall message. Invite redemption (path 1) and bare /start (path 2)
+      // already returned above — they bypass the gate intentionally.
+      const paid = await enforcePaidStatus(ctx, familyId, { isGroup });
+      if (!paid.allowed) return;
 
       // First-time group link: confirm to the group so members know it's
       // wired up. We deliberately DON'T do this in DM because the welcome
@@ -302,7 +366,7 @@ export function createBot(): Bot {
       // In DMs the chat link IS the user record, so this just looks them up;
       // in groups it auto-creates a user row when a new member first chats.
       const senderName = ctx.from?.first_name || 'User';
-      const userResult = await getOrCreateUserInFamily(telegramId, familyId, senderName);
+      const userResult = await getOrCreateUserInFamily(telegramId, familyId, senderName, ctx.from?.username ?? null);
       if ('error' in userResult) {
         if (isPrivate) {
           await ctx.reply(`😔 ${userResult.error}`);
@@ -369,6 +433,15 @@ export function createBot(): Bot {
       return;
     }
     const { familyId } = resolved;
+
+    // Trial / paid gate. answerCallbackQuery first so the user sees the
+    // toast, then enforcePaidStatus sends the paywall reply (rate-limited).
+    const isGroup = ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
+    const paid = await enforcePaidStatus(ctx, familyId, { isGroup });
+    if (!paid.allowed) {
+      await ctx.answerCallbackQuery({ text: '⏸ Подписка приостановлена' }).catch(() => undefined);
+      return;
+    }
 
     // Auto-register the tapper if they're a new group member (same logic
     // as the message handler — chat_id is the trust boundary).

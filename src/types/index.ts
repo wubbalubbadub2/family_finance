@@ -4,6 +4,10 @@ export interface User {
   id: string;
   telegram_id: number;
   name: string;
+  // @username from Telegram. NULL if the user hasn't set a public handle.
+  // Captured at user-creation sites; never overwritten on subsequent updates
+  // since users sometimes change their handle and we want the original.
+  telegram_username: string | null;
   email: string | null;
   created_at: string;
 }

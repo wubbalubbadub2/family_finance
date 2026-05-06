@@ -61,9 +61,16 @@ export async function GET(req: NextRequest) {
   const weekEndDate = new Date(new Date(bounds.weekEndDate).getTime() - 86_400_000)
     .toISOString().slice(0, 10);
 
+  const now = Date.now();
   for (const family of families) {
     if (!family.primary_chat_id) {
       results.push({ family_id: family.id, name: family.name, sent: false, reason: 'no primary_chat_id' });
+      continue;
+    }
+    // Skip expired families — sending a digest to a paywalled customer is the
+    // wrong UX (they get budget data they no longer have access to).
+    if (new Date(family.paid_until).getTime() <= now) {
+      results.push({ family_id: family.id, name: family.name, sent: false, reason: 'paid_until expired' });
       continue;
     }
 

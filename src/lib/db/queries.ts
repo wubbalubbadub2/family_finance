@@ -96,6 +96,7 @@ export async function getOrCreateUserInFamily(
   telegramId: number,
   familyId: string,
   name: string,
+  telegramUsername?: string | null,
 ): Promise<{ id: string; family_id: string } | { error: string }> {
   const existing = await getUserByTelegramId(telegramId);
   if (existing) {
@@ -106,7 +107,12 @@ export async function getOrCreateUserInFamily(
   }
   const { data, error } = await supabase
     .from('users')
-    .insert({ telegram_id: telegramId, name: name || 'User', family_id: familyId })
+    .insert({
+      telegram_id: telegramId,
+      name: name || 'User',
+      family_id: familyId,
+      telegram_username: telegramUsername ?? null,
+    })
     .select('id, family_id')
     .single();
   if (error || !data) return { error: `Не удалось зарегистрировать: ${error?.message}` };
@@ -171,6 +177,7 @@ export interface Family {
   id: string;
   name: string;
   created_at: string;
+  paid_until: string;  // ISO timestamp; 2099-01-01 = effectively unlimited
 }
 
 export async function getFamilyById(familyId: string): Promise<Family | null> {
@@ -180,6 +187,120 @@ export async function getFamilyById(familyId: string): Promise<Family | null> {
     .eq('id', familyId)
     .single();
   return data;
+}
+
+// ── Trial / paid status (migration 013) ──
+
+/**
+ * Read paid_until + family name for the bot gate. One PK lookup per inbound
+ * message — fresh each time, no memoization. Cost is negligible (~5ms) and
+ * the alternative is stale gating after an admin extends a paid_until.
+ */
+export async function getPaidStatus(
+  familyId: string,
+): Promise<{ paidUntil: Date; familyName: string } | null> {
+  const { data } = await supabase
+    .from('families')
+    .select('name, paid_until')
+    .eq('id', familyId)
+    .single();
+  if (!data) return null;
+  return { paidUntil: new Date(data.paid_until), familyName: data.name };
+}
+
+/**
+ * Admin dashboard listing — all families with paid status + member count +
+ * activity stats (tx_count, last_tx_at, distinct_days).
+ *
+ * Pulls live transactions in one shot and aggregates in JS. Fine at current
+ * scale (<1k tx total); when prod grows past ~10k rows, swap for a Postgres
+ * view or RPC that does the GROUP BY server-side.
+ */
+export interface FamilyAdminRow {
+  id: string;
+  name: string;
+  created_at: string;
+  paid_until: string;
+  member_count: number;
+  tx_count: number;
+  last_tx_at: string | null;
+  distinct_days: number;
+  // Primary member identity for receipt-verification lookup. Picks the
+  // earliest-created member as "primary" — the one who onboarded the
+  // family. Other members are not surfaced; admin can drill into the
+  // family if they need the full roster.
+  primary_member: {
+    name: string;
+    telegram_id: number;
+    telegram_username: string | null;
+  } | null;
+}
+
+export async function listFamiliesWithPaidStatus(): Promise<FamilyAdminRow[]> {
+  const { data: families } = await supabase
+    .from('families')
+    .select('id, name, created_at, paid_until')
+    .order('created_at', { ascending: false });
+  if (!families) return [];
+
+  const { data: users } = await supabase
+    .from('users')
+    .select('family_id, name, telegram_id, telegram_username, created_at')
+    .order('created_at', { ascending: true });
+  const memberCounts = new Map<string, number>();
+  const primaryMember = new Map<string, FamilyAdminRow['primary_member']>();
+  for (const u of users ?? []) {
+    memberCounts.set(u.family_id, (memberCounts.get(u.family_id) ?? 0) + 1);
+    // Earliest-created wins because we ordered ASC; later writes don't overwrite.
+    if (!primaryMember.has(u.family_id)) {
+      primaryMember.set(u.family_id, {
+        name: u.name,
+        telegram_id: u.telegram_id,
+        telegram_username: u.telegram_username,
+      });
+    }
+  }
+
+  const { data: txns } = await supabase
+    .from('transactions')
+    .select('family_id, created_at, transaction_date')
+    .is('deleted_at', null);
+  const txCounts = new Map<string, number>();
+  const lastTxAt = new Map<string, string>();
+  const distinctDays = new Map<string, Set<string>>();
+  for (const t of txns ?? []) {
+    txCounts.set(t.family_id, (txCounts.get(t.family_id) ?? 0) + 1);
+    const prev = lastTxAt.get(t.family_id);
+    if (!prev || t.created_at > prev) lastTxAt.set(t.family_id, t.created_at);
+    let days = distinctDays.get(t.family_id);
+    if (!days) { days = new Set(); distinctDays.set(t.family_id, days); }
+    days.add(t.transaction_date);
+  }
+
+  return families.map((f) => ({
+    id: f.id,
+    name: f.name,
+    created_at: f.created_at,
+    paid_until: f.paid_until,
+    member_count: memberCounts.get(f.id) ?? 0,
+    tx_count: txCounts.get(f.id) ?? 0,
+    last_tx_at: lastTxAt.get(f.id) ?? null,
+    distinct_days: distinctDays.get(f.id)?.size ?? 0,
+    primary_member: primaryMember.get(f.id) ?? null,
+  }));
+}
+
+/**
+ * Admin dashboard write. Sets paid_until to a specific instant. The API
+ * passes an absolute ISO date from the client (so double-clicks are
+ * idempotent — same value sent twice = same row state).
+ */
+export async function setPaidUntil(familyId: string, paidUntil: Date): Promise<void> {
+  const { error } = await supabase
+    .from('families')
+    .update({ paid_until: paidUntil.toISOString() })
+    .eq('id', familyId);
+  if (error) throw new Error(`setPaidUntil failed: ${error.message}`);
 }
 
 // ── Categories (per-family since migration 007) ──
@@ -1004,6 +1125,30 @@ export async function saveMessage(
   });
 }
 
+/**
+ * Webhook-level idempotency. Returns alreadyProcessed=true if this Telegram
+ * update_id was seen before — caller drops the retry without re-running the
+ * bot logic.
+ *
+ * Race-safe via PRIMARY KEY conflict (Postgres serializes the unique-index
+ * check). Fail-open on unexpected errors: better to process a message twice
+ * than to drop it entirely (the soft duplicate detection in findRecentDuplicate
+ * catches most accidental doubles for expenses anyway).
+ */
+export async function markUpdateSeen(
+  updateId: number,
+  chatId: number,
+  messageId: number | null,
+): Promise<{ alreadyProcessed: boolean }> {
+  const { error } = await supabase
+    .from('telegram_updates_processed')
+    .insert({ update_id: updateId, chat_id: chatId, message_id: messageId });
+  if (!error) return { alreadyProcessed: false };
+  if (error.code === '23505') return { alreadyProcessed: true };
+  console.error(`[idempotency] mark failed for update_id=${updateId}:`, error.message);
+  return { alreadyProcessed: false };
+}
+
 // ── Aggregations ──
 
 export async function getMonthSummary(year: number, month: number, familyId: string) {
@@ -1089,10 +1234,10 @@ export async function getMonthSummary(year: number, month: number, familyId: str
 // Families (admin ops)
 // ─────────────────────────────────────────────────────────────────────────────
 
-export async function getAllFamilies(): Promise<{ id: string; name: string; primary_chat_id: number | null }[]> {
+export async function getAllFamilies(): Promise<{ id: string; name: string; primary_chat_id: number | null; paid_until: string }[]> {
   const { data } = await supabase
     .from('families')
-    .select('id, name, primary_chat_id')
+    .select('id, name, primary_chat_id, paid_until')
     .order('created_at');
   return data ?? [];
 }
@@ -1104,9 +1249,11 @@ export async function getAllFamilies(): Promise<{ id: string; name: string; prim
  */
 export async function createFamily(name: string, primaryChatId?: number): Promise<string> {
   if (!name || !name.trim()) throw new Error('Укажи название семьи.');
+  // 3-day trial, set explicitly per migration 013 (no DB default by design).
+  const trialEnd = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString();
   const { data, error } = await supabase
     .from('families')
-    .insert({ name: name.trim(), primary_chat_id: primaryChatId ?? null })
+    .insert({ name: name.trim(), primary_chat_id: primaryChatId ?? null, paid_until: trialEnd })
     .select('id')
     .single();
   if (error || !data) throw new Error(`Не удалось создать семью: ${error?.message ?? 'no data'}`);
@@ -1143,7 +1290,8 @@ export interface FamilyInvite {
   created_by: string | null;
   created_at: string;
   expires_at: string | null;
-  uses_remaining: number;
+  // NULL = unlimited / multi-use (per migration 015). Public link uses NULL.
+  uses_remaining: number | null;
 }
 
 /**
@@ -1185,17 +1333,23 @@ export async function createFamilyInvite(input: {
 }
 
 /**
- * Consume an invite code: validate, create the user row, decrement uses.
- * Returns the new user's family_id + name on success, null if the invite
- * is invalid/expired/exhausted OR the telegram_id already exists.
+ * Consume an invite code. Two flavors based on the invite's uses_remaining:
+ *
+ * 1. Single-use (uses_remaining is a number ≥ 1): legacy flow — attach the
+ *    user to the pre-existing family the invite points at, decrement counter.
+ * 2. Multi-use (uses_remaining IS NULL, per migration 015): public-link flow —
+ *    create a FRESH family for this redeemer using their Telegram name, set
+ *    the 3-day trial, then attach the user. No counter to decrement.
+ *
+ * Returns the resulting family_id + user_id on success. Idempotent: if the
+ * Telegram user is already registered, returns their existing family.
  */
 export async function consumeFamilyInvite(
   code: string,
   telegramId: number,
   name: string,
+  telegramUsername?: string | null,
 ): Promise<{ familyId: string; userId: string } | { error: string }> {
-  // If the user is already registered, don't re-add — just return their family.
-  // This keeps the invite flow idempotent for users who tap the link twice.
   const existing = await getUserByTelegramId(telegramId);
   if (existing) return { familyId: existing.family_id, userId: existing.id };
 
@@ -1206,18 +1360,35 @@ export async function consumeFamilyInvite(
     .single();
 
   if (!invite) return { error: 'Приглашение не найдено.' };
-  if (invite.uses_remaining <= 0) return { error: 'Приглашение уже использовано.' };
   if (invite.expires_at && new Date(invite.expires_at) < new Date()) {
     return { error: 'Срок приглашения истёк.' };
   }
 
-  // Create user
+  const isMultiUse = invite.uses_remaining === null;
+  if (!isMultiUse && invite.uses_remaining <= 0) {
+    return { error: 'Приглашение уже использовано.' };
+  }
+
+  // Resolve the family: existing one for single-use, freshly created for multi-use.
+  let familyId: string;
+  if (isMultiUse) {
+    try {
+      familyId = await createFamily(`${name || 'User'}'s family`);
+    } catch (e) {
+      return { error: e instanceof Error ? e.message : 'Не удалось создать семью.' };
+    }
+  } else {
+    familyId = invite.family_id;
+  }
+
+  // Create the user row, link to the resolved family.
   const { data: newUser, error: userErr } = await supabase
     .from('users')
     .insert({
       telegram_id: telegramId,
       name: name || 'User',
-      family_id: invite.family_id,
+      family_id: familyId,
+      telegram_username: telegramUsername ?? null,
     })
     .select('id, family_id')
     .single();
@@ -1226,11 +1397,13 @@ export async function consumeFamilyInvite(
     return { error: `Не удалось создать пользователя: ${userErr?.message ?? 'no data'}` };
   }
 
-  // Decrement uses (non-fatal if this fails — user is already registered)
-  await supabase
-    .from('family_invites')
-    .update({ uses_remaining: invite.uses_remaining - 1 })
-    .eq('code', code);
+  // Decrement only for single-use invites; NULL stays NULL forever.
+  if (!isMultiUse) {
+    await supabase
+      .from('family_invites')
+      .update({ uses_remaining: invite.uses_remaining - 1 })
+      .eq('code', code);
+  }
 
   return { familyId: newUser.family_id, userId: newUser.id };
 }
