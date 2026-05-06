@@ -2,8 +2,8 @@
 
 // Client component: renders the families table with a search-as-you-type
 // filter on top + click-to-sort column headers. Filter matches against family
-// name, primary member's first_name, @username, telegram_id, and
-// family_id_prefix — all the identifiers an admin might paste in.
+// name, family_id_prefix, AND every member's first_name + @username +
+// telegram_id (so searching a wife's @handle finds the husband's family row).
 
 import { useMemo, useState } from 'react';
 import type { FamilyAdminRow } from '@/lib/db/queries';
@@ -38,13 +38,12 @@ const DEFAULT_DIR: Record<SortKey, SortDir> = {
 function matchesQuery(f: FamilyAdminRow, q: string): boolean {
   if (!q) return true;
   const qLower = q.toLowerCase().replace(/^@/, '');
-  const haystack = [
-    f.name,
-    f.id,
-    f.primary_member?.name ?? '',
-    f.primary_member?.telegram_username ?? '',
-    String(f.primary_member?.telegram_id ?? ''),
-  ].join(' ').toLowerCase();
+  const memberFields = f.members.flatMap((m) => [
+    m.name,
+    m.telegram_username ?? '',
+    String(m.telegram_id),
+  ]);
+  const haystack = [f.name, f.id, ...memberFields].join(' ').toLowerCase();
   return haystack.includes(qLower);
 }
 
@@ -214,7 +213,7 @@ export default function FamiliesTable({ families, serverNow }: Props) {
                 txCount={f.tx_count}
                 lastTxAt={f.last_tx_at}
                 distinctDays={f.distinct_days}
-                primaryMember={f.primary_member}
+                members={f.members}
                 serverNow={serverNow}
               />
             ))}
