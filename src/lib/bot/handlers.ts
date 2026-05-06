@@ -189,6 +189,44 @@ async function handleInviteArrival(ctx: Context, code: string): Promise<void> {
   await ctx.reply(buildWelcomeText(name, cats));
 }
 
+/**
+ * Onboard a fresh DM user with no prior registration: spin up a new family
+ * (using their Telegram first_name), insert their user row, welcome them.
+ * Used by the bare-/start path and also when an unregistered user sends any
+ * first message in DM. The 3-day trial is set inside createFamily.
+ *
+ * Idempotent: callers should check the user doesn't already exist before
+ * invoking this — but if a race creates a duplicate user row, the unique
+ * constraint on telegram_id will surface it as an error and the second
+ * attempt will hit the existing-user path on retry.
+ */
+async function onboardFreshDmUser(ctx: Context): Promise<void> {
+  const telegramId = ctx.from?.id;
+  const name = ctx.from?.first_name || 'User';
+  if (!telegramId) { await ctx.reply('⛔ Не могу определить твой Telegram ID.'); return; }
+
+  let familyId: string;
+  try {
+    familyId = await createFamily(`${name}'s family`);
+  } catch (e) {
+    await captureError(e, { source: 'onboardFreshDmUser:createFamily', userTgId: telegramId });
+    await ctx.reply('😔 Не удалось создать семью. Попробуй ещё раз через минуту.');
+    return;
+  }
+
+  const userRes = await getOrCreateUserInFamily(telegramId, familyId, name);
+  if ('error' in userRes) {
+    await captureError(new Error(userRes.error), {
+      source: 'onboardFreshDmUser:getOrCreateUser', userTgId: telegramId,
+    });
+    await ctx.reply('😔 Не удалось зарегистрировать тебя. Попробуй ещё раз.');
+    return;
+  }
+
+  const cats = await getCategoriesForFamily(familyId).catch(() => [] as Category[]);
+  await ctx.reply(buildWelcomeText(name, cats));
+}
+
 export function createBot(): Bot {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   if (!token) throw new Error('Missing TELEGRAM_BOT_TOKEN');
@@ -240,21 +278,18 @@ export function createBot(): Bot {
         return;
       }
 
-      // Path 2: bare /start in DM — welcome for existing users, or invite gate.
-      // In groups Telegram lets users type /start@bot but we don't treat it as
-      // anything special; let it fall through to the normal flow.
+      // Path 2: bare /start in DM. Existing users get a welcome with their
+      // current categories. NEW users (never seen before) auto-onboard into
+      // a fresh family with a 3-day trial — no invite code needed. This is
+      // the public-link entry point: just `t.me/<bot>` works, no payload.
+      // In groups we ignore /start@bot specifically (let it fall through).
       if (isPrivate && /^\/start(@\w+)?$/i.test(rawText)) {
         const existing = await getUserByTelegramId(telegramId);
         if (existing) {
-          // Same welcome shape as handleInviteArrival, with the user's CURRENT
-          // categories (which may differ from defaults if they've customized).
           const cats = await getCategoriesForFamily(existing.family_id).catch(() => [] as Category[]);
           await ctx.reply(buildWelcomeText(existing.name, cats));
         } else {
-          await ctx.reply(
-            '👋 Этот бот работает по приглашению.\n' +
-            'Попроси у админа семьи ссылку вида `t.me/<имя_бота>?start=invite_XXX` — после клика тебя добавят автоматически.',
-          );
+          await onboardFreshDmUser(ctx);
         }
         return;
       }
@@ -273,15 +308,17 @@ export function createBot(): Bot {
 
       if ('error' in resolved) {
         if (resolved.error === 'unregistered_sender') {
-          // In DM: show the polite invite gate (existing behaviour).
-          // In a group: silently ignore — strangers might be in the group with
-          // the bot via a member who already left, and we don't want to spam
-          // the group with "you need an invite" on every message.
+          // DM from someone we've never seen — onboard them into a fresh
+          // family with a 3-day trial. They typed something other than /start
+          // (e.g. "кофе 500" right out of the gate); we welcome them rather
+          // than processing the message, because the welcome is more useful
+          // than a guessed transaction. They can re-send after.
+          //
+          // In a group: silently ignore. Strangers might be in the group via
+          // a member who already left; we don't auto-onboard random group
+          // participants into new solo families.
           if (isPrivate) {
-            await ctx.reply(
-              '👋 Этот бот работает только по приглашению.\n' +
-              'Попроси у админа семьи ссылку-приглашение.',
-            );
+            await onboardFreshDmUser(ctx);
           }
           return;
         }
