@@ -103,6 +103,15 @@ export async function getOrCreateUserInFamily(
     if (existing.family_id !== familyId) {
       return { error: `User already linked to a different family.` };
     }
+    // Refresh telegram_username if we have a new value and it differs. Guarded
+    // on `telegramUsername` truthiness so we never wipe a captured handle when
+    // a later message arrives without one (Telegram occasionally omits it).
+    if (telegramUsername && telegramUsername !== existing.telegram_username) {
+      await supabase
+        .from('users')
+        .update({ telegram_username: telegramUsername })
+        .eq('id', existing.id);
+    }
     return { id: existing.id, family_id: existing.family_id };
   }
   const { data, error } = await supabase
