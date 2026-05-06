@@ -11,7 +11,7 @@
 
 import { useState } from 'react';
 
-interface PrimaryMember {
+interface Member {
   name: string;
   telegram_id: number;
   telegram_username: string | null;
@@ -26,7 +26,7 @@ interface Props {
   txCount: number;
   lastTxAt: string | null;
   distinctDays: number;
-  primaryMember: PrimaryMember | null;
+  members: Member[];
   serverNow: number; // ms; passed from server to avoid hydration mismatch
 }
 
@@ -50,7 +50,7 @@ export default function ExtendRow({
   txCount,
   lastTxAt,
   distinctDays,
-  primaryMember,
+  members,
   serverNow,
 }: Props) {
   const [busy, setBusy] = useState(false);
@@ -133,24 +133,19 @@ export default function ExtendRow({
         </div>
       </td>
       <td className="py-3 pr-4">
-        {primaryMember ? (
-          <>
-            <div style={{ color: 'var(--ink-1)' }}>
-              {primaryMember.name}
-              {memberCount > 1 && (
-                <span className="text-[11px] ml-1" style={{ color: 'var(--ink-4)' }}>
-                  +{memberCount - 1}
-                </span>
-              )}
-            </div>
-            <div className="text-[11px] mt-0.5" style={{ color: 'var(--ink-3)' }}>
-              {primaryMember.telegram_username
-                ? `@${primaryMember.telegram_username} · ${primaryMember.telegram_id}`
-                : `${primaryMember.telegram_id}`}
-            </div>
-          </>
-        ) : (
+        {members.length === 0 ? (
           <span style={{ color: 'var(--ink-4)' }}>—</span>
+        ) : (
+          members.map((m, i) => (
+            <div key={m.telegram_id} className={i > 0 ? 'mt-2' : ''}>
+              <div style={{ color: 'var(--ink-1)' }}>{m.name}</div>
+              <div className="text-[11px] mt-0.5" style={{ color: 'var(--ink-3)' }}>
+                {m.telegram_username
+                  ? `@${m.telegram_username} · ${m.telegram_id}`
+                  : `${m.telegram_id}`}
+              </div>
+            </div>
+          ))
         )}
       </td>
       <td className="py-3 pr-4" style={{ color: 'var(--ink-2)' }}>

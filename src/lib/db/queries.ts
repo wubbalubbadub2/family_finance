@@ -234,15 +234,15 @@ export interface FamilyAdminRow {
   tx_count: number;
   last_tx_at: string | null;
   distinct_days: number;
-  // Primary member identity for receipt-verification lookup. Picks the
-  // earliest-created member as "primary" — the one who onboarded the
-  // family. Other members are not surfaced; admin can drill into the
-  // family if they need the full roster.
-  primary_member: {
+  // All family members, sorted oldest-first (so members[0] is the founder).
+  // Includes everyone so admin search hits secondary members too (e.g. wife
+  // joined a family her husband created — searching her @handle still finds
+  // the family row).
+  members: Array<{
     name: string;
     telegram_id: number;
     telegram_username: string | null;
-  } | null;
+  }>;
 }
 
 export async function listFamiliesWithPaidStatus(): Promise<FamilyAdminRow[]> {
@@ -256,18 +256,16 @@ export async function listFamiliesWithPaidStatus(): Promise<FamilyAdminRow[]> {
     .from('users')
     .select('family_id, name, telegram_id, telegram_username, created_at')
     .order('created_at', { ascending: true });
-  const memberCounts = new Map<string, number>();
-  const primaryMember = new Map<string, FamilyAdminRow['primary_member']>();
+  const membersByFamily = new Map<string, FamilyAdminRow['members']>();
   for (const u of users ?? []) {
-    memberCounts.set(u.family_id, (memberCounts.get(u.family_id) ?? 0) + 1);
-    // Earliest-created wins because we ordered ASC; later writes don't overwrite.
-    if (!primaryMember.has(u.family_id)) {
-      primaryMember.set(u.family_id, {
-        name: u.name,
-        telegram_id: u.telegram_id,
-        telegram_username: u.telegram_username,
-      });
-    }
+    let arr = membersByFamily.get(u.family_id);
+    if (!arr) { arr = []; membersByFamily.set(u.family_id, arr); }
+    // Push order = users.created_at ASC, so arr[0] is the family founder.
+    arr.push({
+      name: u.name,
+      telegram_id: u.telegram_id,
+      telegram_username: u.telegram_username,
+    });
   }
 
   const { data: txns } = await supabase
@@ -286,17 +284,20 @@ export async function listFamiliesWithPaidStatus(): Promise<FamilyAdminRow[]> {
     days.add(t.transaction_date);
   }
 
-  return families.map((f) => ({
-    id: f.id,
-    name: f.name,
-    created_at: f.created_at,
-    paid_until: f.paid_until,
-    member_count: memberCounts.get(f.id) ?? 0,
-    tx_count: txCounts.get(f.id) ?? 0,
-    last_tx_at: lastTxAt.get(f.id) ?? null,
-    distinct_days: distinctDays.get(f.id)?.size ?? 0,
-    primary_member: primaryMember.get(f.id) ?? null,
-  }));
+  return families.map((f) => {
+    const members = membersByFamily.get(f.id) ?? [];
+    return {
+      id: f.id,
+      name: f.name,
+      created_at: f.created_at,
+      paid_until: f.paid_until,
+      member_count: members.length,
+      tx_count: txCounts.get(f.id) ?? 0,
+      last_tx_at: lastTxAt.get(f.id) ?? null,
+      distinct_days: distinctDays.get(f.id)?.size ?? 0,
+      members,
+    };
+  });
 }
 
 /**
