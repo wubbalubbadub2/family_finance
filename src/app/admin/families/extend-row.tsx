@@ -6,8 +6,16 @@
 // - Computes daysLeft client-side from the ISO string for the colored badge.
 // - +30 / +90 / custom buttons compute an absolute date from the current
 //   paid_until and POST it. API takes absolute ISO so double-click = idempotent.
+// - Shows primary member's first_name + @handle + tg_id so admin can match a
+//   Kaspi receipt's sender to the family row in <5 seconds.
 
 import { useState } from 'react';
+
+interface PrimaryMember {
+  name: string;
+  telegram_id: number;
+  telegram_username: string | null;
+}
 
 interface Props {
   familyId: string;
@@ -18,6 +26,7 @@ interface Props {
   txCount: number;
   lastTxAt: string | null;
   distinctDays: number;
+  primaryMember: PrimaryMember | null;
   serverNow: number; // ms; passed from server to avoid hydration mismatch
 }
 
@@ -41,6 +50,7 @@ export default function ExtendRow({
   txCount,
   lastTxAt,
   distinctDays,
+  primaryMember,
   serverNow,
 }: Props) {
   const [busy, setBusy] = useState(false);
@@ -87,14 +97,10 @@ export default function ExtendRow({
         return;
       }
     } else {
-      // Idempotency: extend from max(now, current paid_until). Two clicks of
-      // [+30] = +30, not +60, because the server's stored value moved between
-      // clicks. (If the user wants +60 they click twice in succession; if
-      // they double-tap by accident the second click is a no-op since both
-      // produce the same target ISO.) Wait — that's not idempotent against
-      // a double-click. Real idempotency: client computes target from the
-      // currently displayed paid_until (closure value), which doesn't change
-      // until reload. So two POSTs send the same absolute date = same result.
+      // Client computes target from the currently displayed paid_until (closure
+      // value), which doesn't change until reload. Two POSTs from the same
+      // page send the same absolute date = same result. The API is idempotent
+      // against the same target ISO arriving twice.
       const base = Math.max(serverNow, new Date(paidUntil).getTime());
       target = new Date(base + deltaDays * DAY_MS);
     }
@@ -123,8 +129,29 @@ export default function ExtendRow({
       <td className="py-3 pr-4">
         <div style={{ color: 'var(--ink-1)' }}>{name}</div>
         <div className="text-[11px] mt-0.5" style={{ color: 'var(--ink-4)' }}>
-          {familyId.slice(0, 8)}
+          {familyId.slice(0, 6).toUpperCase()}
         </div>
+      </td>
+      <td className="py-3 pr-4">
+        {primaryMember ? (
+          <>
+            <div style={{ color: 'var(--ink-1)' }}>
+              {primaryMember.name}
+              {memberCount > 1 && (
+                <span className="text-[11px] ml-1" style={{ color: 'var(--ink-4)' }}>
+                  +{memberCount - 1}
+                </span>
+              )}
+            </div>
+            <div className="text-[11px] mt-0.5" style={{ color: 'var(--ink-3)' }}>
+              {primaryMember.telegram_username
+                ? `@${primaryMember.telegram_username} · ${primaryMember.telegram_id}`
+                : `${primaryMember.telegram_id}`}
+            </div>
+          </>
+        ) : (
+          <span style={{ color: 'var(--ink-4)' }}>—</span>
+        )}
       </td>
       <td className="py-3 pr-4" style={{ color: 'var(--ink-2)' }}>
         {formatDate(createdAt)}
@@ -138,9 +165,6 @@ export default function ExtendRow({
             {days <= 0 ? `истекла ${-days} дн. назад` : `осталось ${days} дн.`}
           </div>
         )}
-      </td>
-      <td className="py-3 pr-4" style={{ color: 'var(--ink-2)' }}>
-        {memberCount}
       </td>
       <td className="py-3 pr-4" style={{ color: 'var(--ink-2)' }}>
         {txCount > 0 ? (

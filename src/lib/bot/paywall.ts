@@ -52,21 +52,43 @@ function pluralizeDays(n: number): string {
   return 'дней';
 }
 
+/**
+ * Short verification code admin uses to find this family in the dashboard.
+ * First 6 hex chars of family_id, uppercased — collisions across all
+ * families are extremely unlikely at our scale (~16M codes; 132 families
+ * today). User pastes this into the dashboard search bar and gets a
+ * unique row.
+ */
+function verificationCode(familyId: string): string {
+  return familyId.replace(/-/g, '').slice(0, 6).toUpperCase();
+}
+
 function buildPaywallMessage(opts: {
   isGroup: boolean;
   familyName: string;
+  familyId: string;
   daysExpired: number;
 }): string {
+  const code = verificationCode(opts.familyId);
   if (opts.isGroup) {
-    // Privacy: anyone in the group can see this. No family name, no expiry math.
-    return `⏸ Семейный бюджет приостановлен. Свяжитесь с администратором: ${ADMIN_HANDLE}`;
+    // Privacy: anyone in the group can see this. No family name, no expiry
+    // math — but we DO show the code so any group member can pass it on
+    // to the admin along with a receipt.
+    return (
+      `⏸ Семейный бюджет приостановлен.\n\n` +
+      `Свяжитесь с администратором: ${ADMIN_HANDLE}\n` +
+      `Код для проверки: ${code}`
+    );
   }
   // DM — full context for the paying customer.
   const days = opts.daysExpired;
   const ago = days <= 0 ? 'сегодня' : `${days} ${pluralizeDays(days)} назад`;
   return (
     `⏸ Подписка семьи "${opts.familyName}" истекла ${ago}.\n\n` +
-    `Чтобы продолжить пользоваться ботом, оплатите доступ и напишите ${ADMIN_HANDLE} со скриншотом — он продлит подписку.`
+    `Чтобы продолжить пользоваться ботом:\n` +
+    `1. Оплатите доступ\n` +
+    `2. Напишите ${ADMIN_HANDLE} со скриншотом чека и кодом ниже\n\n` +
+    `Код для проверки: ${code}`
   );
 }
 
@@ -103,6 +125,7 @@ export async function enforcePaidStatus(
       const text = buildPaywallMessage({
         isGroup: opts.isGroup,
         familyName: status.familyName,
+        familyId,
         daysExpired: status.daysExpired,
       });
       // .catch() because groups can restrict bot replies; missing the paywall is

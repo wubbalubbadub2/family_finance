@@ -96,6 +96,7 @@ export async function getOrCreateUserInFamily(
   telegramId: number,
   familyId: string,
   name: string,
+  telegramUsername?: string | null,
 ): Promise<{ id: string; family_id: string } | { error: string }> {
   const existing = await getUserByTelegramId(telegramId);
   if (existing) {
@@ -106,7 +107,12 @@ export async function getOrCreateUserInFamily(
   }
   const { data, error } = await supabase
     .from('users')
-    .insert({ telegram_id: telegramId, name: name || 'User', family_id: familyId })
+    .insert({
+      telegram_id: telegramId,
+      name: name || 'User',
+      family_id: familyId,
+      telegram_username: telegramUsername ?? null,
+    })
     .select('id, family_id')
     .single();
   if (error || !data) return { error: `Не удалось зарегистрировать: ${error?.message}` };
@@ -210,7 +216,7 @@ export async function getPaidStatus(
  * scale (<1k tx total); when prod grows past ~10k rows, swap for a Postgres
  * view or RPC that does the GROUP BY server-side.
  */
-export async function listFamiliesWithPaidStatus(): Promise<Array<{
+export interface FamilyAdminRow {
   id: string;
   name: string;
   created_at: string;
@@ -219,7 +225,18 @@ export async function listFamiliesWithPaidStatus(): Promise<Array<{
   tx_count: number;
   last_tx_at: string | null;
   distinct_days: number;
-}>> {
+  // Primary member identity for receipt-verification lookup. Picks the
+  // earliest-created member as "primary" — the one who onboarded the
+  // family. Other members are not surfaced; admin can drill into the
+  // family if they need the full roster.
+  primary_member: {
+    name: string;
+    telegram_id: number;
+    telegram_username: string | null;
+  } | null;
+}
+
+export async function listFamiliesWithPaidStatus(): Promise<FamilyAdminRow[]> {
   const { data: families } = await supabase
     .from('families')
     .select('id, name, created_at, paid_until')
@@ -228,10 +245,20 @@ export async function listFamiliesWithPaidStatus(): Promise<Array<{
 
   const { data: users } = await supabase
     .from('users')
-    .select('family_id');
+    .select('family_id, name, telegram_id, telegram_username, created_at')
+    .order('created_at', { ascending: true });
   const memberCounts = new Map<string, number>();
+  const primaryMember = new Map<string, FamilyAdminRow['primary_member']>();
   for (const u of users ?? []) {
     memberCounts.set(u.family_id, (memberCounts.get(u.family_id) ?? 0) + 1);
+    // Earliest-created wins because we ordered ASC; later writes don't overwrite.
+    if (!primaryMember.has(u.family_id)) {
+      primaryMember.set(u.family_id, {
+        name: u.name,
+        telegram_id: u.telegram_id,
+        telegram_username: u.telegram_username,
+      });
+    }
   }
 
   const { data: txns } = await supabase
@@ -259,6 +286,7 @@ export async function listFamiliesWithPaidStatus(): Promise<Array<{
     tx_count: txCounts.get(f.id) ?? 0,
     last_tx_at: lastTxAt.get(f.id) ?? null,
     distinct_days: distinctDays.get(f.id)?.size ?? 0,
+    primary_member: primaryMember.get(f.id) ?? null,
   }));
 }
 
@@ -1320,6 +1348,7 @@ export async function consumeFamilyInvite(
   code: string,
   telegramId: number,
   name: string,
+  telegramUsername?: string | null,
 ): Promise<{ familyId: string; userId: string } | { error: string }> {
   const existing = await getUserByTelegramId(telegramId);
   if (existing) return { familyId: existing.family_id, userId: existing.id };
@@ -1359,6 +1388,7 @@ export async function consumeFamilyInvite(
       telegram_id: telegramId,
       name: name || 'User',
       family_id: familyId,
+      telegram_username: telegramUsername ?? null,
     })
     .select('id, family_id')
     .single();

@@ -172,7 +172,7 @@ async function handleInviteArrival(ctx: Context, code: string): Promise<void> {
   const name = ctx.from?.first_name || 'User';
   if (!telegramId) { await ctx.reply('⛔ Не могу определить твой Telegram ID.'); return; }
 
-  const result = await consumeFamilyInvite(code, telegramId, name);
+  const result = await consumeFamilyInvite(code, telegramId, name, ctx.from?.username ?? null);
   if ('error' in result) {
     await ctx.reply(
       `❌ ${result.error}\n\nПопроси у админа семьи свежую ссылку-приглашение.`,
@@ -214,7 +214,7 @@ async function onboardFreshDmUser(ctx: Context): Promise<void> {
     return;
   }
 
-  const userRes = await getOrCreateUserInFamily(telegramId, familyId, name);
+  const userRes = await getOrCreateUserInFamily(telegramId, familyId, name, ctx.from?.username ?? null);
   if ('error' in userRes) {
     await captureError(new Error(userRes.error), {
       source: 'onboardFreshDmUser:getOrCreateUser', userTgId: telegramId,
@@ -366,7 +366,7 @@ export function createBot(): Bot {
       // In DMs the chat link IS the user record, so this just looks them up;
       // in groups it auto-creates a user row when a new member first chats.
       const senderName = ctx.from?.first_name || 'User';
-      const userResult = await getOrCreateUserInFamily(telegramId, familyId, senderName);
+      const userResult = await getOrCreateUserInFamily(telegramId, familyId, senderName, ctx.from?.username ?? null);
       if ('error' in userResult) {
         if (isPrivate) {
           await ctx.reply(`😔 ${userResult.error}`);
