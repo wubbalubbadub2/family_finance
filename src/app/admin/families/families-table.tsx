@@ -8,6 +8,14 @@
 import { useMemo, useState } from 'react';
 import type { FamilyAdminRow } from '@/lib/db/queries';
 import ExtendRow from './extend-row';
+import {
+  statusBucket,
+  payBucket,
+  STATUS_LABELS,
+  PAY_LABELS,
+  type StatusBucket,
+  type PayBucket,
+} from './family-status';
 
 interface Props {
   families: FamilyAdminRow[];
@@ -79,6 +87,8 @@ function SortHeader({ label, sortKey, active, dir, onClick, align = 'left' }: So
 
 export default function FamiliesTable({ families, serverNow }: Props) {
   const [query, setQuery] = useState('');
+  const [statusFilter, setStatusFilter] = useState<StatusBucket | 'all'>('all');
+  const [payFilter, setPayFilter] = useState<PayBucket | 'all'>('all');
   const [sortBy, setSortBy] = useState<SortKey>('created_at');
   const [sortDir, setSortDir] = useState<SortDir>('desc');
 
@@ -92,9 +102,18 @@ export default function FamiliesTable({ families, serverNow }: Props) {
   }
 
   const filtered = useMemo(
-    () => families.filter((f) => matchesQuery(f, query.trim())),
-    [families, query],
+    () =>
+      families.filter((f) => {
+        if (!matchesQuery(f, query.trim())) return false;
+        if (statusFilter !== 'all' && statusBucket(f, serverNow) !== statusFilter) return false;
+        if (payFilter !== 'all' && payBucket(f, serverNow) !== payFilter) return false;
+        return true;
+      }),
+    [families, query, statusFilter, payFilter, serverNow],
   );
+
+  const isFiltered =
+    query.trim().length > 0 || statusFilter !== 'all' || payFilter !== 'all';
 
   const sorted = useMemo(() => {
     const arr = [...filtered];
@@ -109,25 +128,59 @@ export default function FamiliesTable({ families, serverNow }: Props) {
     return arr;
   }, [filtered, sortBy, sortDir]);
 
+  const selectStyle = {
+    backgroundColor: 'var(--bg)',
+    color: 'var(--ink-1)',
+    borderColor: 'var(--ink-6)',
+  };
+
   return (
     <>
-      <div className="mb-4">
+      <div className="mb-3">
         <input
           type="search"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           placeholder="Поиск: имя, @handle, telegram_id, или код семьи (первые 6 символов)"
           className="w-full px-3 py-2 rounded text-[13px] border"
-          style={{
-            backgroundColor: 'var(--bg)',
-            color: 'var(--ink-1)',
-            borderColor: 'var(--ink-6)',
-          }}
+          style={selectStyle}
         />
       </div>
 
+      <div className="mb-4 flex flex-wrap gap-2">
+        <select
+          value={statusFilter}
+          onChange={(e) => setStatusFilter(e.target.value as StatusBucket | 'all')}
+          className="px-3 py-2 rounded text-[13px] border"
+          style={selectStyle}
+        >
+          {(Object.keys(STATUS_LABELS) as Array<StatusBucket | 'all'>).map((k) => (
+            <option key={k} value={k}>{STATUS_LABELS[k]}</option>
+          ))}
+        </select>
+        <select
+          value={payFilter}
+          onChange={(e) => setPayFilter(e.target.value as PayBucket | 'all')}
+          className="px-3 py-2 rounded text-[13px] border"
+          style={selectStyle}
+        >
+          {(Object.keys(PAY_LABELS) as Array<PayBucket | 'all'>).map((k) => (
+            <option key={k} value={k}>{PAY_LABELS[k]}</option>
+          ))}
+        </select>
+        {isFiltered && (
+          <button
+            onClick={() => { setQuery(''); setStatusFilter('all'); setPayFilter('all'); }}
+            className="px-3 py-2 rounded text-[13px] border"
+            style={selectStyle}
+          >
+            Сбросить
+          </button>
+        )}
+      </div>
+
       <p className="text-[13px] mb-4" style={{ color: 'var(--ink-3)' }}>
-        {filtered.length === families.length
+        {!isFiltered
           ? `${families.length} ${families.length === 1 ? 'семья' : 'семей'}`
           : `${filtered.length} из ${families.length} (фильтр)`}
       </p>
@@ -169,7 +222,7 @@ export default function FamiliesTable({ families, serverNow }: Props) {
         </table>
         {sorted.length === 0 && (
           <p className="text-[13px] py-6 text-center" style={{ color: 'var(--ink-4)' }}>
-            Ничего не найдено по запросу &laquo;{query}&raquo;
+            Ничего не найдено по текущему фильтру
           </p>
         )}
       </div>
