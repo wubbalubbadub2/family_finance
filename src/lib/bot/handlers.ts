@@ -16,24 +16,27 @@ import { captureError } from '@/lib/observability';
 import { enforcePaidStatus } from '@/lib/bot/paywall';
 import type { Category } from '@/types';
 
-/**
- * Single source of truth for the welcome message. Used by both:
- *   - handleInviteArrival (brand new user just consumed an invite)
- *   - bare /start (existing user re-greeting)
- *
- * Shows the family's CURRENT categories (not hardcoded defaults) so an
- * existing user who has customized sees their real setup, and a fresh
- * user sees the auto-seeded universal defaults.
- */
-function buildWelcomeText(name: string, categories: Category[]): string {
-  const catList = categories.length > 0
+// Single support contact surfaced in welcome footers + error messages, so
+// users always have a human to escalate to when the bot can't help itself.
+const SUPPORT_HANDLE = '@shynggys_islam';
+
+function formatCategories(categories: Category[]): string {
+  return categories.length > 0
     ? categories.map((c) => `${c.emoji} ${c.name}`).join(' · ')
     : '(пока нет — создадутся автоматически на первой трате)';
+}
 
+const SUPPORT_FOOTER = `\n\nЧто-то не так? Напиши ${SUPPORT_HANDLE}.`;
+
+/**
+ * Welcome for a brand-NEW user: just got onboarded into a fresh family.
+ * Long-form because they need to understand what the bot does.
+ */
+function buildWelcomeText(name: string, categories: Category[]): string {
   return (
     `👋 Привет, ${name}!\n\n` +
     `Я веду семейный бюджет — пиши траты обычным текстом, я разберусь сам.\n\n` +
-    `📋 Сейчас у тебя такие категории:\n${catList}\n\n` +
+    `📋 Сейчас у тебя такие категории:\n${formatCategories(categories)}\n\n` +
     `Хочешь свои? Напиши, например:\n` +
     `«создай категории: Продукты, Бензин, Рестораны, Хобби»\n` +
     `Можно добавлять, переименовывать, удалять в любой момент. ` +
@@ -46,7 +49,22 @@ function buildWelcomeText(name: string, categories: Category[]): string {
     `• сколько на кофе? — поиск\n` +
     `• итоги месяца — общая сводка\n` +
     `• хочу накопить 1 000 000 к декабрю — поставить цель\n\n` +
-    `Просто начни писать.`
+    `Просто начни писать.` +
+    SUPPORT_FOOTER
+  );
+}
+
+/**
+ * Welcome-back for an EXISTING user re-tapping /start. Shorter — they
+ * already know what the bot does. Confirms which family they're in so
+ * they can spot the case where they tapped a link on the wrong account.
+ */
+function buildWelcomeBackText(name: string, familyName: string, categories: Category[]): string {
+  return (
+    `👋 С возвращением, ${name}!\n\n` +
+    `Ты в семье «${familyName}». Просто пиши свои траты — я разберусь.\n\n` +
+    `📋 Категории: ${formatCategories(categories)}` +
+    SUPPORT_FOOTER
   );
 }
 
@@ -203,23 +221,33 @@ async function handleInviteArrival(ctx: Context, code: string): Promise<void> {
 async function onboardFreshDmUser(ctx: Context): Promise<void> {
   const telegramId = ctx.from?.id;
   const name = ctx.from?.first_name || 'User';
-  if (!telegramId) { await ctx.reply('⛔ Не могу определить твой Telegram ID.'); return; }
+  if (!telegramId) {
+    await ctx.reply(`⛔ Не могу определить твой Telegram ID. Напиши ${SUPPORT_HANDLE}.`);
+    return;
+  }
 
   let familyId: string;
   try {
     familyId = await createFamily(`${name}'s family`);
   } catch (e) {
     await captureError(e, { source: 'onboardFreshDmUser:createFamily', userTgId: telegramId });
-    await ctx.reply('😔 Не удалось создать семью. Попробуй ещё раз через минуту.');
+    await ctx.reply(`😔 Не удалось создать семью. Попробуй ещё раз через минуту, или напиши ${SUPPORT_HANDLE}.`);
     return;
   }
 
   const userRes = await getOrCreateUserInFamily(telegramId, familyId, name, ctx.from?.username ?? null);
   if ('error' in userRes) {
+    // Most common cause: this Telegram account already exists in another
+    // family (e.g. user tapped a link on a wrong account, or admin manually
+    // moved them). The user can't fix this themselves — escalate to support.
     await captureError(new Error(userRes.error), {
       source: 'onboardFreshDmUser:getOrCreateUser', userTgId: telegramId,
     });
-    await ctx.reply('😔 Не удалось зарегистрировать тебя. Попробуй ещё раз.');
+    await ctx.reply(
+      `😔 Не получилось добавить тебя в семью.\n\n` +
+      `Возможно, ты уже зарегистрирован в другой семье. ` +
+      `Напиши ${SUPPORT_HANDLE} — он разберётся.`,
+    );
     return;
   }
 
@@ -286,8 +314,12 @@ export function createBot(): Bot {
       if (isPrivate && /^\/start(@\w+)?$/i.test(rawText)) {
         const existing = await getUserByTelegramId(telegramId);
         if (existing) {
-          const cats = await getCategoriesForFamily(existing.family_id).catch(() => [] as Category[]);
-          await ctx.reply(buildWelcomeText(existing.name, cats));
+          const [cats, fam] = await Promise.all([
+            getCategoriesForFamily(existing.family_id).catch(() => [] as Category[]),
+            getFamilyById(existing.family_id).catch(() => null),
+          ]);
+          const familyName = fam?.name ?? '?';
+          await ctx.reply(buildWelcomeBackText(existing.name, familyName, cats));
         } else {
           await onboardFreshDmUser(ctx);
         }
