@@ -355,6 +355,11 @@ export async function getCategoryBySlugInFamily(
 /**
  * Create a new category in a family. Slug is derived from the name if not
  * provided. Emoji + name must be supplied.
+ *
+ * If a category with the same slug already exists but was soft-deleted
+ * (is_active=false from a prior "Заменить" action), reactivate it instead
+ * of erroring out. The user's intent is the same: "I want a category with
+ * this name visible." Refreshes name+emoji to whatever the caller asked for.
  */
 export async function createCategory(input: {
   family_id: string;
@@ -365,10 +370,24 @@ export async function createCategory(input: {
   const slug = input.slug ?? slugifyForCategory(input.name);
   if (!slug) throw new Error('Невалидное название категории.');
 
-  // Compute next sort_order (append to end)
   const existing = await getAllCategoriesForFamily(input.family_id);
-  const nextOrder = (existing.reduce((m, c) => Math.max(m, c.sort_order ?? 0), 0)) + 1;
+  const collision = existing.find((c) => c.slug === slug);
+  if (collision) {
+    if (collision.is_active) {
+      throw new Error(`Категория с похожим названием уже есть: ${slug}.`);
+    }
+    // Soft-deleted match — reactivate (and refresh display name/emoji).
+    const { data, error } = await supabase
+      .from('categories')
+      .update({ is_active: true, name: input.name, emoji: input.emoji })
+      .eq('id', collision.id)
+      .select()
+      .single();
+    if (error) throw new Error(`Не удалось восстановить категорию: ${error.message}`);
+    return data;
+  }
 
+  const nextOrder = (existing.reduce((m, c) => Math.max(m, c.sort_order ?? 0), 0)) + 1;
   const { data, error } = await supabase
     .from('categories')
     .insert({
@@ -393,7 +412,14 @@ export async function createCategory(input: {
 /**
  * Bulk-create categories for a family. Used during onboarding so a new user
  * can set up 5–10 categories with ONE confirm tap instead of 10.
- * Skips any duplicates (slug collision) and reports them in a warnings list.
+ *
+ * If a slug matches a soft-deleted row (is_active=false from a prior
+ * "Заменить" action), reactivate it rather than reporting "уже существует".
+ * The user can't see soft-deleted categories so reporting them as conflicts
+ * looked like a hallucination ("but it's not in my list!"). Refreshes
+ * name+emoji to whatever the caller proposed.
+ *
+ * Only ACTIVE-row collisions still get reported as 'уже существует'.
  */
 export async function createCategoriesBulk(input: {
   family_id: string;
@@ -402,15 +428,37 @@ export async function createCategoriesBulk(input: {
   const created: Category[] = [];
   const skipped: { slug: string; reason: string }[] = [];
 
-  // Fetch existing sort_orders once so we can append new ones
   const existing = await getAllCategoriesForFamily(input.family_id);
   let nextOrder = existing.reduce((m, c) => Math.max(m, c.sort_order ?? 0), 0) + 1;
-  const existingSlugs = new Set(existing.map(c => c.slug));
+  const existingBySlug = new Map<string, Category>();
+  for (const c of existing) existingBySlug.set(c.slug, c);
 
   for (const c of input.categories) {
     const slug = c.slug ?? slugifyForCategory(c.name);
     if (!slug) { skipped.push({ slug: c.name, reason: 'пустое название' }); continue; }
-    if (existingSlugs.has(slug)) { skipped.push({ slug, reason: 'уже существует' }); continue; }
+
+    const collision = existingBySlug.get(slug);
+    if (collision) {
+      if (collision.is_active) {
+        skipped.push({ slug, reason: 'уже существует' });
+        continue;
+      }
+      // Soft-deleted match — reactivate and refresh display fields.
+      const { data, error } = await supabase
+        .from('categories')
+        .update({ is_active: true, name: c.name, emoji: c.emoji })
+        .eq('id', collision.id)
+        .select()
+        .single();
+      if (error) {
+        skipped.push({ slug, reason: `восстановление не удалось: ${error.message}` });
+        continue;
+      }
+      created.push(data);
+      // Update the local map so a later iteration sees this slug as active.
+      existingBySlug.set(slug, data);
+      continue;
+    }
 
     const { data, error } = await supabase
       .from('categories')
@@ -429,7 +477,7 @@ export async function createCategoriesBulk(input: {
       continue;
     }
     created.push(data);
-    existingSlugs.add(slug);
+    existingBySlug.set(slug, data);
   }
 
   return { created, skipped };
