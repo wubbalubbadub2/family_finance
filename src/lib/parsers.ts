@@ -82,6 +82,14 @@ export function tryParseDebt(text: string): { amount: number; name: string } | n
   return { amount, name };
 }
 
+/**
+ * @deprecated Unused since the Phase 1 intent refactor (2026-05-08). Undo
+ * intent now flows through Sonnet → `delete_last_transaction` tool. The
+ * regex matched "удали" anywhere in the message, which produced the
+ * "Удалить все категории и оставить только X, Y, Z" → "🗑️ Удалено: 1500 ₸ —
+ * кофе" bug (silently deleted a transaction). Kept as dead code for one
+ * release cycle in case a downstream caller needs it; delete in Phase 4.
+ */
 export function isUndoRequest(text: string): boolean {
   return /удали|отмени|undo|убери последн|верни назад|отмена/i.test(text);
 }
@@ -113,26 +121,19 @@ export function looksLikeNonExpenseIntent(text: string): boolean {
 }
 
 /**
- * Has the user actually said anything meaningful, or is this just punctuation?
+ * Empty-input guard. Returns false ONLY when the message has zero non-
+ * whitespace characters. Everything else — including "1", "?", "hm" — flows
+ * through to Sonnet which can interpret it against the open conversation.
  *
- * Background: with Sonnet handling fallback NL queries, ambiguous inputs like
- * "?", "??", "!", "...", "hmm" cause the model to anchor on recent
- * conversation history and hallucinate a response. Real prod incident: a
- * lone "?" in a group chat got back "Похоже, вы написали 'автобус 110'..."
- * referencing a transaction from 30min earlier. We short-circuit these
- * before they reach the LLM and ask the user to be more specific instead.
- *
- * Exception: short confirmation words ("да", "нет", "ok", "yes", "no") are
- * legitimate replies to a bot question. Real prod incident (2026-04-29):
- * bot offered to move a transaction, user said "да", short-circuit triggered
- * and the user's confirmation was lost. These pass through to Sonnet which
- * can use conversation history to interpret them in context.
+ * Why this is permissive: previously the function rejected anything under 3
+ * meaningful characters to dodge a hallucination case where Sonnet
+ * confronted with "?" anchored on the last expense in history and faked
+ * "Похоже, вы написали 'автобус 110'…". The cure was worse than the
+ * disease: it also blocked legitimate replies like "1" / "2" to a
+ * clarifying question the bot itself just asked. The right fix is at the
+ * Sonnet-context layer (pending_question + conversation history), not a
+ * char-count gate.
  */
-const ALWAYS_MEANINGFUL = /^(да|нет|ок|ok|yes|no|yep|nope|sure|конечно|нет\s*спасибо|давай|погнали|ага|угу|sure|готово|done|yep|cancel|отмена)\W*$/i;
-
 export function isMeaningfulInput(text: string): boolean {
-  const trimmed = text.trim();
-  if (ALWAYS_MEANINGFUL.test(trimmed)) return true;
-  const meaningfulChars = trimmed.replace(/[\s?!.,;:()\[\]{}<>—–-]/g, '');
-  return meaningfulChars.length >= 3;
+  return text.trim().length > 0;
 }

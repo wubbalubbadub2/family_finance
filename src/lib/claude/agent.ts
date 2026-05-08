@@ -53,15 +53,15 @@ import {
   tryParseExpenses,
   tryParseIncome,
   tryParseDebt,
-  isUndoRequest,
   isMeaningfulInput,
 } from '@/lib/parsers';
 
 // Re-export for any historical callers that imported from this module.
 // The deterministic parsers are no longer used by chat() — Sonnet handles
-// all intent recognition via log_expense/log_income/log_debt tools — but
-// the pure functions remain available for tests and any out-of-bot caller.
-export { stripCurrencyMarkers, tryParseExpenses, tryParseIncome, tryParseDebt, isUndoRequest };
+// all intent recognition via tools — but the pure functions remain available
+// for the hallucination guard ("Sonnet wrote ✅ but called no tool") and
+// for any out-of-bot caller.
+export { stripCurrencyMarkers, tryParseExpenses, tryParseIncome, tryParseDebt };
 
 const client = new Anthropic();
 // Sonnet 4.6 for tool routing — Haiku had ~15-30% miss rate on ambiguous
@@ -893,7 +893,19 @@ const WRITE_TOOLS: Anthropic.Tool[] = [
       'Propose creating MULTIPLE categories at once — one confirm covers all. ' +
       'Use for first-run setup ("создай категории Продукты 🛒, Транспорт 🚗, Кафе ☕") ' +
       'and for any message that lists ≥2 categories at once. Pick sensible emojis yourself ' +
-      'if the user only provides names.',
+      'if the user only provides names.\n\n' +
+      'ALSO use this tool for "delete-all-and-keep-only-X" intents — phrases that mean ' +
+      '"replace my whole category set with this list":\n' +
+      '  • "удали все категории и оставь только Кафе, Транспорт"\n' +
+      '  • "замени все стандартные на Продукты, Жильё, Хобби"\n' +
+      '  • "сбрось категории и сделай Овощи, Фрукты, Мясо"\n' +
+      '  • "хочу другие категории: A, B, C"\n' +
+      'Pass `categories=[A, B, C]` — the server\'s _replace_defaults logic handles the rest ' +
+      '(soft-deletes the old standard set on a fresh family with 0 transactions; on a family ' +
+      'that already has transactions, it appends the new ones and keeps existing categories ' +
+      'with their history intact). Either way the user gets a single confirm.\n\n' +
+      'Do NOT call propose_delete_category in a loop for this intent. Do NOT call ' +
+      'delete_last_transaction (that\'s only for undoing the most recent expense).',
     input_schema: {
       type: 'object' as const,
       properties: {
@@ -1024,6 +1036,26 @@ const DIRECT_WRITE_TOOLS: Anthropic.Tool[] = [
       required: ['amount', 'name'],
     },
   },
+  {
+    name: 'delete_last_transaction',
+    description:
+      'Soft-delete the user\'s most recent transaction (expense, income, or debt). NO confirmation — undone ' +
+      'immediately. Use ONLY when the user explicitly asks to undo their LAST transaction:\n' +
+      '  • "удали последнюю", "отмени последнюю трату", "верни последнюю", "удали"\n' +
+      '  • "undo", "cancel last", "revert last entry"\n' +
+      '  • "ой ошибся", "не то записал", "это лишнее" — when conversation history shows the bot just logged something\n\n' +
+      'DO NOT use for:\n' +
+      '  • "удали категорию X" → call propose_delete_category\n' +
+      '  • "удали цель X" → call propose_delete_goal\n' +
+      '  • "удали все категории и оставь только X, Y" → call propose_create_categories_bulk (handles replace)\n' +
+      '  • "удали транзакцию про X" / "удали кофе из апреля" → call propose_delete_transaction with a search step first\n\n' +
+      'If the user names a SPECIFIC target ("кофе", "из апреля", "категорию", "цель") — that is NOT this tool. ' +
+      'This tool is purely "the most recent thing I logged". When in doubt, ask the user to clarify.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {},
+    },
+  },
 ];
 
 const DIRECT_WRITE_TOOL_NAMES = new Set(DIRECT_WRITE_TOOLS.map(t => t.name));
@@ -1077,6 +1109,10 @@ async function executeDirectWriteTool(
         throw new Error('Сумма долга должна быть > 0');
       }
       return await handleDebt({ amount, name }, ctx);
+    }
+    case 'delete_last_transaction': {
+      // No args — handleUndo finds the user's last transaction itself.
+      return await handleUndo(ctx);
     }
     default:
       throw new Error(`Неизвестный direct-write tool: ${toolName}`);
@@ -1651,15 +1687,14 @@ export async function chat(
     familyCategoriesCheck = await getCategoriesForFamily(ctx.familyId).catch(() => []);
   }
 
-  // ── 1. Undo fast path (single keyword, zero ambiguity) ──
-  if (isUndoRequest(text)) {
-    const reply = await handleUndo(ctx);
-    await saveUserMsg();
-    await saveAssistantMsg(reply);
-    return textOnly(reply);
-  }
-
-  // ── 2. Conversation context ──
+  // ── 1. Conversation context ──
+  // Undo intent now flows through Sonnet → delete_last_transaction tool. The
+  // old `isUndoRequest` regex-shortcut deleted this path because it matched
+  // "удали" anywhere in the message, including "Удалить все категории и
+  // оставить только X, Y, Z" — which then dropped the last transaction
+  // instead of routing to the categories tool. Sonnet sees the full message
+  // and decides between delete_last_transaction / propose_delete_category /
+  // propose_create_categories_bulk based on what the user actually said.
   // Last assistant turn drives a hint Sonnet gets in the system prompt:
   // "you just asked X — interpret the user's reply in that context." We
   // no longer use it to gate parsers because we no longer have parsers.
@@ -1677,8 +1712,9 @@ export async function chat(
   // hallucination guard at the bottom of this function for the
   // "Sonnet skipped the tool" failure mode.
   //
-  // Kept up-stack: isUndoRequest (single keyword, can't misclassify),
-  // isMeaningfulInput (short-circuits "?", "...", "hmm" before LLM cost).
+  // Kept up-stack: only isMeaningfulInput, and only as an empty-input guard
+  // (returns false ONLY when the trimmed text has zero characters). All
+  // other intent — including undo — flows through Sonnet.
   const messages: Anthropic.MessageParam[] = [];
   for (const msg of history) {
     if (messages.length === 0 && msg.role === 'assistant') continue;
