@@ -226,53 +226,33 @@ describe('tryParseDebt', () => {
   });
 });
 
-describe('isMeaningfulInput — ambiguous-input short-circuit', () => {
-  test('rejects lone "?" (real prod hallucination case)', () => {
-    // A lone "?" in a group chat made Sonnet fabricate "Похоже, вы написали
-    // 'автобус 110'..." referencing a transaction from earlier. We short-
-    // circuit before the LLM sees it.
-    assert.equal(isMeaningfulInput('?'), false);
-  });
-
-  test('rejects "??", "!", "...", "??!"', () => {
-    assert.equal(isMeaningfulInput('??'), false);
-    assert.equal(isMeaningfulInput('!'), false);
-    assert.equal(isMeaningfulInput('...'), false);
-    assert.equal(isMeaningfulInput('??!'), false);
-    assert.equal(isMeaningfulInput('   '), false);
+describe('isMeaningfulInput — empty-input guard only', () => {
+  test('rejects empty / whitespace-only inputs', () => {
     assert.equal(isMeaningfulInput(''), false);
+    assert.equal(isMeaningfulInput('   '), false);
+    assert.equal(isMeaningfulInput('\n\t '), false);
   });
 
-  test('rejects 1-2 character mumbles (but NOT confirmation words)', () => {
-    assert.equal(isMeaningfulInput('a'), false);
-    assert.equal(isMeaningfulInput('xy'), false);
-    assert.equal(isMeaningfulInput('hm'), false);
-    // "ok" and "да" are now allow-listed as confirmation words (see test below)
+  test('accepts short replies — single chars, digits, punctuation', () => {
+    // These used to be rejected by the old ≥3-meaningful-chars rule. The new
+    // rule passes them through to Sonnet, which has the open-question
+    // context to interpret a "1" / "?" reply correctly.
+    assert.equal(isMeaningfulInput('1'), true);
+    assert.equal(isMeaningfulInput('2'), true);
+    assert.equal(isMeaningfulInput('a'), true);
+    assert.equal(isMeaningfulInput('xy'), true);
+    assert.equal(isMeaningfulInput('hm'), true);
+    assert.equal(isMeaningfulInput('?'), true);
+    assert.equal(isMeaningfulInput('??'), true);
+    assert.equal(isMeaningfulInput('...'), true);
   });
 
-  test('accepts real questions (>= 3 meaningful chars)', () => {
-    assert.equal(isMeaningfulInput('кофе'), true);
-    assert.equal(isMeaningfulInput('сколько?'), true);
-    assert.equal(isMeaningfulInput('покажи'), true);
-    assert.equal(isMeaningfulInput('кофе 500'), true);
-  });
-
-  test('accepts short-but-meaningful "хлеб 100"', () => {
-    assert.equal(isMeaningfulInput('хлеб 100'), true);
-  });
-
-  test('lets confirmation words through (real prod incident: "да" lost)', () => {
-    // Bot suggested moving a transaction, user replied "да", short-circuit
-    // killed it before Sonnet could see the conversation context. Must pass.
+  test('accepts confirmation words and full sentences', () => {
     assert.equal(isMeaningfulInput('да'), true);
-    assert.equal(isMeaningfulInput('Да'), true);
-    assert.equal(isMeaningfulInput('ДА'), true);
     assert.equal(isMeaningfulInput('нет'), true);
     assert.equal(isMeaningfulInput('ok'), true);
-    assert.equal(isMeaningfulInput('OK'), true);
-    assert.equal(isMeaningfulInput('yes'), true);
-    assert.equal(isMeaningfulInput('давай'), true);
-    assert.equal(isMeaningfulInput('отмена'), true);
+    assert.equal(isMeaningfulInput('кофе 500'), true);
+    assert.equal(isMeaningfulInput('сколько на чипсы?'), true);
   });
 });
 
