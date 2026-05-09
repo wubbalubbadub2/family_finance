@@ -34,11 +34,16 @@ echo "→ git push origin dev"
 git push origin dev
 
 # 4. Wait for a NEW preview deploy to appear and be Ready. Poll up to 5 min.
+# Vercel can take 60-90s to even REGISTER a new deploy after a push (let alone
+# build it). The earlier heuristic that bailed at 30s with "push was no-op"
+# was wrong — it assumed instant deploy registration. Now we patiently wait
+# the full 5 min for a new-and-Ready deploy. If after 5 min nothing has
+# changed, fall back to re-aliasing the current latest (the genuine no-op
+# case where source files didn't change).
 echo "→ Waiting for Vercel build (up to 5 min)..."
 NEW_DEPLOY=""
 for i in $(seq 1 60); do
   sleep 5
-  # vercel ls preview — newest first.
   LATEST_LINE=$(vercel ls 2>/dev/null | grep "Preview" | head -1 || true)
   if [ -z "$LATEST_LINE" ]; then continue; fi
 
@@ -46,19 +51,10 @@ for i in $(seq 1 60); do
   LATEST_HOST="${LATEST_URL#https://}"
   STATUS=$(echo "$LATEST_LINE" | awk '{print $5}')
 
-  # Skip if it's the same deploy we started from AND no Ready signal yet.
   if [ "$LATEST_HOST" = "$BEFORE" ]; then
-    # Same deploy still latest — push was a no-op, OR build hasn't started.
-    # Wait one more cycle then exit the wait loop (nothing new to deploy).
-    if [ "$i" -ge 6 ]; then
-      echo "→ No new deploy after 30s (push was likely a no-op). Re-aliasing to current latest."
-      NEW_DEPLOY="$LATEST_URL"
-      break
-    fi
-    continue
+    continue  # No new deploy yet; keep waiting.
   fi
 
-  # Different deploy — wait for Ready.
   if echo "$STATUS" | grep -q "Ready"; then
     NEW_DEPLOY="$LATEST_URL"
     echo "→ New deploy Ready: $NEW_DEPLOY (took ~$((i*5))s)"
@@ -66,9 +62,18 @@ for i in $(seq 1 60); do
   fi
 done
 
+# Fallback: nothing new after 5 min — push was likely a true no-op (no source
+# files changed). Re-alias to current latest so the alias stays current.
 if [ -z "$NEW_DEPLOY" ]; then
-  echo "✗ Timed out waiting for build. Check 'vercel ls' manually and run 'vercel alias set <url> $ALIAS_HOST'."
-  exit 1
+  LATEST_LINE=$(vercel ls 2>/dev/null | grep "Preview" | head -1 || true)
+  if [ -n "$LATEST_LINE" ]; then
+    LATEST_URL=$(echo "$LATEST_LINE" | awk '{print $3}')
+    echo "→ No new deploy after 5 min — re-aliasing to current latest ($LATEST_URL)."
+    NEW_DEPLOY="$LATEST_URL"
+  else
+    echo "✗ No preview deploys found. Check 'vercel ls' manually."
+    exit 1
+  fi
 fi
 
 # 5. Re-alias.
