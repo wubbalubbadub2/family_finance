@@ -6,7 +6,6 @@ import {
   getUserByTelegramId,
   createFamily,
   createFamilyInvite,
-  getCategoriesForFamily,
   resolveFamilyForChat,
   getOrCreateUserInFamily,
   getFamilyById,
@@ -14,57 +13,39 @@ import {
 } from '@/lib/db/queries';
 import { captureError } from '@/lib/observability';
 import { enforcePaidStatus } from '@/lib/bot/paywall';
-import type { Category } from '@/types';
 
-// Single support contact surfaced in welcome footers + error messages, so
-// users always have a human to escalate to when the bot can't help itself.
+// Single support contact surfaced in error messages, so users always have a
+// human to escalate to when the bot can't help itself. Removed from welcome
+// messages — we want the welcome to push users into their first transaction,
+// not into a support DM. They'll discover support via /help or via errors.
 const SUPPORT_HANDLE = '@shynggys_islam';
-
-function formatCategories(categories: Category[]): string {
-  return categories.length > 0
-    ? categories.map((c) => `${c.emoji} ${c.name}`).join(' · ')
-    : '(пока нет — создадутся автоматически на первой трате)';
-}
-
-const SUPPORT_FOOTER = `\n\nЧто-то не так? Напиши ${SUPPORT_HANDLE}.`;
 
 /**
  * Welcome for a brand-NEW user: just got onboarded into a fresh family.
- * Long-form because they need to understand what the bot does.
+ *
+ * Three short paragraphs. No categories list, no examples beyond one, no
+ * customization paragraph, no support footer. The previous version had ~15
+ * lines and 27 of 30 onboarded-silent customers wrote zero messages after
+ * seeing it (per 2026-05-09 product analytics) — they bounced at the wall of
+ * text. The new version's only job is to make the first transaction feel
+ * effortless.
  */
-function buildWelcomeText(name: string, categories: Category[]): string {
+function buildWelcomeText(name: string): string {
   return (
-    `👋 Привет, ${name}!\n\n` +
-    `Я веду семейный бюджет — пиши траты обычным текстом, я разберусь сам.\n\n` +
-    `📋 Сейчас у тебя такие категории:\n${formatCategories(categories)}\n\n` +
-    `Хочешь свои? Напиши, например:\n` +
-    `«создай категории: Продукты, Бензин, Рестораны, Хобби»\n` +
-    `Можно добавлять, переименовывать, удалять в любой момент. ` +
-    `При удалении категории её траты переедут в Разное.\n\n` +
-    `Что попробовать:\n` +
-    `• кофе 500 — записать трату\n` +
-    `• зарплата 500 000 — записать доход\n` +
-    `• взял в долг 100 000 у Аидара — записать долг\n` +
-    `• поставь лимит 80 000 на Продукты — план на категорию\n` +
-    `• сколько на кофе? — поиск\n` +
-    `• итоги месяца — общая сводка\n` +
-    `• хочу накопить 1 000 000 к декабрю — поставить цель\n\n` +
-    `Просто начни писать.` +
-    SUPPORT_FOOTER
+    `Привет, ${name}!\n\n` +
+    `Я помогу тебе разобраться с твоими финансами. Чем больше и чаще ты мне пишешь, тем больше я буду приносить ценность.\n\n` +
+    `Напиши свою первую трату: например, «кофе 500».`
   );
 }
 
 /**
- * Welcome-back for an EXISTING user re-tapping /start. Shorter — they
- * already know what the bot does. Confirms which family they're in so
- * they can spot the case where they tapped a link on the wrong account.
+ * Welcome-back for an EXISTING user re-tapping /start. Same minimal shape as
+ * the fresh welcome.
  */
-function buildWelcomeBackText(name: string, familyName: string, categories: Category[]): string {
+function buildWelcomeBackText(name: string): string {
   return (
-    `👋 С возвращением, ${name}!\n\n` +
-    `Ты в семье «${familyName}». Просто пиши свои траты — я разберусь.\n\n` +
-    `📋 Категории: ${formatCategories(categories)}` +
-    SUPPORT_FOOTER
+    `Привет снова, ${name}!\n\n` +
+    `Просто продолжай писать свои траты — например, «кофе 500».`
   );
 }
 
@@ -199,12 +180,9 @@ async function handleInviteArrival(ctx: Context, code: string): Promise<void> {
   }
 
   // Success — brand new user (or idempotent re-tap).
-  // Fetch the family's actual categories so the welcome reflects whatever was
-  // auto-seeded at family creation (or whatever the user has since customized).
-  const cats = await getCategoriesForFamily(result.familyId).catch(() => [] as Category[]);
   // No parse_mode: bot username + Russian text would trip the legacy Markdown
   // underscore-as-italic bug. Plain text is the most robust render path.
-  await ctx.reply(buildWelcomeText(name, cats));
+  await ctx.reply(buildWelcomeText(name));
 }
 
 /**
@@ -251,8 +229,7 @@ async function onboardFreshDmUser(ctx: Context): Promise<void> {
     return;
   }
 
-  const cats = await getCategoriesForFamily(familyId).catch(() => [] as Category[]);
-  await ctx.reply(buildWelcomeText(name, cats));
+  await ctx.reply(buildWelcomeText(name));
 }
 
 export function createBot(): Bot {
@@ -314,12 +291,7 @@ export function createBot(): Bot {
       if (isPrivate && /^\/start(@\w+)?$/i.test(rawText)) {
         const existing = await getUserByTelegramId(telegramId);
         if (existing) {
-          const [cats, fam] = await Promise.all([
-            getCategoriesForFamily(existing.family_id).catch(() => [] as Category[]),
-            getFamilyById(existing.family_id).catch(() => null),
-          ]);
-          const familyName = fam?.name ?? '?';
-          await ctx.reply(buildWelcomeBackText(existing.name, familyName, cats));
+          await ctx.reply(buildWelcomeBackText(existing.name));
         } else {
           await onboardFreshDmUser(ctx);
         }
