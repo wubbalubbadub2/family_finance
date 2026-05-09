@@ -39,14 +39,11 @@ function buildWelcomeText(name: string): string {
 }
 
 /**
- * Welcome-back for an EXISTING user re-tapping /start. Same minimal shape as
- * the fresh welcome.
+ * Welcome-back for an EXISTING user re-tapping /start. One line, no name —
+ * the user knows who they are. Just nudges them back to the action.
  */
-function buildWelcomeBackText(name: string): string {
-  return (
-    `Привет снова, ${name}!\n\n` +
-    `Просто продолжай писать свои траты — например, «кофе 500».`
-  );
+function buildWelcomeBackText(): string {
+  return `Рад тебя снова видеть! Продолжай активно писать свои траты - например, «кофе 500».`;
 }
 
 // NOTE: we removed ALLOWED_TELEGRAM_IDS. Allowlist is the `users` table now.
@@ -291,7 +288,7 @@ export function createBot(): Bot {
       if (isPrivate && /^\/start(@\w+)?$/i.test(rawText)) {
         const existing = await getUserByTelegramId(telegramId);
         if (existing) {
-          await ctx.reply(buildWelcomeBackText(existing.name));
+          await ctx.reply(buildWelcomeBackText());
         } else {
           await onboardFreshDmUser(ctx);
         }
