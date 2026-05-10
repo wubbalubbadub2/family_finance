@@ -23,18 +23,22 @@ const SUPPORT_HANDLE = '@shynggys_islam';
 /**
  * Welcome for a brand-NEW user: just got onboarded into a fresh family.
  *
- * Three short paragraphs. No categories list, no examples beyond one, no
- * customization paragraph, no support footer. The previous version had ~15
- * lines and 27 of 30 onboarded-silent customers wrote zero messages after
- * seeing it (per 2026-05-09 product analytics) — they bounced at the wall of
- * text. The new version's only job is to make the first transaction feel
- * effortless.
+ * Concrete examples, zero abstraction. The earlier version included a
+ * "Я помогу тебе разобраться с твоими финансами. Чем больше и чаще ты мне
+ * пишешь, тем больше я буду приносить ценность" sentence which framed the
+ * bot as homework with delayed payoff — exactly the engagement-farming tone
+ * second-opinion review (Gemini + ChatGPT, 2026-05-10) flagged as an
+ * activation killer. Three concrete examples covering expense / transport /
+ * income demonstrate what the bot accepts, without making any claims the
+ * user has to take on faith.
  */
 function buildWelcomeText(name: string): string {
   return (
-    `Привет, ${name}!\n\n` +
-    `Я помогу тебе разобраться с твоими финансами. Чем больше и чаще ты мне пишешь, тем больше я буду приносить ценность.\n\n` +
-    `Напиши свою первую трату: например, «кофе 500».`
+    `Привет, ${name} 👋\n\n` +
+    `Напиши свою трату — например:\n` +
+    `  • кофе 500\n` +
+    `  • такси 2300\n` +
+    `  • зарплата 500 000`
   );
 }
 
