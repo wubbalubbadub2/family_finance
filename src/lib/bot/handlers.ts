@@ -6,7 +6,6 @@ import {
   getUserByTelegramId,
   createFamily,
   createFamilyInvite,
-  getCategoriesForFamily,
   resolveFamilyForChat,
   getOrCreateUserInFamily,
   getFamilyById,
@@ -14,40 +13,37 @@ import {
 } from '@/lib/db/queries';
 import { captureError } from '@/lib/observability';
 import { enforcePaidStatus } from '@/lib/bot/paywall';
-import type { Category } from '@/types';
+
+// Single support contact surfaced in error messages, so users always have a
+// human to escalate to when the bot can't help itself. Removed from welcome
+// messages — we want the welcome to push users into their first transaction,
+// not into a support DM. They'll discover support via /help or via errors.
+const SUPPORT_HANDLE = '@shynggys_islam';
 
 /**
- * Single source of truth for the welcome message. Used by both:
- *   - handleInviteArrival (brand new user just consumed an invite)
- *   - bare /start (existing user re-greeting)
+ * Welcome for a brand-NEW user: just got onboarded into a fresh family.
  *
- * Shows the family's CURRENT categories (not hardcoded defaults) so an
- * existing user who has customized sees their real setup, and a fresh
- * user sees the auto-seeded universal defaults.
+ * Three short paragraphs. No categories list, no examples beyond one, no
+ * customization paragraph, no support footer. The previous version had ~15
+ * lines and 27 of 30 onboarded-silent customers wrote zero messages after
+ * seeing it (per 2026-05-09 product analytics) — they bounced at the wall of
+ * text. The new version's only job is to make the first transaction feel
+ * effortless.
  */
-function buildWelcomeText(name: string, categories: Category[]): string {
-  const catList = categories.length > 0
-    ? categories.map((c) => `${c.emoji} ${c.name}`).join(' · ')
-    : '(пока нет — создадутся автоматически на первой трате)';
-
+function buildWelcomeText(name: string): string {
   return (
-    `👋 Привет, ${name}!\n\n` +
-    `Я веду семейный бюджет — пиши траты обычным текстом, я разберусь сам.\n\n` +
-    `📋 Сейчас у тебя такие категории:\n${catList}\n\n` +
-    `Хочешь свои? Напиши, например:\n` +
-    `«создай категории: Продукты, Бензин, Рестораны, Хобби»\n` +
-    `Можно добавлять, переименовывать, удалять в любой момент. ` +
-    `При удалении категории её траты переедут в Разное.\n\n` +
-    `Что попробовать:\n` +
-    `• кофе 500 — записать трату\n` +
-    `• зарплата 500 000 — записать доход\n` +
-    `• взял в долг 100 000 у Аидара — записать долг\n` +
-    `• поставь лимит 80 000 на Продукты — план на категорию\n` +
-    `• сколько на кофе? — поиск\n` +
-    `• итоги месяца — общая сводка\n` +
-    `• хочу накопить 1 000 000 к декабрю — поставить цель\n\n` +
-    `Просто начни писать.`
+    `Привет, ${name}!\n\n` +
+    `Я помогу тебе разобраться с твоими финансами. Чем больше и чаще ты мне пишешь, тем больше я буду приносить ценность.\n\n` +
+    `Напиши свою первую трату: например, «кофе 500».`
   );
+}
+
+/**
+ * Welcome-back for an EXISTING user re-tapping /start. One line, no name —
+ * the user knows who they are. Just nudges them back to the action.
+ */
+function buildWelcomeBackText(): string {
+  return `Рад тебя снова видеть! Продолжай активно писать свои траты - например, «кофе 500».`;
 }
 
 // NOTE: we removed ALLOWED_TELEGRAM_IDS. Allowlist is the `users` table now.
@@ -181,12 +177,9 @@ async function handleInviteArrival(ctx: Context, code: string): Promise<void> {
   }
 
   // Success — brand new user (or idempotent re-tap).
-  // Fetch the family's actual categories so the welcome reflects whatever was
-  // auto-seeded at family creation (or whatever the user has since customized).
-  const cats = await getCategoriesForFamily(result.familyId).catch(() => [] as Category[]);
   // No parse_mode: bot username + Russian text would trip the legacy Markdown
   // underscore-as-italic bug. Plain text is the most robust render path.
-  await ctx.reply(buildWelcomeText(name, cats));
+  await ctx.reply(buildWelcomeText(name));
 }
 
 /**
@@ -203,28 +196,37 @@ async function handleInviteArrival(ctx: Context, code: string): Promise<void> {
 async function onboardFreshDmUser(ctx: Context): Promise<void> {
   const telegramId = ctx.from?.id;
   const name = ctx.from?.first_name || 'User';
-  if (!telegramId) { await ctx.reply('⛔ Не могу определить твой Telegram ID.'); return; }
+  if (!telegramId) {
+    await ctx.reply(`⛔ Не могу определить твой Telegram ID. Напиши ${SUPPORT_HANDLE}.`);
+    return;
+  }
 
   let familyId: string;
   try {
     familyId = await createFamily(`${name}'s family`);
   } catch (e) {
     await captureError(e, { source: 'onboardFreshDmUser:createFamily', userTgId: telegramId });
-    await ctx.reply('😔 Не удалось создать семью. Попробуй ещё раз через минуту.');
+    await ctx.reply(`😔 Не удалось создать семью. Попробуй ещё раз через минуту, или напиши ${SUPPORT_HANDLE}.`);
     return;
   }
 
   const userRes = await getOrCreateUserInFamily(telegramId, familyId, name, ctx.from?.username ?? null);
   if ('error' in userRes) {
+    // Most common cause: this Telegram account already exists in another
+    // family (e.g. user tapped a link on a wrong account, or admin manually
+    // moved them). The user can't fix this themselves — escalate to support.
     await captureError(new Error(userRes.error), {
       source: 'onboardFreshDmUser:getOrCreateUser', userTgId: telegramId,
     });
-    await ctx.reply('😔 Не удалось зарегистрировать тебя. Попробуй ещё раз.');
+    await ctx.reply(
+      `😔 Не получилось добавить тебя в семью.\n\n` +
+      `Возможно, ты уже зарегистрирован в другой семье. ` +
+      `Напиши ${SUPPORT_HANDLE} — он разберётся.`,
+    );
     return;
   }
 
-  const cats = await getCategoriesForFamily(familyId).catch(() => [] as Category[]);
-  await ctx.reply(buildWelcomeText(name, cats));
+  await ctx.reply(buildWelcomeText(name));
 }
 
 export function createBot(): Bot {
@@ -286,8 +288,7 @@ export function createBot(): Bot {
       if (isPrivate && /^\/start(@\w+)?$/i.test(rawText)) {
         const existing = await getUserByTelegramId(telegramId);
         if (existing) {
-          const cats = await getCategoriesForFamily(existing.family_id).catch(() => [] as Category[]);
-          await ctx.reply(buildWelcomeText(existing.name, cats));
+          await ctx.reply(buildWelcomeBackText());
         } else {
           await onboardFreshDmUser(ctx);
         }
