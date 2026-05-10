@@ -391,12 +391,36 @@ export function createBot(): Bot {
         return;
       }
 
-      // Path 4: registered user → normal chat() flow
-      const cleanText = rawText
+      // Path 4: registered user → normal chat() flow.
+      //
+      // Slash commands from the Telegram menu (BotFather /setcommands) arrive
+      // here as "/summary", "/help", etc. with no payload. Stripping the
+      // leading slash-word leaves an empty string and we'd silently no-op,
+      // which is exactly what happened to /summary, /help, /categories on the
+      // dev bot's first menu test. Map known menu commands to natural-Russian
+      // phrases that Sonnet already handles well — verified by user that
+      // "итоги месяца" / "мои категории" / "что умеет бот" produce correct
+      // replies. Unknown bare slash commands still no-op, which is fine.
+      const SLASH_COMMAND_TO_NL: Record<string, string> = {
+        summary: 'итоги месяца',
+        categories: 'мои категории',
+        help: 'что умеет бот',
+      };
+
+      let cleanText = rawText
         .replace(/@\w+/g, '')
         .replace(/^\/\w+\s*/, '')
         .trim();
-      if (!cleanText) return;
+
+      if (!cleanText) {
+        const slashMatch = rawText.trim().match(/^\/(\w+)/);
+        const cmd = slashMatch?.[1].toLowerCase();
+        if (cmd && SLASH_COMMAND_TO_NL[cmd]) {
+          cleanText = SLASH_COMMAND_TO_NL[cmd];
+        } else {
+          return; // Unknown bare slash command — silent no-op
+        }
+      }
 
       await ctx.replyWithChatAction('typing').catch(() => { /* groups can disallow */ });
       const userName = ctx.from?.first_name || user.name || 'User';
