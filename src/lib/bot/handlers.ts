@@ -32,7 +32,7 @@ const SUPPORT_HANDLE = '@shynggys_islam';
  * income demonstrate what the bot accepts, without making any claims the
  * user has to take on faith.
  */
-function buildWelcomeText(name: string): string {
+export function buildWelcomeText(name: string): string {
   return (
     `Привет, ${name} 👋\n\n` +
     `Напиши свою трату — например:\n` +
@@ -46,7 +46,7 @@ function buildWelcomeText(name: string): string {
  * Welcome-back for an EXISTING user re-tapping /start. One line, no name —
  * the user knows who they are. Just nudges them back to the action.
  */
-function buildWelcomeBackText(): string {
+export function buildWelcomeBackText(): string {
   return `Рад тебя снова видеть! Продолжай активно писать свои траты - например, «кофе 500».`;
 }
 

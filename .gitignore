@@ -35,3 +35,7 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# local prod analytics output (may contain user content; never commit)
+prod-*.md
+prod-*.txt

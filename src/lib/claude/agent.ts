@@ -29,8 +29,6 @@ import {
   addGoalContribution,
   createCategory,
   createCategoriesBulk,
-  replaceCategoriesForFreshFamily,
-  countActiveTransactions,
   renameCategory,
   deleteCategory,
   mergeCategories,
@@ -42,6 +40,7 @@ import {
   resolveCategoryByName,
   findRecentDuplicate,
   seedDefaultCategoriesForFamily,
+  russianStem,
   type ConfirmType,
   type PendingConfirm,
 } from '@/lib/db/queries';
@@ -62,6 +61,83 @@ import {
 // for the hallucination guard ("Sonnet wrote ✅ but called no tool") and
 // for any out-of-bot caller.
 export { stripCurrencyMarkers, tryParseExpenses, tryParseIncome, tryParseDebt };
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Layer 3 — pending_confirm context invalidation
+//
+// User C's 25-min Day-1 disaster (2026-05-04 prod logs) was driven by a goal
+// proposal that stayed in `pending_confirm` while the conversation moved on.
+// Every "Да" / "Создай!" the user typed in a totally unrelated turn was
+// interpreted by Sonnet as confirming the stale goal. The fix: when the
+// incoming user message looks like a new-action intent rather than a
+// confirm/cancel of the open proposal, clear the pending state first.
+//
+// Three-rule classifier (called only when pending_confirm exists):
+//   1. message starts with a confirm/cancel token → preserve (let the
+//      existing flow execute or cancel the action via callback or natural
+//      Sonnet routing). Match by PREFIX, not contains, so "да, создай"
+//      hits rule 1 (confirm) and is NOT clobbered by rule 2's "создай".
+//   2. any token in the message has a russianStem matching a known
+//      context-shift verb → clear-and-proceed (the user is doing something
+//      else now; let Sonnet see the message with no stale pending state).
+//   3. otherwise (short reply like "?" or "hm") → preserve.
+//
+// Placed AFTER markUpdateSeen (handlers.ts:252 — already covered, chat()
+// only runs on a non-retry update), so a Telegram retry never re-runs this
+// classifier on a message that's already been processed.
+// ═══════════════════════════════════════════════════════════════════════════
+
+export type PendingConfirmTransition = 'preserve' | 'clear-and-proceed';
+
+// Prefix-match list. Lowercased, trimmed comparison.
+// Includes the design doc's explicit tokens plus common Russian/English
+// natural confirmations called out in the eng-review test plan ("ага удали"
+// must hit rule 1 not rule 2). Order-independent.
+const CONFIRM_PREFIXES: readonly string[] = [
+  '✅', '❌',
+  'да', 'нет', 'ага', 'угу', 'ок', 'ok', 'yes', 'no', 'yep', 'nope', 'sure',
+  'confirm', 'cancel',
+  'подтверждаю', 'отмена',
+];
+
+// Stems of context-shift verbs. Compared against russianStem(token) for
+// each token in the user message. startsWith match so off-by-one stripping
+// from russianStem (e.g. "сколько" → "скольк") still hits.
+const CONTEXT_SHIFT_STEMS: readonly string[] = [
+  'созда', 'добав', 'удал', 'перенес', 'переимен', 'покаж', 'скольк', 'итог',
+  'найд', 'постав', 'измен',
+];
+
+// English fallback — literal lowercased tokens. The bot is Russian-first
+// but a chunk of users type mixed RU/EN ("hey, create a new category").
+const CONTEXT_SHIFT_ENGLISH: readonly string[] = [
+  'create', 'add', 'delete', 'show', 'set', 'find',
+];
+
+export function classifyPendingConfirmTransition(text: string): PendingConfirmTransition {
+  const lower = text.trim().toLowerCase();
+  if (!lower) return 'preserve';
+
+  // Rule 1: prefix-match a confirm/cancel token. Lets "да, создай" through
+  // as confirm without rule 2 clobbering it.
+  for (const prefix of CONFIRM_PREFIXES) {
+    if (lower.startsWith(prefix)) return 'preserve';
+  }
+
+  // Rule 2: any token's stem matches a context-shift verb → clear.
+  const tokens = lower.split(/[\s.,!?;:()\[\]{}<>—–"'/\\]+/).filter(Boolean);
+  for (const token of tokens) {
+    if (CONTEXT_SHIFT_ENGLISH.includes(token)) return 'clear-and-proceed';
+    const stem = russianStem(token);
+    for (const target of CONTEXT_SHIFT_STEMS) {
+      if (stem === target || stem.startsWith(target)) return 'clear-and-proceed';
+    }
+  }
+
+  // Rule 3: preserve. Short replies like "?", "hm", and bare numerals fall
+  // here — Sonnet sees the message AND the still-active pending_confirm.
+  return 'preserve';
+}
 
 const client = new Anthropic();
 // Sonnet 4.6 for tool routing — Haiku had ~15-30% miss rate on ambiguous
@@ -699,9 +775,10 @@ propose_create_category.
 - "поставь лимит N на [категорию]" (ОДНА категория) → propose_set_monthly_plan
 - "поставь лимиты на категории: A 10к, B 20к, C 30к" / "поставь оставшиеся лимиты" / любое сообщение с ≥2 лимитов → propose_set_monthly_plans_bulk (ОДНА кнопка подтверждения на все)
 - "создай категорию X" (одна) → propose_create_category
-- "создай категории X, Y, Z" / "добавь 5 категорий" / "стартовый набор" → propose_create_categories_bulk
+- "создай категории X, Y, Z" / "добавь 5 категорий" / "стартовый набор" → propose_create_categories_bulk (ВСЕГДА добавляет, существующие категории сохраняются)
 - "переименуй X в Y" / "поменяй название" → propose_rename_category
-- "удали категорию" → propose_delete_category
+- "удали категорию X" (одна конкретная) → propose_delete_category
+- "удали все категории и оставь только X, Y, Z" / "сбрось всё и сделай..." → НЕ вызывай инструмент, ответь текстом: "Удаление категорий по одной. Напиши «удали категорию ИМЯ». После этого можно добавить новые через «создай категории A, B, C»."
 - "объедини X в Y" → propose_merge_categories
 
 КРИТИЧЕСКИ ВАЖНО: результаты read-tools И direct-write tools — ЭТО УЖЕ ГОТОВЫЙ ТЕКСТ
@@ -894,18 +971,11 @@ const WRITE_TOOLS: Anthropic.Tool[] = [
       'Use for first-run setup ("создай категории Продукты 🛒, Транспорт 🚗, Кафе ☕") ' +
       'and for any message that lists ≥2 categories at once. Pick sensible emojis yourself ' +
       'if the user only provides names.\n\n' +
-      'ALSO use this tool for "delete-all-and-keep-only-X" intents — phrases that mean ' +
-      '"replace my whole category set with this list":\n' +
-      '  • "удали все категории и оставь только Кафе, Транспорт"\n' +
-      '  • "замени все стандартные на Продукты, Жильё, Хобби"\n' +
-      '  • "сбрось категории и сделай Овощи, Фрукты, Мясо"\n' +
-      '  • "хочу другие категории: A, B, C"\n' +
-      'Pass `categories=[A, B, C]` — the server\'s _replace_defaults logic handles the rest ' +
-      '(soft-deletes the old standard set on a fresh family with 0 transactions; on a family ' +
-      'that already has transactions, it appends the new ones and keeps existing categories ' +
-      'with their history intact). Either way the user gets a single confirm.\n\n' +
-      'Do NOT call propose_delete_category in a loop for this intent. Do NOT call ' +
-      'delete_last_transaction (that\'s only for undoing the most recent expense).',
+      'Always APPENDS. Existing categories are preserved. If the user wants ' +
+      '"replace my whole set" or "удали все и оставь только X, Y" — see the system ' +
+      'prompt rule on that intent. Do NOT call this tool to wipe-and-rebuild.\n\n' +
+      'Do NOT call propose_delete_category in a loop for create-with-overlap. Do NOT ' +
+      'call delete_last_transaction (only for undoing the most recent expense).',
     input_schema: {
       type: 'object' as const,
       properties: {
@@ -1047,7 +1117,8 @@ const DIRECT_WRITE_TOOLS: Anthropic.Tool[] = [
       'DO NOT use for:\n' +
       '  • "удали категорию X" → call propose_delete_category\n' +
       '  • "удали цель X" → call propose_delete_goal\n' +
-      '  • "удали все категории и оставь только X, Y" → call propose_create_categories_bulk (handles replace)\n' +
+      '  • "удали все категории и оставь только X, Y, Z" → reply with plain text: ' +
+      '"Удаление категорий по одной. Напиши «удали категорию ИМЯ». После этого можно добавить новые через «создай категории A, B, C»." Do NOT call any propose_* tool for this intent.\n' +
       '  • "удали транзакцию про X" / "удали кофе из апреля" → call propose_delete_transaction with a search step first\n\n' +
       'If the user names a SPECIFIC target ("кофе", "из апреля", "категорию", "цель") — that is NOT this tool. ' +
       'This tool is purely "the most recent thing I logged". When in doubt, ask the user to clarify.',
@@ -1260,18 +1331,16 @@ async function buildProposalMessage(
       // Mutate input so execute path uses cleaned data
       (input as Record<string, unknown>).categories = clean;
 
-      // Fresh-setup detection: a family with 0 transactions that asks to
-      // "create categories" almost always means "set my categories to these"
-      // (matches the welcome example "Хочешь свои? Напиши: создай категории
-      // X, Y, Z"). Append behavior is the bug — user ends up with 8 defaults
-      // + 3 customs and a confused mental model. We replace the auto-seeded
-      // defaults instead and stash a flag for the execute path.
-      const txnCount = await countActiveTransactions(ctx.familyId).catch(() => -1);
-      const isFresh = txnCount === 0;
-      (input as Record<string, unknown>)._replace_defaults = isFresh;
-
+      // Append-only: bulk-create now always preserves existing categories.
+      // The previous fresh-family branch silently soft-deleted defaults when
+      // the user said "Добавь" (intent: add), conflating it with "Заменить"
+      // (intent: replace) — this was the root of @madikarim's 25-min Day-1
+      // disaster. Layer 2 of the 2026-05-10 plan removes the branch entirely.
+      // Users who genuinely want a wipe-and-rebuild flow are routed via the
+      // system-prompt example to delete categories one at a time. A future
+      // wipe_all_categories tool is tracked in TODOS.md.
       const list = clean.map(c => `${c.emoji} ${c.name}`).join(', ');
-      const verb = isFresh ? 'Заменить стандартные категории на' : `Создать ${clean.length} ${clean.length === 1 ? 'категорию' : 'категорий'}:`;
+      const verb = `Создать ${clean.length} ${clean.length === 1 ? 'категорию' : 'категорий'}:`;
       return `🆕 ${verb} ${list}?`;
     }
     case 'rename_category': {
@@ -1420,14 +1489,12 @@ async function executeConfirmedAction(
     }
     case 'create_categories_bulk': {
       const cats = a.categories as Array<{ name: string; emoji: string }>;
-      // Re-check fresh-setup at execute time too — defends against the case
-      // where the user logged a transaction between propose and confirm.
-      const wantsReplace = a._replace_defaults === true && (await countActiveTransactions(ctx.familyId).catch(() => -1)) === 0;
-      const { created, skipped } = wantsReplace
-        ? await replaceCategoriesForFreshFamily(ctx.familyId, cats)
-        : await createCategoriesBulk({ family_id: ctx.familyId, categories: cats });
-      const verb = wantsReplace ? 'Заменено стандартных на' : 'Создано';
-      let reply = `🆕 ${verb} ${created.length} ${created.length === 1 ? 'категория' : 'категорий'}:\n`;
+      // Append-only. The previous fresh-family branch consumed
+      // `_replace_defaults` (set at propose time, no longer set) and swapped
+      // in replaceCategoriesForFreshFamily, which silently soft-deleted the
+      // user's existing custom categories — the @madikarim disaster.
+      const { created, skipped } = await createCategoriesBulk({ family_id: ctx.familyId, categories: cats });
+      let reply = `🆕 Создано ${created.length} ${created.length === 1 ? 'категория' : 'категорий'}:\n`;
       for (const c of created) reply += `- ${c.emoji} ${c.name}\n`;
       if (skipped.length > 0) {
         reply += `\n⚠️ Пропущено ${skipped.length}:\n`;
@@ -1660,6 +1727,20 @@ export async function chat(
   // Ask for clarification instead of letting the model guess.
   if (!isMeaningfulInput(text)) {
     return textOnly('🤔 Не понял вопрос. Например: "сколько на кофе?", "из чего состоит Разное?", "покажи последние 10 трат".');
+  }
+
+  // Layer 3: context-shift detection. Only inspects pending_confirm; never
+  // mutates it for confirm/preserve cases. Safe to run on every request
+  // (idempotent — markUpdateSeen already gated the lambda invocation).
+  const existingPending = await getPendingConfirm(ctx.familyId).catch(() => null);
+  if (existingPending) {
+    const transition = classifyPendingConfirmTransition(text);
+    if (transition === 'clear-and-proceed') {
+      await clearPendingConfirm(ctx.familyId).catch((e) => {
+        console.warn(`[layer3] clearPendingConfirm failed for family ${ctx.familyId}:`, e instanceof Error ? e.message : e);
+      });
+    }
+    // 'preserve' (rules 1 + 3) → no-op; existing flow continues with pending state intact.
   }
 
   const saveUserMsg = () => saveMessage(ctx.chatId, ctx.familyId, 'user', `[${userName}]: ${text}`).catch(() => {});
