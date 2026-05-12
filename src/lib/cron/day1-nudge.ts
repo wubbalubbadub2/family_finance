@@ -110,10 +110,16 @@ export async function sendDay1Nudges(opts: SendDay1NudgesOptions = {}): Promise<
     if (outcome.ok) {
       result.sent++;
       result.sent_families.push({ family_id: fam.family_id, family_name: fam.family_name, latency_ms: latency });
-      // Best-effort writes — never let observability/state failure crash the loop.
-      void markFamilyNudgeSent(fam.family_id).catch(e => {
+      // CRITICAL: markFamilyNudgeSent is the idempotency gate for the next
+      // cron firing. If this write doesn't reach Postgres before the function
+      // returns, Vercel may kill the lambda mid-write — and tomorrow's cron
+      // would re-send to a family we already nudged. AWAIT it. Caught a real
+      // miss on 2026-05-12 prod test where the HTTP response returned with
+      // last_nudge_sent_at still null.
+      await markFamilyNudgeSent(fam.family_id).catch(e => {
         void captureError(e, { source: 'cron:day1_nudge:markSent', familyId: fam.family_id });
       });
+      // Telemetry can stay fire-and-forget — losing a row is not user-visible.
       void logBotAction({
         source: 'cron:day1_nudge',
         familyId: fam.family_id,
@@ -124,7 +130,9 @@ export async function sendDay1Nudges(opts: SendDay1NudgesOptions = {}): Promise<
     } else if (outcome.blocked) {
       result.blocked++;
       result.blocked_families.push({ family_id: fam.family_id, family_name: fam.family_name });
-      void setFamilyRemindersDisabled(fam.family_id, true).catch(e => {
+      // Auto opt-out is also correctness-critical: if we don't persist this,
+      // we'll re-attempt to message a blocked user every night.
+      await setFamilyRemindersDisabled(fam.family_id, true).catch(e => {
         void captureError(e, { source: 'cron:day1_nudge:autoOptOut', familyId: fam.family_id });
       });
       void logBotAction({
