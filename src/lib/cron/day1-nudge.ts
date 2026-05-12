@@ -104,7 +104,7 @@ export async function sendDay1Nudges(opts: SendDay1NudgesOptions = {}): Promise<
 
   for (const fam of audience) {
     const tStart = Date.now();
-    const outcome = await sendNudgeWithErrorDetail(fam.primary_chat_id);
+    const outcome = await sendNudgeWithErrorDetail(fam.chat_id);
     const latency = Date.now() - tStart;
 
     if (outcome.ok) {
@@ -143,7 +143,7 @@ export async function sendDay1Nudges(opts: SendDay1NudgesOptions = {}): Promise<
       void captureError(new Error(outcome.errorMessage ?? 'unknown'), {
         source: 'cron:day1_nudge:send',
         familyId: fam.family_id,
-        context: { chat_id: fam.primary_chat_id },
+        context: { chat_id: fam.chat_id },
       });
       void logBotAction({
         source: 'cron:day1_nudge',

@@ -2210,17 +2210,24 @@ export async function clearPendingConfirm(familyId: string): Promise<void> {
 // See supabase/migrations/018_day1_nudge.sql and src/lib/cron/day1-nudge.ts
 // for the full design. Filter rules:
 //   - reminders_disabled = false                     (opt-out gate)
-//   - primary_chat_id IS NOT NULL                    (need somewhere to send)
 //   - paid_until > now                               (don't bother paywalled users)
 //   - last_nudge_sent_at < today's Almaty 00:00      (within-day idempotency)
+//   - has a `family_chats` row with chat_type='private'
+//     → DM-only audience. Groups deliberately excluded — design doc flags
+//        a nudge appearing in a 3-person group as creepy.
 //   - family has ≥1 non-deleted transaction EVER     (the engaged cohort)
 //   - family has 0 non-deleted transactions TODAY    (silent today)
+//
+// Note: families.primary_chat_id is a legacy column from pre-Phase-2; post-
+// multi-tenancy it's no longer reliably populated. The cron resolves the
+// recipient chat via family_chats instead, picking the user's DM chat.
 // ───────────────────────────────────────────────────────────────────────────
 
 export interface Day1NudgeCandidate {
   family_id: string;
   family_name: string;
-  primary_chat_id: number;
+  /** Resolved Telegram chat_id (private chat with the user). */
+  chat_id: number;
 }
 
 export async function getDay1NudgeCandidates(): Promise<Day1NudgeCandidate[]> {
@@ -2228,18 +2235,14 @@ export async function getDay1NudgeCandidates(): Promise<Day1NudgeCandidate[]> {
 
   // Today's Almaty date as YYYY-MM-DD; passed into the transaction_date filter.
   const today = new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Almaty' });
-
-  // 1. Eligible families: opt-in, has a chat, not paywalled, not already nudged today.
-  // `last_nudge_sent_at` IS NULL passes; we also accept rows where it's older than
-  // the Almaty day-start UTC instant (currently UTC+5 always — Kazakhstan abolished DST).
   const almatyDayStartUtc = new Date(`${today}T00:00:00+05:00`).toISOString();
 
+  // 1. Eligible families: opt-in, not paywalled, not already nudged today.
   const { data: fams, error: famErr } = await supabase
     .from('families')
-    .select('id, name, primary_chat_id, paid_until, reminders_disabled, last_nudge_sent_at')
+    .select('id, name, paid_until, reminders_disabled, last_nudge_sent_at')
     .eq('reminders_disabled', false)
-    .gt('paid_until', nowIso)
-    .not('primary_chat_id', 'is', null);
+    .gt('paid_until', nowIso);
   if (famErr) throw famErr;
   const eligible = (fams ?? []).filter(f => {
     if (!f.last_nudge_sent_at) return true;
@@ -2247,8 +2250,29 @@ export async function getDay1NudgeCandidates(): Promise<Day1NudgeCandidate[]> {
   });
   if (eligible.length === 0) return [];
 
-  // 2. Distinct family_ids that have EVER logged a non-deleted transaction.
-  //    Page-walk to bypass the 1000-row cap on the transactions table.
+  // 2. Resolve a private chat_id per eligible family (skip families with only
+  //    group chats — we don't broadcast nudges to groups). If a family has
+  //    multiple private chats (rare — would mean multiple members each in
+  //    their own DM), pick the most recently linked.
+  const eligibleIds = new Set(eligible.map(f => f.id));
+  const privateChats = new Map<string, number>(); // family_id → chat_id
+  for (let from = 0; ; from += 1000) {
+    const { data } = await supabase
+      .from('family_chats')
+      .select('family_id, chat_id, chat_type, linked_at')
+      .eq('chat_type', 'private')
+      .order('linked_at', { ascending: false })
+      .range(from, from + 999);
+    if (!data || data.length === 0) break;
+    for (const r of data) {
+      if (eligibleIds.has(r.family_id) && !privateChats.has(r.family_id)) {
+        privateChats.set(r.family_id, r.chat_id as number);
+      }
+    }
+    if (data.length < 1000) break;
+  }
+
+  // 3. Distinct family_ids that have EVER logged a non-deleted transaction.
   const everLogged = new Set<string>();
   for (let from = 0; ; from += 1000) {
     const { data } = await supabase
@@ -2261,9 +2285,7 @@ export async function getDay1NudgeCandidates(): Promise<Day1NudgeCandidate[]> {
     if (data.length < 1000) break;
   }
 
-  // 3. Distinct family_ids that have a non-deleted transaction TODAY (Almaty).
-  //    Bounded by date so payload is small — no chunking needed at our scale,
-  //    but still page-walk defensively in case the day is busy.
+  // 4. Distinct family_ids that have a non-deleted transaction TODAY (Almaty).
   const loggedToday = new Set<string>();
   for (let from = 0; ; from += 1000) {
     const { data } = await supabase
@@ -2278,11 +2300,11 @@ export async function getDay1NudgeCandidates(): Promise<Day1NudgeCandidate[]> {
   }
 
   return eligible
-    .filter(f => everLogged.has(f.id) && !loggedToday.has(f.id))
+    .filter(f => privateChats.has(f.id) && everLogged.has(f.id) && !loggedToday.has(f.id))
     .map(f => ({
       family_id: f.id,
       family_name: f.name,
-      primary_chat_id: f.primary_chat_id as number,
+      chat_id: privateChats.get(f.id) as number,
     }));
 }
 
