@@ -145,6 +145,14 @@ const client = new Anthropic();
 // but at 1-2 families scale, that's pennies/month and the reliability wins.
 // Override via env if you want to test Haiku or a different model.
 const MODEL = process.env.CLAUDE_MODEL || 'claude-sonnet-4-6';
+// Haiku is the failover when Sonnet returns 529 overloaded_error. Real
+// outage 2026-05-13 (Anthropic platform-wide Sonnet 4.6 incident) blocked
+// every user message for ~10 min. Failover means we degrade to a less
+// capable model instead of degrading to "bot is silent." Haiku is cheaper
+// and has its own server pool, so it usually survives Sonnet-specific
+// platform issues. Tool calls work the same; the only loss is some
+// fidelity on multi-step reasoning.
+const HAIKU_MODEL = process.env.CLAUDE_HAIKU_MODEL || 'claude-haiku-4-5-20251001';
 
 // ═══════════════════════════════════════════════════════════════
 // PATTERN DETECTION — determine user intent from text
@@ -1847,6 +1855,10 @@ export async function chat(
   let totalOutputTokens = 0;
   let totalCacheRead = 0;
   let totalCacheWrite = 0;
+  // Track haiku-fallback count (incremented each iter that fell back from
+  // Sonnet 529 to Haiku). Surfaces in bot_actions_log.meta.haiku_fallbacks
+  // so we can spot ongoing Anthropic Sonnet incidents post-hoc.
+  let haikuFallbacks = 0;
 
   for (let i = 0; i < 5; i++) {
     // Vercel webhook has a 60s budget. If we've already burned 45s, bail so
@@ -1878,17 +1890,35 @@ export async function chat(
         ? { ...t, cache_control: { type: 'ephemeral' as const } }
         : t,
     );
-    const response = await client.messages.create({
-      model: MODEL,
+    const baseParams = {
       max_tokens: 1024,
       system: [{
-        type: 'text',
+        type: 'text' as const,
         text: buildSystemPrompt(familyCategoriesCheck),
-        cache_control: { type: 'ephemeral' },
+        cache_control: { type: 'ephemeral' as const },
       }],
       tools: cachedTools,
       messages,
-    });
+    };
+
+    // Try Sonnet first. On Anthropic's "529 overloaded_error" (Sonnet-pool
+    // saturation, real outage 2026-05-13), failover to Haiku for THIS turn.
+    // Per-call decision, no sticky state — when Sonnet recovers, next turn
+    // uses Sonnet again. We track which model actually ran in
+    // bot_actions_log.meta.model_used for post-incident analysis.
+    let response;
+    try {
+      response = await client.messages.create({ model: MODEL, ...baseParams });
+    } catch (e) {
+      const errMsg = e instanceof Error ? e.message : String(e);
+      if (/overloaded_error|529[^\d]/i.test(errMsg)) {
+        console.warn(`[chat] Sonnet returned 529 — falling back to ${HAIKU_MODEL} for this turn`);
+        haikuFallbacks++;
+        response = await client.messages.create({ model: HAIKU_MODEL, ...baseParams });
+      } else {
+        throw e;
+      }
+    }
 
     const toolUses = response.content.filter(b => b.type === 'tool_use');
     const textBlocks = response.content.filter(b => b.type === 'text');
@@ -2012,7 +2042,7 @@ export async function chat(
       outputTokens: totalOutputTokens,
       cacheRead: totalCacheRead,
       cacheWrite: totalCacheWrite,
-      meta: { exit: 'confirm' },
+      meta: { exit: 'confirm', haiku_fallbacks: haikuFallbacks },
     });
     return confirmResponse;
   }
@@ -2129,6 +2159,7 @@ export async function chat(
       exit: 'reply',
       had_direct_write: directWriteReply !== null,
       hallucination: hallucinationRecovered,
+      haiku_fallbacks: haikuFallbacks,
     },
   });
   return textOnly(finalReply);
