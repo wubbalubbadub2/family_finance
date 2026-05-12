@@ -24,6 +24,7 @@ interface Props {
   paidUntil: string;
   memberCount: number;
   txCount: number;
+  userMsgCount: number;
   lastTxAt: string | null;
   distinctDays: number;
   members: Member[];
@@ -48,6 +49,7 @@ export default function ExtendRow({
   paidUntil,
   memberCount,
   txCount,
+  userMsgCount,
   lastTxAt,
   distinctDays,
   members,
@@ -73,8 +75,13 @@ export default function ExtendRow({
   let status: { label: string; color: string };
   if (memberCount === 0) {
     status = { label: 'не активирован', color: 'var(--ink-4)' };
-  } else if (txCount === 0) {
+  } else if (txCount === 0 && userMsgCount === 0) {
+    // Joined but never sent a single message. The truly-silent ghost cohort.
     status = { label: 'нет транзакций', color: '#d68a00' };
+  } else if (txCount === 0) {
+    // Sent messages but didn't log a tx. Engaged-but-not-converted — different
+    // signal than "ghost." Yellow-to-blue: present, not productive yet.
+    status = { label: `пробует (${userMsgCount} сооб.)`, color: '#3b82f6' };
   } else if (daysSinceLastTx !== null && daysSinceLastTx <= 1) {
     status = { label: 'активен', color: '#2a7' };
   } else if (daysSinceLastTx !== null && daysSinceLastTx <= 7) {

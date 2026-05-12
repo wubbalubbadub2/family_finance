@@ -4,19 +4,30 @@
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
-export type StatusBucket = 'not-activated' | 'no-transactions' | 'active' | 'silent';
+// Triage buckets, narrow → broad:
+//   not-activated : bot is in the chat, no users joined the family record yet.
+//   never-typed   : user(s) joined but have not sent a single message. True ghosts.
+//   typed-no-log  : user(s) sent ≥1 message but never produced a transaction
+//                   (asked questions, hit help, gave up). The actionable cohort
+//                   for retention work — they ARE engaged, they just didn't log.
+//   active        : last tx within 7 days.
+//   silent        : last tx >7 days ago — was active, went quiet.
+export type StatusBucket = 'not-activated' | 'never-typed' | 'typed-no-log' | 'active' | 'silent';
 export type PayBucket = 'expired' | 'soon' | 'active' | 'unlimited';
 
 interface FamilyLike {
   member_count: number;
   tx_count: number;
+  user_msg_count: number;
   last_tx_at: string | null;
   paid_until: string;
 }
 
 export function statusBucket(f: FamilyLike, nowMs: number): StatusBucket {
   if (f.member_count === 0) return 'not-activated';
-  if (f.tx_count === 0) return 'no-transactions';
+  if (f.tx_count === 0) {
+    return f.user_msg_count === 0 ? 'never-typed' : 'typed-no-log';
+  }
   const daysSince = f.last_tx_at
     ? Math.floor((nowMs - new Date(f.last_tx_at).getTime()) / DAY_MS)
     : Infinity;
@@ -37,7 +48,8 @@ export function payBucket(f: FamilyLike, nowMs: number): PayBucket {
 export const STATUS_LABELS: Record<StatusBucket | 'all', string> = {
   all: 'Все статусы',
   'not-activated': 'Не активирован',
-  'no-transactions': 'Нет транзакций',
+  'never-typed': 'Нет транзакций',         // truly silent — joined, never sent a message
+  'typed-no-log': 'Пробует',                // engaged but didn't log a tx yet
   active: 'Активные (≤7д)',
   silent: 'Молчат (>7д)',
 };

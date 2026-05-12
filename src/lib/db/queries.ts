@@ -219,11 +219,17 @@ export async function getPaidStatus(
 
 /**
  * Admin dashboard listing — all families with paid status + member count +
- * activity stats (tx_count, last_tx_at, distinct_days).
+ * activity stats (tx_count, last_tx_at, distinct_days, user_msg_count).
  *
- * Pulls live transactions in one shot and aggregates in JS. Fine at current
- * scale (<1k tx total); when prod grows past ~10k rows, swap for a Postgres
- * view or RPC that does the GROUP BY server-side.
+ * IMPORTANT: PostgREST has a server-side 1000-row default cap on every query,
+ * regardless of `.limit()`. With prod now at 830 families + 1477 transactions +
+ * 50k+ conversation_messages, a naive SELECT silently drops anything past row
+ * 1000 — which is exactly what made the dashboard show `tx_count=0` for every
+ * family whose newest tx fell past the cap (real 2026-05-12 bug). We chunk-fetch
+ * with .range() to walk the full table.
+ *
+ * When this gets slow (>10k families), swap for a Postgres view that does the
+ * GROUP BY server-side.
  */
 export interface FamilyAdminRow {
   id: string;
@@ -234,6 +240,9 @@ export interface FamilyAdminRow {
   tx_count: number;
   last_tx_at: string | null;
   distinct_days: number;
+  /** Count of role='user' rows in conversation_messages. Used by the
+   *  admin badge to distinguish "joined, never typed" from "typed, no tx." */
+  user_msg_count: number;
   // All family members, sorted oldest-first (so members[0] is the founder).
   // Includes everyone so admin search hits secondary members too (e.g. wife
   // joined a family her husband created — searching her @handle still finds
@@ -245,22 +254,48 @@ export interface FamilyAdminRow {
   }>;
 }
 
-export async function listFamiliesWithPaidStatus(): Promise<FamilyAdminRow[]> {
-  const { data: families } = await supabase
-    .from('families')
-    .select('id, name, created_at, paid_until')
-    .order('created_at', { ascending: false });
-  if (!families) return [];
+// PostgREST default page size is 1000. .range(start, end) is inclusive on both
+// sides, so .range(0, 999) returns up to 1000 rows. We page until a chunk
+// returns fewer rows than the page size, which means we've drained the table.
+const PAGE = 1000;
 
-  const { data: users } = await supabase
-    .from('users')
-    .select('family_id, name, telegram_id, telegram_username, created_at')
-    .order('created_at', { ascending: true });
+async function fetchAllRows<T>(
+  build: (from: number, to: number) => PromiseLike<{ data: T[] | null }>,
+): Promise<T[]> {
+  const out: T[] = [];
+  for (let from = 0; ; from += PAGE) {
+    const { data } = await build(from, from + PAGE - 1);
+    if (!data || data.length === 0) break;
+    out.push(...data);
+    if (data.length < PAGE) break;
+  }
+  return out;
+}
+
+export async function listFamiliesWithPaidStatus(): Promise<FamilyAdminRow[]> {
+  // Families typically <10k for years; one shot is fine but we still
+  // page-fetch to be safe.
+  const families = await fetchAllRows<{ id: string; name: string; created_at: string; paid_until: string }>(
+    (from, to) => supabase
+      .from('families')
+      .select('id, name, created_at, paid_until')
+      .order('created_at', { ascending: false })
+      .range(from, to),
+  );
+  if (families.length === 0) return [];
+
+  // Members. Order by created_at ASC so the founder is members[0] per family.
+  const users = await fetchAllRows<{ family_id: string; name: string; telegram_id: number; telegram_username: string | null; created_at: string }>(
+    (from, to) => supabase
+      .from('users')
+      .select('family_id, name, telegram_id, telegram_username, created_at')
+      .order('created_at', { ascending: true })
+      .range(from, to),
+  );
   const membersByFamily = new Map<string, FamilyAdminRow['members']>();
-  for (const u of users ?? []) {
+  for (const u of users) {
     let arr = membersByFamily.get(u.family_id);
     if (!arr) { arr = []; membersByFamily.set(u.family_id, arr); }
-    // Push order = users.created_at ASC, so arr[0] is the family founder.
     arr.push({
       name: u.name,
       telegram_id: u.telegram_id,
@@ -268,20 +303,41 @@ export async function listFamiliesWithPaidStatus(): Promise<FamilyAdminRow[]> {
     });
   }
 
-  const { data: txns } = await supabase
-    .from('transactions')
-    .select('family_id, created_at, transaction_date')
-    .is('deleted_at', null);
+  // Transactions (excluding soft-deleted). Page-fetched to bypass the 1000-row
+  // PostgREST cap that previously caused `tx_count=0` to show for any family
+  // whose newest tx landed past row 1000 in the result set.
+  const txns = await fetchAllRows<{ family_id: string; created_at: string; transaction_date: string }>(
+    (from, to) => supabase
+      .from('transactions')
+      .select('family_id, created_at, transaction_date')
+      .is('deleted_at', null)
+      .range(from, to),
+  );
   const txCounts = new Map<string, number>();
   const lastTxAt = new Map<string, string>();
   const distinctDays = new Map<string, Set<string>>();
-  for (const t of txns ?? []) {
+  for (const t of txns) {
     txCounts.set(t.family_id, (txCounts.get(t.family_id) ?? 0) + 1);
     const prev = lastTxAt.get(t.family_id);
     if (!prev || t.created_at > prev) lastTxAt.set(t.family_id, t.created_at);
     let days = distinctDays.get(t.family_id);
     if (!days) { days = new Set(); distinctDays.set(t.family_id, days); }
     days.add(t.transaction_date);
+  }
+
+  // User-message count per family. Drives the new "joined but never typed" vs
+  // "typed but never logged" status distinction in the admin badge. Filtering
+  // to role='user' keeps the payload roughly half-size vs role IN (user, asst).
+  const userMsgs = await fetchAllRows<{ family_id: string }>(
+    (from, to) => supabase
+      .from('conversation_messages')
+      .select('family_id')
+      .eq('role', 'user')
+      .range(from, to),
+  );
+  const userMsgCounts = new Map<string, number>();
+  for (const m of userMsgs) {
+    userMsgCounts.set(m.family_id, (userMsgCounts.get(m.family_id) ?? 0) + 1);
   }
 
   return families.map((f) => {
@@ -295,6 +351,7 @@ export async function listFamiliesWithPaidStatus(): Promise<FamilyAdminRow[]> {
       tx_count: txCounts.get(f.id) ?? 0,
       last_tx_at: lastTxAt.get(f.id) ?? null,
       distinct_days: distinctDays.get(f.id)?.size ?? 0,
+      user_msg_count: userMsgCounts.get(f.id) ?? 0,
       members,
     };
   });

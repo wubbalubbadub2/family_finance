@@ -211,6 +211,7 @@ export default function FamiliesTable({ families, serverNow }: Props) {
                 paidUntil={f.paid_until}
                 memberCount={f.member_count}
                 txCount={f.tx_count}
+                userMsgCount={f.user_msg_count}
                 lastTxAt={f.last_tx_at}
                 distinctDays={f.distinct_days}
                 members={f.members}
