@@ -51,6 +51,21 @@ const CRITICAL_PATTERNS: readonly CriticalPattern[] = [
       'Проверь ANTHROPIC_API_KEY в Vercel env vars.',
   },
   {
+    // Anthropic returns HTTP 529 with `overloaded_error` when their platform
+    // is under heavy load (entire-platform overload, not our account). Added
+    // 2026-05-13 after a real outage: every webhook:message for ~10 min was
+    // 529 and we had NO alert — only noticed when a user (Shynggys) reported
+    // it. The alert says it's Anthropic-side so admin doesn't go hunting in
+    // our code.
+    key: 'anthropic:overloaded',
+    test: /overloaded_error|529[^\d]/i,
+    alert:
+      '🚨 Anthropic перегружен (529 overloaded_error). ' +
+      'Платформа Anthropic под нагрузкой, наши запросы отбиваются. ' +
+      'Обычно восстанавливается за 5–30 минут.\n\n' +
+      'Статус: https://status.anthropic.com',
+  },
+  {
     key: 'anthropic:rate-limit',
     test: /rate[_ ]limit_error|429[^\d]/i,
     alert:
