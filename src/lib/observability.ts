@@ -5,6 +5,101 @@ import { supabase } from './db/supabase';
 const MAX_STACK = 4096;
 const MAX_MSG = 2048;
 
+// ───────────────────────────────────────────────────────────────────────────
+// Critical-error admin alerts
+//
+// On 2026-05-11, Anthropic credits ran out at 12:15 UTC. The bot returned
+// raw error replies to ~263 user attempts across 103 distinct customers
+// over a ~12h window before the founder noticed. error_log was capturing
+// every failure (we could reconstruct the damage after the fact), but no
+// active alert fired — there was no monitoring layer that screamed when the
+// shape of the error indicated "everything is broken right now, refill
+// credits immediately."
+//
+// This module adds a thin alert layer on top of captureError: any error
+// whose message matches a critical pattern triggers a Telegram DM to
+// ADMIN_TG_ID (defaults to the founder). Dedup is per-pattern with a
+// 10-minute in-memory window so a sustained outage produces ~one alert per
+// cold-started lambda instance instead of 263. The dedup intentionally
+// resets across cold starts — at worst we send a small handful of
+// duplicates, which is vastly better than missing the next outage.
+// ───────────────────────────────────────────────────────────────────────────
+
+interface CriticalPattern {
+  /** Dedup key. Reuses across messages that match the same pattern. */
+  key: string;
+  /** Regex applied against the error message text. */
+  test: RegExp;
+  /** Russian alert text DM'd to the admin. */
+  alert: string;
+}
+
+const CRITICAL_PATTERNS: readonly CriticalPattern[] = [
+  {
+    key: 'anthropic:credit-balance',
+    test: /credit balance is too low/i,
+    alert:
+      '🚨 КРИТИЧНО: закончились кредиты Anthropic. Бот сейчас падает на каждом запросе.\n\n' +
+      'Пополнить: https://console.anthropic.com/settings/billing\n\n' +
+      '(этот алерт повторится максимум раз в 10 мин, чтобы не спамить)',
+  },
+  {
+    key: 'anthropic:invalid-key',
+    test: /invalid x-api-key|authentication[_ ]failed|401[^\d]/i,
+    alert:
+      '🚨 КРИТИЧНО: Anthropic API ключ невалидный. ' +
+      'Проверь ANTHROPIC_API_KEY в Vercel env vars.',
+  },
+  {
+    key: 'anthropic:rate-limit',
+    test: /rate[_ ]limit_error|429[^\d]/i,
+    alert:
+      '⚠️ Anthropic rate-limit. Часть запросов пользователей сейчас падает. ' +
+      'Подожди ~1 минуту, лимит сбросится сам.',
+  },
+];
+
+/** Match a message against the critical-pattern catalogue. Pure, no side effects.
+ *  Exported for tests. */
+export function matchCriticalPattern(message: string): CriticalPattern | null {
+  for (const pat of CRITICAL_PATTERNS) {
+    if (pat.test.test(message)) return pat;
+  }
+  return null;
+}
+
+// Module-level dedup map. Resets on cold start — that's the design: at worst
+// the admin gets one alert per warm-instance during a sustained outage.
+const recentAlerts = new Map<string, number>();
+const ALERT_DEDUP_MS = 10 * 60 * 1000;
+
+async function notifyAdmin(text: string): Promise<void> {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  const adminTg = Number(process.env.ADMIN_TG_ID ?? 173826717);
+  if (!token || !Number.isFinite(adminTg) || adminTg <= 0) return;
+  try {
+    await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: adminTg, text }),
+    });
+  } catch (e) {
+    // Network failure to Telegram is non-fatal. Don't recurse into captureError
+    // — that way lies infinite loops if Telegram is the thing that's broken.
+    console.error('[observability] notifyAdmin failed:', e instanceof Error ? e.message : String(e));
+  }
+}
+
+function maybeAlertCritical(message: string): void {
+  const pat = matchCriticalPattern(message);
+  if (!pat) return;
+  const last = recentAlerts.get(pat.key);
+  if (last && Date.now() - last < ALERT_DEDUP_MS) return;
+  recentAlerts.set(pat.key, Date.now());
+  // Fire-and-forget. captureError itself is not awaited beyond the DB insert.
+  void notifyAdmin(pat.alert);
+}
+
 export interface ErrorContext {
   source: string;                   // 'webhook' | 'cron:<name>' | 'agent:read-tool' | etc.
   familyId?: string | null;
@@ -28,6 +123,10 @@ export async function captureError(err: unknown, ctx: ErrorContext): Promise<voi
   // Always log to Vercel — this is the floor. If the DB insert fails (DB outage,
   // RLS surprise, schema drift), we still see the error in Vercel logs.
   console.error(`[${ctx.source}]`, message, ctx.context ? JSON.stringify(ctx.context) : '');
+
+  // Critical-pattern admin alert. Fire-and-forget; never blocks the DB insert.
+  // See header comment for the 2026-05-11 outage that motivated this.
+  maybeAlertCritical(message);
 
   try {
     await supabase.from('error_log').insert({
