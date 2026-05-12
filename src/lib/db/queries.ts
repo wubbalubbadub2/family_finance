@@ -325,6 +325,28 @@ export async function listFamiliesWithPaidStatus(): Promise<FamilyAdminRow[]> {
     days.add(t.transaction_date);
   }
 
+  // Debts live in their own table (debts), not in transactions. The Sonnet
+  // log_debt tool writes here, not to transactions. Without folding debts
+  // into the engagement count, any family that only logged debts shows up
+  // with `tx_count=0` → "пробует" badge → looks like they didn't try. They
+  // did. fam=90c6fdf6 logged 4 debts totalling 1.198M ₸ and was misclassified
+  // before this rolled in. Count debts as activity too.
+  //
+  // distinct_days isn't updated from debts because `debts` has no
+  // transaction_date column. Created-day inclusion would require an extra
+  // date conversion and the "N акт. дн." admin label is informational only.
+  const debts = await fetchAllRows<{ family_id: string; created_at: string }>(
+    (from, to) => supabase
+      .from('debts')
+      .select('family_id, created_at')
+      .range(from, to),
+  );
+  for (const d of debts) {
+    txCounts.set(d.family_id, (txCounts.get(d.family_id) ?? 0) + 1);
+    const prev = lastTxAt.get(d.family_id);
+    if (!prev || d.created_at > prev) lastTxAt.set(d.family_id, d.created_at);
+  }
+
   // User-message count per family. Drives the new "joined but never typed" vs
   // "typed but never logged" status distinction in the admin badge. Filtering
   // to role='user' keeps the payload roughly half-size vs role IN (user, asst).
