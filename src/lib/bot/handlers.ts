@@ -22,6 +22,31 @@ import { enforcePaidStatus } from '@/lib/bot/paywall';
 const SUPPORT_HANDLE = '@shynggys_islam';
 
 /**
+ * Map an API/internal error to a user-facing Russian reply. Avoids leaking
+ * raw API JSON (e.g. `529 {"type":"error",…}`) into the user's chat — both
+ * for UX and to not expose internal request_ids etc to end users.
+ *
+ * Added 2026-05-13 after Anthropic platform overload: users were seeing
+ * `😔 Ошибка: 529 {"type":"error","error":{"type":"overloaded_error",…}}`
+ * verbatim. Now they see a friendly "перегружен, попробуй через минуту"
+ * instead. The original error_log row still captures the full detail for
+ * post-incident debugging.
+ */
+function formatUserErrorReply(errMsg: string): string {
+  if (/overloaded_error|529[^\d]/i.test(errMsg)) {
+    return '😔 Сервис временно перегружен. Попробуй через 1-2 минуты.';
+  }
+  if (/rate[_ ]limit_error|429[^\d]/i.test(errMsg)) {
+    return '⏳ Слишком много запросов сразу. Попробуй через минуту.';
+  }
+  if (/credit balance is too low|invalid x-api-key|authentication[_ ]failed|401[^\d]/i.test(errMsg)) {
+    return `⚠️ Сервис временно недоступен. Если проблема не уйдёт — пиши ${SUPPORT_HANDLE}.`;
+  }
+  // Unknown error: friendly fallback, no raw API text leaked.
+  return '😔 Что-то пошло не так. Попробуй переформулировать или подожди минуту.';
+}
+
+/**
  * Welcome for a brand-NEW user: just got onboarded into a fresh family.
  *
  * Concrete examples, zero abstraction. The earlier version included a
@@ -457,7 +482,7 @@ export function createBot(): Bot {
       // In groups, swallow user-facing error noise to avoid spamming the group
       // when something internal breaks. The error is captured server-side.
       if (isPrivate) {
-        await ctx.reply(`😔 Ошибка: ${errMsg.slice(0, 200)}`);
+        await ctx.reply(formatUserErrorReply(errMsg));
       }
     }
   });
@@ -518,7 +543,7 @@ export function createBot(): Bot {
         context: { data: ctx.callbackQuery.data?.slice(0, 200) },
       });
       try { await ctx.answerCallbackQuery({ text: '😔 Ошибка' }); } catch { /* already answered */ }
-      await ctx.reply(`😔 Ошибка: ${errMsg.slice(0, 200)}`);
+      await ctx.reply(formatUserErrorReply(errMsg));
     }
   });
 
