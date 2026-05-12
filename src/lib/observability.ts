@@ -144,6 +144,58 @@ export async function captureError(err: unknown, ctx: ErrorContext): Promise<voi
   }
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// Bot action telemetry
+//
+// Companion to error_log: every bot action (chat call, cron nudge, etc.)
+// inserts a row capturing latency, tools invoked, reply size, token usage.
+// Privacy: shape data only, no raw user text or tool-call args.
+// See supabase/migrations/017_bot_actions_log.sql.
+// ───────────────────────────────────────────────────────────────────────────
+
+export interface BotActionEntry {
+  source: string;                            // 'chat' | 'cron:day1_nudge' | etc.
+  familyId?: string | null;
+  toolNames?: string[];                      // names only — no args
+  iterations?: number;
+  replyLength?: number;
+  latencyMs?: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheRead?: number;
+  cacheWrite?: number;
+  meta?: Record<string, unknown>;
+}
+
+/**
+ * Fire-and-forget bot-action log. Mirrors captureError's discipline:
+ * console.error floor, DB insert is best-effort, never throws to caller.
+ *
+ * Caller should NOT await this for correctness. Tests can await for
+ * determinism; production code uses `void logBotAction(...)`.
+ */
+export async function logBotAction(entry: BotActionEntry): Promise<void> {
+  try {
+    await supabase.from('bot_actions_log').insert({
+      source: entry.source,
+      family_id: entry.familyId ?? null,
+      tool_names: entry.toolNames ?? null,
+      iterations: entry.iterations ?? null,
+      reply_length: entry.replyLength ?? null,
+      latency_ms: entry.latencyMs ?? null,
+      input_tokens: entry.inputTokens ?? null,
+      output_tokens: entry.outputTokens ?? null,
+      cache_read: entry.cacheRead ?? null,
+      cache_write: entry.cacheWrite ?? null,
+      meta: entry.meta ?? null,
+    });
+  } catch (e) {
+    // Same rule as captureError: never recurse into observability if the
+    // observability layer itself is the thing that's broken.
+    console.error('[observability] logBotAction failed:', e instanceof Error ? e.message : String(e));
+  }
+}
+
 export interface ErrorLogRow {
   id: number;
   occurred_at: string;

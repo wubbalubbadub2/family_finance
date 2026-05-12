@@ -46,7 +46,7 @@ import {
 } from '@/lib/db/queries';
 import { todayAlmaty, currentMonthAlmaty, monthNameRu, formatTenge } from '@/lib/utils';
 import { renderGoalProgress } from '@/lib/goals';
-import { captureError } from '@/lib/observability';
+import { captureError, logBotAction } from '@/lib/observability';
 import {
   stripCurrencyMarkers,
   tryParseExpenses,
@@ -1719,6 +1719,7 @@ export async function chat(
   };
 
   const text = userMessage.trim();
+  const chatStart = Date.now();
 
   // Short-circuit: ambiguous inputs ("?", "??", "!", ".", "hmm") have no
   // actionable content. Sonnet confronted with these tends to hallucinate from
@@ -1726,7 +1727,15 @@ export async function chat(
   // reply about the PREVIOUS expense, claiming the user had just logged it).
   // Ask for clarification instead of letting the model guess.
   if (!isMeaningfulInput(text)) {
-    return textOnly('🤔 Не понял вопрос. Например: "сколько на кофе?", "из чего состоит Разное?", "покажи последние 10 трат".');
+    const reply = '🤔 Не понял вопрос. Например: "сколько на кофе?", "из чего состоит Разное?", "покажи последние 10 трат".';
+    void logBotAction({
+      source: 'chat',
+      familyId: ctx.familyId,
+      replyLength: reply.length,
+      latencyMs: Date.now() - chatStart,
+      meta: { early_exit: 'meaningless_input' },
+    });
+    return textOnly(reply);
   }
 
   // Layer 3: context-shift detection. Only inspects pending_confirm; never
@@ -1830,6 +1839,15 @@ export async function chat(
   let confirmResponse: BotResponse | null = null;
   const loopStart = Date.now();
 
+  // bot_actions_log accumulators — track shape data across loop iterations
+  // for a single end-of-call telemetry write. Names only, no args (no PII).
+  const toolNamesAcc: string[] = [];
+  let iterationsRan = 0;
+  let totalInputTokens = 0;
+  let totalOutputTokens = 0;
+  let totalCacheRead = 0;
+  let totalCacheWrite = 0;
+
   for (let i = 0; i < 5; i++) {
     // Vercel webhook has a 60s budget. If we've already burned 45s, bail so
     // the user sees something instead of Telegram timing out on its retry.
@@ -1883,6 +1901,14 @@ export async function chat(
     const cacheCreate = (u as { cache_creation_input_tokens?: number }).cache_creation_input_tokens ?? 0;
     const cacheRead = (u as { cache_read_input_tokens?: number }).cache_read_input_tokens ?? 0;
     console.error(`[chat] iter ${i}: stop=${response.stop_reason} tools=${toolUses.length} text=${turnText.length}b in=${u.input_tokens} out=${u.output_tokens} cache_write=${cacheCreate} cache_read=${cacheRead}`);
+    iterationsRan = i + 1;
+    totalInputTokens += u.input_tokens ?? 0;
+    totalOutputTokens += u.output_tokens ?? 0;
+    totalCacheRead += cacheRead;
+    totalCacheWrite += cacheCreate;
+    for (const block of toolUses) {
+      if (block.type === 'tool_use') toolNamesAcc.push(block.name);
+    }
     if (turnText) finalReply = turnText;
 
     if (toolUses.length === 0) break;
@@ -1975,6 +2001,19 @@ export async function chat(
 
   if (confirmResponse) {
     await saveAssistantMsg(confirmResponse.text);
+    void logBotAction({
+      source: 'chat',
+      familyId: ctx.familyId,
+      toolNames: toolNamesAcc,
+      iterations: iterationsRan,
+      replyLength: confirmResponse.text.length,
+      latencyMs: Date.now() - chatStart,
+      inputTokens: totalInputTokens,
+      outputTokens: totalOutputTokens,
+      cacheRead: totalCacheRead,
+      cacheWrite: totalCacheWrite,
+      meta: { exit: 'confirm' },
+    });
     return confirmResponse;
   }
 
@@ -2028,6 +2067,7 @@ export async function chat(
     /🤝\s*Долг\s+записан/i.test(finalReply) ||             // debt:   handleDebt's exact prefix
     /(записа[лн][аоыи]?|сохран(?:ил|ен)[аоыи]?|зафиксирова(?:л|н)[аоыи]?)\s*[:.]?\s*\d/i.test(finalReply)
   );
+  let hallucinationRecovered: false | 'income' | 'debt' | 'expense' | 'unrecovered' = false;
   if (looksLikeFakeConfirmation) {
     console.error('[chat] hallucination detected — Sonnet returned a "записал" reply without tool; trying parser recovery');
     let recovered = false;
@@ -2037,6 +2077,7 @@ export async function chat(
       console.warn('[chat] parser recovery: log_income');
       finalReply = await handleIncome(incomeParse, ctx);
       recovered = true;
+      hallucinationRecovered = 'income';
     }
 
     if (!recovered) {
@@ -2045,6 +2086,7 @@ export async function chat(
         console.warn('[chat] parser recovery: log_debt');
         finalReply = await handleDebt(debtParse, ctx);
         recovered = true;
+        hallucinationRecovered = 'debt';
       }
     }
 
@@ -2054,6 +2096,7 @@ export async function chat(
         console.warn('[chat] parser recovery: log_expense');
         finalReply = await handleExpenses(expenseParse, ctx);
         recovered = true;
+        hallucinationRecovered = 'expense';
       }
     }
 
@@ -2066,10 +2109,28 @@ export async function chat(
         context: { user_message: text.slice(0, 200), sonnet_reply: finalReply.slice(0, 400) },
       }).catch(() => { /* */ });
       finalReply = '🤔 Не получилось разобрать формат. Напиши проще, например: «кофе 500» или «такси 2500».';
+      hallucinationRecovered = 'unrecovered';
     }
   }
 
   await saveAssistantMsg(finalReply);
+  void logBotAction({
+    source: 'chat',
+    familyId: ctx.familyId,
+    toolNames: toolNamesAcc,
+    iterations: iterationsRan,
+    replyLength: finalReply.length,
+    latencyMs: Date.now() - chatStart,
+    inputTokens: totalInputTokens,
+    outputTokens: totalOutputTokens,
+    cacheRead: totalCacheRead,
+    cacheWrite: totalCacheWrite,
+    meta: {
+      exit: 'reply',
+      had_direct_write: directWriteReply !== null,
+      hallucination: hallucinationRecovered,
+    },
+  });
   return textOnly(finalReply);
 }
 
