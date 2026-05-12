@@ -2204,3 +2204,101 @@ export async function clearPendingConfirm(familyId: string): Promise<void> {
   if (error) throw error;
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// Day-1 re-engagement nudge — audience + state helpers
+//
+// See supabase/migrations/018_day1_nudge.sql and src/lib/cron/day1-nudge.ts
+// for the full design. Filter rules:
+//   - reminders_disabled = false                     (opt-out gate)
+//   - primary_chat_id IS NOT NULL                    (need somewhere to send)
+//   - paid_until > now                               (don't bother paywalled users)
+//   - last_nudge_sent_at < today's Almaty 00:00      (within-day idempotency)
+//   - family has ≥1 non-deleted transaction EVER     (the engaged cohort)
+//   - family has 0 non-deleted transactions TODAY    (silent today)
+// ───────────────────────────────────────────────────────────────────────────
+
+export interface Day1NudgeCandidate {
+  family_id: string;
+  family_name: string;
+  primary_chat_id: number;
+}
+
+export async function getDay1NudgeCandidates(): Promise<Day1NudgeCandidate[]> {
+  const nowIso = new Date().toISOString();
+
+  // Today's Almaty date as YYYY-MM-DD; passed into the transaction_date filter.
+  const today = new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Almaty' });
+
+  // 1. Eligible families: opt-in, has a chat, not paywalled, not already nudged today.
+  // `last_nudge_sent_at` IS NULL passes; we also accept rows where it's older than
+  // the Almaty day-start UTC instant (currently UTC+5 always — Kazakhstan abolished DST).
+  const almatyDayStartUtc = new Date(`${today}T00:00:00+05:00`).toISOString();
+
+  const { data: fams, error: famErr } = await supabase
+    .from('families')
+    .select('id, name, primary_chat_id, paid_until, reminders_disabled, last_nudge_sent_at')
+    .eq('reminders_disabled', false)
+    .gt('paid_until', nowIso)
+    .not('primary_chat_id', 'is', null);
+  if (famErr) throw famErr;
+  const eligible = (fams ?? []).filter(f => {
+    if (!f.last_nudge_sent_at) return true;
+    return f.last_nudge_sent_at < almatyDayStartUtc;
+  });
+  if (eligible.length === 0) return [];
+
+  // 2. Distinct family_ids that have EVER logged a non-deleted transaction.
+  //    Page-walk to bypass the 1000-row cap on the transactions table.
+  const everLogged = new Set<string>();
+  for (let from = 0; ; from += 1000) {
+    const { data } = await supabase
+      .from('transactions')
+      .select('family_id')
+      .is('deleted_at', null)
+      .range(from, from + 999);
+    if (!data || data.length === 0) break;
+    for (const r of data) everLogged.add(r.family_id);
+    if (data.length < 1000) break;
+  }
+
+  // 3. Distinct family_ids that have a non-deleted transaction TODAY (Almaty).
+  //    Bounded by date so payload is small — no chunking needed at our scale,
+  //    but still page-walk defensively in case the day is busy.
+  const loggedToday = new Set<string>();
+  for (let from = 0; ; from += 1000) {
+    const { data } = await supabase
+      .from('transactions')
+      .select('family_id')
+      .is('deleted_at', null)
+      .eq('transaction_date', today)
+      .range(from, from + 999);
+    if (!data || data.length === 0) break;
+    for (const r of data) loggedToday.add(r.family_id);
+    if (data.length < 1000) break;
+  }
+
+  return eligible
+    .filter(f => everLogged.has(f.id) && !loggedToday.has(f.id))
+    .map(f => ({
+      family_id: f.id,
+      family_name: f.name,
+      primary_chat_id: f.primary_chat_id as number,
+    }));
+}
+
+export async function markFamilyNudgeSent(familyId: string): Promise<void> {
+  const { error } = await supabase
+    .from('families')
+    .update({ last_nudge_sent_at: new Date().toISOString() })
+    .eq('id', familyId);
+  if (error) throw error;
+}
+
+export async function setFamilyRemindersDisabled(familyId: string, disabled: boolean): Promise<void> {
+  const { error } = await supabase
+    .from('families')
+    .update({ reminders_disabled: disabled })
+    .eq('id', familyId);
+  if (error) throw error;
+}
+

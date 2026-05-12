@@ -10,6 +10,7 @@ import {
   getOrCreateUserInFamily,
   getFamilyById,
   markUpdateSeen,
+  setFamilyRemindersDisabled,
 } from '@/lib/db/queries';
 import { captureError } from '@/lib/observability';
 import { enforcePaidStatus } from '@/lib/bot/paywall';
@@ -388,6 +389,26 @@ export function createBot(): Bot {
       if (newFamMatch) {
         // Only the caller's identity matters — chat resolution above is fine.
         await handleNewFamilyCommand(ctx, newFamMatch[1] ?? null, user.id);
+        return;
+      }
+
+      // /напоминания on|off — toggles the Day-1 re-engagement nudge for this
+      // family. Stored on families.reminders_disabled (migration 018). The
+      // cron also auto-flips this to TRUE if the user blocks the bot, so any
+      // /напоминания on after a block is a "re-opt-in" the user is explicitly
+      // making.
+      const remindersMatch = rawText.match(/^\/напоминания(?:@\w+)?(?:\s+(on|off))?\s*$/i);
+      if (remindersMatch) {
+        const arg = (remindersMatch[1] ?? '').toLowerCase();
+        if (arg === 'off') {
+          await setFamilyRemindersDisabled(familyId, true).catch(() => {});
+          await ctx.reply('🔕 Напоминания отключены. Передумаешь — напиши `/напоминания on`.', { parse_mode: 'Markdown' }).catch(() => {});
+        } else if (arg === 'on') {
+          await setFamilyRemindersDisabled(familyId, false).catch(() => {});
+          await ctx.reply('🔔 Напоминания включены. Буду писать вечером, если за день не залогируешь ни одной траты.').catch(() => {});
+        } else {
+          await ctx.reply('Используй `/напоминания on` или `/напоминания off`.', { parse_mode: 'Markdown' }).catch(() => {});
+        }
         return;
       }
 
