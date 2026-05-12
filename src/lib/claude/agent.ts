@@ -1906,13 +1906,24 @@ export async function chat(
     // Per-call decision, no sticky state — when Sonnet recovers, next turn
     // uses Sonnet again. We track which model actually ran in
     // bot_actions_log.meta.model_used for post-incident analysis.
+    // Per-attempt timeout: Anthropic's 529 sometimes hangs the request
+    // for 30-50s before returning the error (observed 2026-05-13 during
+    // Sonnet 4.6 platform outage — chat() loop latency went to 45-50s).
+    // Fail-fast on Sonnet after 8s so we move to Haiku quickly. Haiku
+    // gets the SDK default (60s) since it's our fallback floor.
+    const SONNET_TIMEOUT_MS = 8000;
     let response;
     try {
-      response = await client.messages.create({ model: MODEL, ...baseParams });
+      response = await client.messages.create(
+        { model: MODEL, ...baseParams },
+        { timeout: SONNET_TIMEOUT_MS },
+      );
     } catch (e) {
       const errMsg = e instanceof Error ? e.message : String(e);
-      if (/overloaded_error|529[^\d]/i.test(errMsg)) {
-        console.warn(`[chat] Sonnet returned 529 — falling back to ${HAIKU_MODEL} for this turn`);
+      const isOverloaded = /overloaded_error|529[^\d]/i.test(errMsg);
+      const isTimeout = /timeout|aborted|connection error/i.test(errMsg);
+      if (isOverloaded || isTimeout) {
+        console.warn(`[chat] Sonnet ${isTimeout ? 'timed out' : 'returned 529'} — falling back to ${HAIKU_MODEL}`);
         haikuFallbacks++;
         response = await client.messages.create({ model: HAIKU_MODEL, ...baseParams });
       } else {
