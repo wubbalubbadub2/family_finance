@@ -16,7 +16,8 @@ async function main() {
     .or('telegram_username.ilike.%akbota%,telegram_username.ilike.%akb%')
     .order('created_at', { ascending: false });
 
-  const all = new Map<string, typeof byName[number]>();
+  type UserRow = { id: string; telegram_id: number; telegram_username: string | null; name: string; family_id: string; created_at: string };
+  const all = new Map<string, UserRow>();
   for (const u of (byName ?? [])) all.set(u.id, u);
   for (const u of (byHandle ?? [])) all.set(u.id, u);
 
