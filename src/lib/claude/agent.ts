@@ -1840,18 +1840,49 @@ export async function chat(
     }
 
     console.error(`[chat] iter ${i}: sending ${messages.length} messages to ${MODEL}`);
+    // Prompt caching (2026-05-12, post-credit-outage cost defense):
+    //   - System prompt (~1.2k tokens) and tools (~4k tokens) are byte-
+    //     identical across consecutive turns for the same family. Marking
+    //     them with `cache_control: ephemeral` makes Anthropic store them
+    //     for 5 min and bill subsequent hits at 10% of the normal input
+    //     rate (90% discount on the cached portion).
+    //   - First call within a 5-min window: full price + small write
+    //     surcharge (~25% extra on the cached portion). Subsequent calls:
+    //     10% rate. Net at our "batcher" pattern (5-10 msgs per session
+    //     within 1 min) is roughly 70-80% input cost saved.
+    //   - Two breakpoints: end of system, end of tools list.
+    //   - System prompt has dynamic content (date + family categoriesBlock),
+    //     so cache is per-family. That's fine — same family typically fires
+    //     several messages in succession.
+    const allTools = [...READ_TOOLS, ...DIRECT_WRITE_TOOLS, ...WRITE_TOOLS];
+    const cachedTools = allTools.map((t, idx) =>
+      idx === allTools.length - 1
+        ? { ...t, cache_control: { type: 'ephemeral' as const } }
+        : t,
+    );
     const response = await client.messages.create({
       model: MODEL,
       max_tokens: 1024,
-      system: buildSystemPrompt(familyCategoriesCheck),
-      tools: [...READ_TOOLS, ...DIRECT_WRITE_TOOLS, ...WRITE_TOOLS],
+      system: [{
+        type: 'text',
+        text: buildSystemPrompt(familyCategoriesCheck),
+        cache_control: { type: 'ephemeral' },
+      }],
+      tools: cachedTools,
       messages,
     });
 
     const toolUses = response.content.filter(b => b.type === 'tool_use');
     const textBlocks = response.content.filter(b => b.type === 'text');
     const turnText = textBlocks.map(b => b.type === 'text' ? b.text : '').join('\n').trim();
-    console.error(`[chat] iter ${i}: stop=${response.stop_reason} tools=${toolUses.length} text=${turnText.length}b`);
+    // Cache stats from Anthropic: cache_creation_input_tokens = wrote-to-cache
+    // (first call in 5-min window, +25% surcharge); cache_read_input_tokens
+    // = hit cache (90% discount). Track in Vercel logs to verify caching is
+    // actually working in prod after deploy.
+    const u = response.usage;
+    const cacheCreate = (u as { cache_creation_input_tokens?: number }).cache_creation_input_tokens ?? 0;
+    const cacheRead = (u as { cache_read_input_tokens?: number }).cache_read_input_tokens ?? 0;
+    console.error(`[chat] iter ${i}: stop=${response.stop_reason} tools=${toolUses.length} text=${turnText.length}b in=${u.input_tokens} out=${u.output_tokens} cache_write=${cacheCreate} cache_read=${cacheRead}`);
     if (turnText) finalReply = turnText;
 
     if (toolUses.length === 0) break;
