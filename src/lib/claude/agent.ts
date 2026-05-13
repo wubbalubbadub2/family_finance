@@ -40,6 +40,7 @@ import {
   resolveCategoryByName,
   findRecentDuplicate,
   seedDefaultCategoriesForFamily,
+  wipeFamilyData,
   russianStem,
   type ConfirmType,
   type PendingConfirm,
@@ -191,7 +192,7 @@ function withKeyboard(text: string, keyboard: InlineKeyboardButton[][]): BotResp
   return { text, keyboard };
 }
 
-function confirmKeyboard(nonce: string): InlineKeyboardButton[][] {
+export function confirmKeyboard(nonce: string): InlineKeyboardButton[][] {
   return [[
     { text: '✅ Да', callback_data: `confirm:${nonce}` },
     { text: '❌ Отмена', callback_data: `cancel:${nonce}` },
@@ -736,6 +737,11 @@ ${categoriesBlock}
   - Перечислить ВСЕ категории из блока выше. Если их 11 — выведи 11. Если 1 — выведи 1.
   - Сохранить порядок sort_order (как в блоке выше).
   - Использовать формат "эмодзи Имя" (без slug в пользовательском ответе).
+  - В КОНЦЕ списка категорий ВСЕГДА добавляй ровно эти 3 строки (пустая строка перед ними):
+
+➕ Создать новую — напиши «создай категорию [название]»
+✏️ Переименовать — «переименуй [старое] на [новое]»
+🗑️ Удалить — «удали категорию [название]»
 
 Если упоминается категория, которой НЕТ в списке выше — это новая, предложи
 propose_create_category.
@@ -1378,6 +1384,13 @@ async function buildProposalMessage(
       if (!target) throw new Error(`Категория '${intoSlug}' не найдена.`);
       return `🔀 Объединить ${source.emoji} ${source.name} в ${target.emoji} ${target.name}?`;
     }
+    case 'soft_wipe_family': {
+      // /удалить_все builds its own confirm message inline in handlers.ts
+      // and uses setPendingConfirm directly. This proposal path isn't used
+      // for this confirm type — present a safe fallback in case it's ever
+      // routed here by accident.
+      return `⚠️ Удалить все твои данные?`;
+    }
   }
 }
 
@@ -1537,6 +1550,20 @@ async function executeConfirmedAction(
         into_slug: String(a.into_slug),
       });
       return `🔀 Категории объединены.`;
+    }
+    case 'soft_wipe_family': {
+      // /удалить_все confirmed. Calls the soft_wipe_family_data RPC, which
+      // atomically: writes an audit row, soft-deletes transactions, and
+      // sets families.deleted_at. The wiped-family gate in handlers.ts
+      // takes over from here — bot ignores wiped families and /start
+      // creates a fresh family.
+      const result = await wipeFamilyData(ctx.familyId);
+      console.error(`[soft-wipe] family=${ctx.familyId} result=${JSON.stringify(result)}`);
+      return (
+        `✂️ Готово. Все данные удалены.\n\n` +
+        `Если когда-нибудь захочешь вернуться — напиши /start.\n\n` +
+        `Спасибо что попробовала бот 🙂`
+      );
     }
   }
 }
