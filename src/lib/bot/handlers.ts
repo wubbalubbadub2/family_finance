@@ -538,7 +538,6 @@ export function createBot(): Bot {
           `• Все категории, лимиты и цели\n` +
           `• Все записанные долги\n` +
           `• Все сообщения с ботом\n\n` +
-          `Если передумаешь — напиши /start чтобы начать заново.\n\n` +
           `Точно?`,
           { reply_markup: { inline_keyboard: confirmKeyboard(nonce) } },
         ).catch(() => {});
