@@ -72,17 +72,17 @@ export function buildWelcomeText(name: string): string {
   );
 }
 
-// Static response for /приватность slash command. Trust-foundation copy:
-// honest about what we do (cohort analytics with usernames internally, no
-// third-party sharing), what we don't (no advertising use). No vendor
-// names — users care about the practice, not the provider stack.
+// Static response for /privacy (alias /приватность) slash command. Tone:
+// conversational, plain Russian, no jargon. Concrete examples ("100 человек
+// сегодня ездили на такси") over abstract claims. Tested for 30-year-old
+// KZ Russian-speaking women with no tech-policy reading habit.
 export const PRIVACY_TEXT =
-  `🔒 Как мы работаем с твоими данными:\n\n` +
-  `📊 Аналитика — обобщённая по группам пользователей. Имена не передаются третьим лицам и не используются для рекламы.\n\n` +
-  `🔧 Конкретные логи — только при расследовании багов или если ты сама обратишься за поддержкой.\n\n` +
-  `🛡️ Хранение — в зашифрованной базе данных. Не передаём третьим лицам.\n\n` +
-  `✂️ Удалить всё — /удалить_все\n\n` +
-  `💬 Вопросы — @sabina_amangeldi`;
+  `🔒 Как мы бережём твои данные (или наша Политика конфиденциальности)\n\n` +
+  `📊 Только статистика. Мы не смотрим твои личные траты. Видим только общую картину (например, что 100 человек сегодня ездили на такси). Твое имя и чеки остаются только между тобой и ботом.\n\n` +
+  `🔧 Без лишних глаз. Мы не читаем твои сообщения. Исключение: ты сама просишь о помощи или бот сломался и нам нужно найти ошибку.\n\n` +
+  `🛡️ Никакой рекламы и сливов. Данные лежат в защищенной базе. Мы их не продаем и не используем, чтобы показывать тебе рекламу.\n\n` +
+  `✂️ Полный сброс. Если захочешь уйти по-английски, просто напиши /удалить_все_данные. Мы сотрем всё, что было, без возможности восстановления.\n\n` +
+  `💬 Нужна помощь? На связи @sabina_amangeldi.`;
 
 /**
  * Welcome-back for an EXISTING user re-tapping /start. One line, no name —
@@ -475,20 +475,22 @@ export function createBot(): Bot {
         return;
       }
 
-      // /приватность — static response describing data handling. Trust
-      // foundation surfaced in the welcome message; sends users here to
-      // read it on demand.
-      const privacyMatch = rawText.match(/^\/приватность(?:@\w+)?\s*$/i);
+      // /privacy (alias /приватность) — static response describing data
+      // handling. ASCII alias /privacy is what we register in the
+      // BotFather menu (Telegram bot commands must be ASCII); the Russian
+      // /приватность is for users who read it in the welcome text and
+      // type it back.
+      const privacyMatch = rawText.match(/^\/(?:приватность|privacy)(?:@\w+)?\s*$/i);
       if (privacyMatch) {
         await ctx.reply(PRIVACY_TEXT).catch(() => {});
         return;
       }
 
-      // /удалить_все — two-tap soft-delete of the family. Wires through
-      // existing pending_confirm flow. The actual wipe runs in
-      // executeConfirmedAction via wipeFamilyData() when the user taps
-      // ✅ Да.
-      const wipeMatch = rawText.match(/^\/удалить_все(?:@\w+)?\s*$/i);
+      // /delete_data (alias /удалить_все_данные) — two-tap soft-delete of
+      // the family. ASCII alias is for BotFather menu. The actual wipe
+      // runs in executeConfirmedAction via wipeFamilyData() when the user
+      // taps ✅ Да.
+      const wipeMatch = rawText.match(/^\/(?:удалить_все_данные|delete_data)(?:@\w+)?\s*$/i);
       if (wipeMatch) {
         const nonce = generateConfirmNonce();
         await setPendingConfirm(familyId, {
