@@ -50,6 +50,14 @@ describe('buildWelcomeText (fresh-user onboarding)', () => {
     assert.doesNotMatch(out, /чем больше/i);
     assert.doesNotMatch(out, /ценность/i);
   });
+
+  test('includes the "что умеет бот" CTA and the privacy disclaimer', () => {
+    // Added 2026-05-13: the welcome should nudge users into discovering
+    // the help command and reassure them about data safety.
+    const out = buildWelcomeText('Тест');
+    assert.match(out, /спроси что умеет бот/i);
+    assert.match(out, /<i>Твои данные в безопасности<\/i>/);
+  });
 });
 
 describe('buildWelcomeBackText (returning-user /start)', () => {

@@ -61,14 +61,25 @@ function formatUserErrorReply(errMsg: string): string {
  * income demonstrate what the bot accepts, without making any claims the
  * user has to take on faith.
  */
+// HTML-escape for parse_mode='HTML' rendering. Russian text is safe but
+// the user's first_name could theoretically contain <, >, & — escape just
+// in case.
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
 export function buildWelcomeText(name: string): string {
+  // Uses HTML parse_mode at the call site for the italic disclaimer line.
+  // Markdown was avoided here historically because the bot username's
+  // underscores tripped the italic syntax; HTML doesn't have that issue.
   return (
-    `Привет, ${name} 👋\n\n` +
+    `Привет, ${escapeHtml(name)} 👋\n\n` +
     `Напиши свою трату — например:\n` +
     `  • кофе 500\n` +
     `  • такси 2300\n` +
     `  • зарплата 500 000\n\n` +
-    `🔒 /приватность — как мы работаем с твоими данными`
+    `или спроси что умеет бот\n\n` +
+    `<i>Твои данные в безопасности</i>`
   );
 }
 
@@ -223,9 +234,10 @@ async function handleInviteArrival(ctx: Context, code: string): Promise<void> {
   }
 
   // Success — brand new user (or idempotent re-tap).
-  // No parse_mode: bot username + Russian text would trip the legacy Markdown
-  // underscore-as-italic bug. Plain text is the most robust render path.
-  await ctx.reply(buildWelcomeText(name));
+  // parse_mode: 'HTML' is required for the <i>Твои данные в безопасности</i>
+  // disclaimer line in buildWelcomeText. HTML avoids the Markdown
+  // underscore-as-italic bug that tripped bot usernames historically.
+  await ctx.reply(buildWelcomeText(name), { parse_mode: 'HTML' });
 }
 
 /**
@@ -272,7 +284,7 @@ async function onboardFreshDmUser(ctx: Context): Promise<void> {
     return;
   }
 
-  await ctx.reply(buildWelcomeText(name));
+  await ctx.reply(buildWelcomeText(name), { parse_mode: 'HTML' });
 }
 
 export function createBot(): Bot {
@@ -347,7 +359,7 @@ export function createBot(): Bot {
             try {
               const newFamilyId = await createFreshFamilyForExistingUser(telegramId, ctx.chat.id);
               const name = ctx.from?.first_name || 'друг';
-              await ctx.reply(buildWelcomeText(name));
+              await ctx.reply(buildWelcomeText(name), { parse_mode: 'HTML' });
               console.error(`[wiped-family-restart] user=${telegramId} old=${existing.family_id} new=${newFamilyId}`);
             } catch (e) {
               await captureError(e, { source: 'webhook:wipe-restart', userTgId: telegramId, familyId: existing.family_id });
@@ -413,7 +425,7 @@ export function createBot(): Bot {
           try {
             const newFamilyId = await createFreshFamilyForExistingUser(telegramId, ctx.chat.id);
             const name = ctx.from?.first_name || 'друг';
-            await ctx.reply(buildWelcomeText(name)).catch(() => {});
+            await ctx.reply(buildWelcomeText(name), { parse_mode: 'HTML' }).catch(() => {});
             console.error(`[wiped-family-restart] user=${telegramId} old=${familyId} new=${newFamilyId}`);
           } catch (e) {
             await captureError(e, { source: 'webhook:wipe-restart', userTgId: telegramId, familyId });
