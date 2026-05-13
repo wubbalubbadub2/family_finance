@@ -1,6 +1,6 @@
 import { Bot, type Context } from 'grammy';
 import type { InlineKeyboardButton } from 'grammy/types';
-import { chat, handleCallback, type BotResponse } from '@/lib/claude/agent';
+import { chat, handleCallback, confirmKeyboard, type BotResponse } from '@/lib/claude/agent';
 import {
   consumeFamilyInvite,
   getUserByTelegramId,
@@ -11,6 +11,9 @@ import {
   getFamilyById,
   markUpdateSeen,
   setFamilyRemindersDisabled,
+  setPendingConfirm,
+  generateConfirmNonce,
+  createFreshFamilyForExistingUser,
 } from '@/lib/db/queries';
 import { captureError } from '@/lib/observability';
 import { enforcePaidStatus } from '@/lib/bot/paywall';
@@ -64,9 +67,22 @@ export function buildWelcomeText(name: string): string {
     `Напиши свою трату — например:\n` +
     `  • кофе 500\n` +
     `  • такси 2300\n` +
-    `  • зарплата 500 000`
+    `  • зарплата 500 000\n\n` +
+    `🔒 /приватность — как мы работаем с твоими данными`
   );
 }
+
+// Static response for /приватность slash command. Trust-foundation copy:
+// honest about what we do (cohort analytics with usernames internally, no
+// third-party sharing), what we don't (no advertising use). No vendor
+// names — users care about the practice, not the provider stack.
+export const PRIVACY_TEXT =
+  `🔒 Как мы работаем с твоими данными:\n\n` +
+  `📊 Аналитика — обобщённая по группам пользователей. Имена не передаются третьим лицам и не используются для рекламы.\n\n` +
+  `🔧 Конкретные логи — только при расследовании багов или если ты сама обратишься за поддержкой.\n\n` +
+  `🛡️ Хранение — в зашифрованной базе данных. Не передаём третьим лицам.\n\n` +
+  `✂️ Удалить всё — /удалить_все\n\n` +
+  `💬 Вопросы — @sabina_amangeldi`;
 
 /**
  * Welcome-back for an EXISTING user re-tapping /start. One line, no name —
@@ -366,6 +382,28 @@ export function createBot(): Bot {
 
       const { familyId, firstTimeInChat } = resolved;
 
+      // Wiped-family gate (migration 019). If the family has been soft-wiped
+      // via /удалить_все, the bot ignores all messages except /start. On
+      // /start, we spawn a fresh family for the user and re-link the chat.
+      // Runs BEFORE paywall so wiped families don't see paywall messages.
+      const familyRecord = await getFamilyById(familyId).catch(() => null);
+      if (familyRecord?.deleted_at) {
+        if (/^\/start(@\w+)?$/i.test(rawText.trim())) {
+          try {
+            const newFamilyId = await createFreshFamilyForExistingUser(telegramId, ctx.chat.id);
+            const name = ctx.from?.first_name || 'друг';
+            await ctx.reply(buildWelcomeText(name)).catch(() => {});
+            console.error(`[wiped-family-restart] user=${telegramId} old=${familyId} new=${newFamilyId}`);
+          } catch (e) {
+            await captureError(e, { source: 'webhook:wipe-restart', userTgId: telegramId, familyId });
+            await ctx.reply(formatUserErrorReply(e instanceof Error ? e.message : String(e))).catch(() => {});
+          }
+        } else {
+          await ctx.reply('Твои данные были удалены ранее. Напиши /start чтобы начать заново.').catch(() => {});
+        }
+        return;
+      }
+
       // Trial / paid gate. Sits before the firstTimeInChat confirmation so an
       // expired family doesn't get "🔗 linked!" followed immediately by the
       // paywall message. Invite redemption (path 1) and bare /start (path 2)
@@ -434,6 +472,41 @@ export function createBot(): Bot {
         } else {
           await ctx.reply('Используй `/напоминания on` или `/напоминания off`.', { parse_mode: 'Markdown' }).catch(() => {});
         }
+        return;
+      }
+
+      // /приватность — static response describing data handling. Trust
+      // foundation surfaced in the welcome message; sends users here to
+      // read it on demand.
+      const privacyMatch = rawText.match(/^\/приватность(?:@\w+)?\s*$/i);
+      if (privacyMatch) {
+        await ctx.reply(PRIVACY_TEXT).catch(() => {});
+        return;
+      }
+
+      // /удалить_все — two-tap soft-delete of the family. Wires through
+      // existing pending_confirm flow. The actual wipe runs in
+      // executeConfirmedAction via wipeFamilyData() when the user taps
+      // ✅ Да.
+      const wipeMatch = rawText.match(/^\/удалить_все(?:@\w+)?\s*$/i);
+      if (wipeMatch) {
+        const nonce = generateConfirmNonce();
+        await setPendingConfirm(familyId, {
+          nonce,
+          type: 'soft_wipe_family',
+          args: {},
+        });
+        await ctx.reply(
+          `⚠️ Удалить все твои данные?\n\n` +
+          `Бот забудет:\n` +
+          `• Все транзакции и доходы\n` +
+          `• Все категории, лимиты и цели\n` +
+          `• Все записанные долги\n` +
+          `• Все сообщения с ботом\n\n` +
+          `Если передумаешь — напиши /start чтобы начать заново.\n\n` +
+          `Точно?`,
+          { reply_markup: { inline_keyboard: confirmKeyboard(nonce) } },
+        ).catch(() => {});
         return;
       }
 
@@ -508,6 +581,15 @@ export function createBot(): Bot {
       return;
     }
     const { familyId } = resolved;
+
+    // Wiped-family gate. If the user taps an old inline button after
+    // /удалить_все, the family record has deleted_at set. Short-circuit
+    // with a toast — don't try to process the confirm/cancel.
+    const cbFamily = await getFamilyById(familyId).catch(() => null);
+    if (cbFamily?.deleted_at) {
+      await ctx.answerCallbackQuery({ text: 'Данные удалены. /start чтобы начать заново' }).catch(() => undefined);
+      return;
+    }
 
     // Trial / paid gate. answerCallbackQuery first so the user sees the
     // toast, then enforcePaidStatus sends the paywall reply (rate-limited).

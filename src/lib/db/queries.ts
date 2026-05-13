@@ -187,6 +187,7 @@ export interface Family {
   name: string;
   created_at: string;
   paid_until: string;  // ISO timestamp; 2099-01-01 = effectively unlimited
+  deleted_at: string | null;  // Migration 019: NULL = active; ISO timestamp = soft-wiped
 }
 
 export async function getFamilyById(familyId: string): Promise<Family | null> {
@@ -236,6 +237,9 @@ export interface FamilyAdminRow {
   name: string;
   created_at: string;
   paid_until: string;
+  /** Migration 019: ISO timestamp when family was soft-wiped via /удалить_все.
+   *  NULL = active. Admin UI should distinguish wiped rows. */
+  deleted_at: string | null;
   member_count: number;
   tx_count: number;
   last_tx_at: string | null;
@@ -275,10 +279,10 @@ async function fetchAllRows<T>(
 export async function listFamiliesWithPaidStatus(): Promise<FamilyAdminRow[]> {
   // Families typically <10k for years; one shot is fine but we still
   // page-fetch to be safe.
-  const families = await fetchAllRows<{ id: string; name: string; created_at: string; paid_until: string }>(
+  const families = await fetchAllRows<{ id: string; name: string; created_at: string; paid_until: string; deleted_at: string | null }>(
     (from, to) => supabase
       .from('families')
-      .select('id, name, created_at, paid_until')
+      .select('id, name, created_at, paid_until, deleted_at')
       .order('created_at', { ascending: false })
       .range(from, to),
   );
@@ -369,6 +373,7 @@ export async function listFamiliesWithPaidStatus(): Promise<FamilyAdminRow[]> {
       name: f.name,
       created_at: f.created_at,
       paid_until: f.paid_until,
+      deleted_at: f.deleted_at,
       member_count: members.length,
       tx_count: txCounts.get(f.id) ?? 0,
       last_tx_at: lastTxAt.get(f.id) ?? null,
@@ -2151,7 +2156,8 @@ export type ConfirmType =
   | 'create_categories_bulk'
   | 'rename_category'
   | 'delete_category'
-  | 'merge_categories';
+  | 'merge_categories'
+  | 'soft_wipe_family';
 
 export interface PendingConfirm {
   nonce: string;
@@ -2205,6 +2211,51 @@ export async function clearPendingConfirm(familyId: string): Promise<void> {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// Family soft-delete (privacy package, migration 019)
+//
+// /удалить_все flow: handler intercepts the slash command, sets a
+// pending_confirm of type='soft_wipe_family'. When the user taps ✅ Да,
+// agent's executeConfirmedAction calls wipeFamilyData below, which invokes
+// the soft_wipe_family_data RPC. The RPC marks families.deleted_at and
+// transactions.deleted_at atomically (Postgres function = transaction).
+// ───────────────────────────────────────────────────────────────────────────
+
+export async function wipeFamilyData(familyId: string): Promise<Record<string, unknown>> {
+  const { data, error } = await supabase.rpc('soft_wipe_family_data', { p_family_id: familyId });
+  if (error) throw error;
+  return (data ?? {}) as Record<string, unknown>;
+}
+
+/**
+ * After a family has been soft-wiped, /start should give the user a fresh
+ * family rather than resurrecting the deleted one. Creates a new family,
+ * re-points the user's family_id, and re-links the chat to the new family.
+ * Old family stays in DB with deleted_at set (admin-recoverable).
+ */
+export async function createFreshFamilyForExistingUser(
+  telegramId: number,
+  chatId: number,
+): Promise<string> {
+  const user = await getUserByTelegramId(telegramId);
+  if (!user) throw new Error('User not found');
+  // createFamily handles default category seeding internally.
+  const newFamilyId = await createFamily(`${user.name}'s family`, chatId);
+  const { error: e1 } = await supabase
+    .from('users')
+    .update({ family_id: newFamilyId })
+    .eq('id', user.id);
+  if (e1) throw e1;
+  // Re-link the chat to the new family. family_chats.chat_id has a unique
+  // constraint, so we UPDATE the existing row rather than INSERT.
+  const { error: e2 } = await supabase
+    .from('family_chats')
+    .update({ family_id: newFamilyId })
+    .eq('chat_id', chatId);
+  if (e2) throw e2;
+  return newFamilyId;
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // Day-1 re-engagement nudge — audience + state helpers
 //
 // See supabase/migrations/018_day1_nudge.sql and src/lib/cron/day1-nudge.ts
@@ -2237,11 +2288,14 @@ export async function getDay1NudgeCandidates(): Promise<Day1NudgeCandidate[]> {
   const today = new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Almaty' });
   const almatyDayStartUtc = new Date(`${today}T00:00:00+05:00`).toISOString();
 
-  // 1. Eligible families: opt-in, not paywalled, not already nudged today.
+  // 1. Eligible families: opt-in, not paywalled, not wiped, not already
+  //    nudged today. `deleted_at IS NULL` excludes soft-wiped families
+  //    (migration 019).
   const { data: fams, error: famErr } = await supabase
     .from('families')
     .select('id, name, paid_until, reminders_disabled, last_nudge_sent_at')
     .eq('reminders_disabled', false)
+    .is('deleted_at', null)
     .gt('paid_until', nowIso);
   if (famErr) throw famErr;
   const eligible = (fams ?? []).filter(f => {
