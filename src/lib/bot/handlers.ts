@@ -331,10 +331,31 @@ export function createBot(): Bot {
       // a fresh family with a 3-day trial — no invite code needed. This is
       // the public-link entry point: just `t.me/<bot>` works, no payload.
       // In groups we ignore /start@bot specifically (let it fall through).
+      //
+      // SPECIAL CASE — wiped family (migration 019). If the existing user's
+      // family has deleted_at set (they ran /удалить_все_данные previously),
+      // /start spawns a fresh family rather than showing welcome-back. The
+      // downstream wiped-family gate at line ~385 also handles this for the
+      // post-Path-2 flow, but Path 2 returns early so the gate never runs
+      // here — handle it inline.
       if (isPrivate && /^\/start(@\w+)?$/i.test(rawText)) {
         const existing = await getUserByTelegramId(telegramId);
         if (existing) {
-          await ctx.reply(buildWelcomeBackText());
+          const fam = await getFamilyById(existing.family_id).catch(() => null);
+          if (fam?.deleted_at) {
+            // Re-onboard: new family + re-point user.family_id + re-link chat.
+            try {
+              const newFamilyId = await createFreshFamilyForExistingUser(telegramId, ctx.chat.id);
+              const name = ctx.from?.first_name || 'друг';
+              await ctx.reply(buildWelcomeText(name));
+              console.error(`[wiped-family-restart] user=${telegramId} old=${existing.family_id} new=${newFamilyId}`);
+            } catch (e) {
+              await captureError(e, { source: 'webhook:wipe-restart', userTgId: telegramId, familyId: existing.family_id });
+              await ctx.reply(formatUserErrorReply(e instanceof Error ? e.message : String(e))).catch(() => {});
+            }
+          } else {
+            await ctx.reply(buildWelcomeBackText());
+          }
         } else {
           await onboardFreshDmUser(ctx);
         }
