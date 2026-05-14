@@ -1773,11 +1773,64 @@ export async function chat(
     return textOnly(reply);
   }
 
-  // Layer 3: context-shift detection. Only inspects pending_confirm; never
-  // mutates it for confirm/preserve cases. Safe to run on every request
-  // (idempotent — markUpdateSeen already gated the lambda invocation).
+  const saveUserMsg = () => saveMessage(ctx.chatId, ctx.familyId, 'user', `[${userName}]: ${text}`).catch(() => {});
+  const saveAssistantMsg = (reply: string) => saveMessage(ctx.chatId, ctx.familyId, 'assistant', reply).catch(() => {});
+
+  // Layer 3: context-shift detection on pending_confirm. Three behaviors:
+  //  (a) Text-fallback for confirm/cancel — users who TYPE "да" / "✅" /
+  //      "подтверждаю" / "нет" / "отмена" instead of tapping the inline
+  //      keyboard. Real cohort signal 2026-05-14: 13 lapsed users (incl.
+  //      paying customers @aigule, @madika) typed "✅ подтвердил" verbatim
+  //      and got no response → silence. Treat as the equivalent button tap.
+  //  (b) Clear-and-proceed — user's message is a clear new intent (create,
+  //      delete, etc) → drop the pending and route through Sonnet.
+  //  (c) Preserve — short replies that could be part of the pending flow.
   const existingPending = await getPendingConfirm(ctx.familyId).catch(() => null);
   if (existingPending) {
+    const lower = text.trim().toLowerCase();
+    // Text-fallback for the inline-keyboard confirm. Conservative patterns:
+    // only fire on clear yes/no/confirm/cancel signals at the START of the
+    // message (anchored). Doesn't fire on bare "ok" — too ambiguous in RU.
+    const isTextConfirm = /^(да|✅|подтверждаю|подтвердил[аоые]?|подтверди\b|давай(?:\s|$)|сохрани\b)/i.test(lower);
+    const isTextCancel  = /^(нет|❌|отмен(?:а|ить|и)?\b|cancel|не\s+надо)/i.test(lower);
+
+    if (isTextConfirm) {
+      await saveUserMsg();
+      await clearPendingConfirm(ctx.familyId).catch(() => {});
+      try {
+        const reply = await executeConfirmedAction(existingPending, ctx);
+        await saveAssistantMsg(reply ?? '');
+        void logBotAction({
+          source: 'chat',
+          familyId: ctx.familyId,
+          replyLength: (reply ?? '').length,
+          latencyMs: Date.now() - chatStart,
+          meta: { exit: 'text_fallback_confirm', pending_type: existingPending.type },
+        });
+        return textOnly(reply ?? '✅ Готово.');
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        console.error('[chat] text-fallback confirm execute failed:', msg);
+        await saveAssistantMsg(`❌ Не получилось: ${msg.slice(0, 200)}`);
+        return textOnly(`❌ ${msg.slice(0, 200)}`);
+      }
+    }
+    if (isTextCancel) {
+      await saveUserMsg();
+      await clearPendingConfirm(ctx.familyId).catch(() => {});
+      const reply = '❌ Отменено.';
+      await saveAssistantMsg(reply);
+      void logBotAction({
+        source: 'chat',
+        familyId: ctx.familyId,
+        replyLength: reply.length,
+        latencyMs: Date.now() - chatStart,
+        meta: { exit: 'text_fallback_cancel', pending_type: existingPending.type },
+      });
+      return textOnly(reply);
+    }
+
+    // Neither confirm nor cancel — run the classifier for context-shift.
     const transition = classifyPendingConfirmTransition(text);
     if (transition === 'clear-and-proceed') {
       await clearPendingConfirm(ctx.familyId).catch((e) => {
@@ -1786,9 +1839,6 @@ export async function chat(
     }
     // 'preserve' (rules 1 + 3) → no-op; existing flow continues with pending state intact.
   }
-
-  const saveUserMsg = () => saveMessage(ctx.chatId, ctx.familyId, 'user', `[${userName}]: ${text}`).catch(() => {});
-  const saveAssistantMsg = (reply: string) => saveMessage(ctx.chatId, ctx.familyId, 'assistant', reply).catch(() => {});
 
   // NOTE: /newfamily and /invite are handled in bot/handlers.ts BEFORE the
   // command-prefix strip, because chat() only receives cleanText (prefix
