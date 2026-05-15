@@ -40,7 +40,7 @@ function shouldSend(chatId: number): boolean {
   return true;
 }
 
-const ADMIN_HANDLE = '@shynggys_islam';
+const ADMIN_HANDLE = '@shynggysislam';
 const KASPI_NUMBER = '87011885707';
 const PRICE_TENGE = '1 990 ₸';
 
@@ -81,7 +81,7 @@ function buildPaywallMessage(opts: {
       `⏸ Семейный бюджет приостановлен.\n\n` +
       `Чтобы продолжить:\n` +
       `1. Оплатите ${PRICE_TENGE} на Kaspi: ${KASPI_NUMBER}\n` +
-      `2. Напишите ${ADMIN_HANDLE} со скриншотом чека и кодом ниже\n\n` +
+      `2. Напишите ${ADMIN_HANDLE} с кодом ниже\n\n` +
       `Код для проверки: ${code}`
     );
   }
@@ -92,7 +92,7 @@ function buildPaywallMessage(opts: {
     `⏸ Подписка семьи "${opts.familyName}" истекла ${ago}.\n\n` +
     `Чтобы продолжить пользоваться ботом:\n` +
     `1. Оплатите ${PRICE_TENGE} на Kaspi: ${KASPI_NUMBER}\n` +
-    `2. Напишите ${ADMIN_HANDLE} со скриншотом чека и кодом ниже\n\n` +
+    `2. Напишите ${ADMIN_HANDLE} с кодом ниже\n\n` +
     `Код для проверки: ${code}`
   );
 }

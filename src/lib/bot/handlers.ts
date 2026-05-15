@@ -22,7 +22,7 @@ import { enforcePaidStatus } from '@/lib/bot/paywall';
 // human to escalate to when the bot can't help itself. Removed from welcome
 // messages — we want the welcome to push users into their first transaction,
 // not into a support DM. They'll discover support via /help or via errors.
-const SUPPORT_HANDLE = '@shynggys_islam';
+const SUPPORT_HANDLE = '@shynggysislam';
 
 /**
  * Map an API/internal error to a user-facing Russian reply. Avoids leaking
