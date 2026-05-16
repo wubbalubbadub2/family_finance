@@ -1,0 +1,99 @@
+# External scheduler for prod cron jobs.
+#
+# Why this exists (2026-05-16): Vercel Hobby cron scheduler became unreliable —
+# stopped firing all 4 of our cron routes for 24+ hours without any error
+# or notification. Routes themselves are healthy (manual curls succeed).
+# We're moving the SCHEDULING off Vercel; the routes still run on Vercel
+# (Next.js serverless functions), GitHub Actions just fires them on time.
+#
+# What it does:
+#   - 4 separate cron schedules, all UTC. Same schedules as old vercel.json.
+#   - Each scheduled fire matches its route via case-statement on the
+#     `github.event.schedule` field.
+#   - Calls https://family-finance-taupe.vercel.app/api/cron/<name> with
+#     bearer auth from GitHub secret CRON_SECRET_PROD.
+#   - Logs the response body + HTTP status to the workflow run; failures
+#     show as red in the Actions tab.
+#
+# Required secret (set via `gh secret set CRON_SECRET_PROD`):
+#   CRON_SECRET_PROD — must match process.env.CRON_SECRET on Vercel prod.
+#                      Value lives in .env.production.local (gitignored).
+#
+# Manual trigger for testing:
+#   gh workflow run scheduled-crons.yml -f route=/api/cron/day1-nudge
+#   OR via the Actions tab → "Scheduled Crons" → Run workflow
+#
+# Notes:
+#   - GitHub Actions cron has its own delay (typically 0-15 min during high
+#     load). Acceptable for our once-daily/weekly schedules.
+#   - Scheduled workflows only run from the DEFAULT branch (main).
+#   - 5-minute job timeout — long enough for any cron, short enough that a
+#     hung run doesn't burn workflow minutes.
+
+name: Scheduled Crons
+
+on:
+  schedule:
+    - cron: '0 16 * * *'   # day1-nudge: daily 21:00 Almaty
+    - cron: '0 15 * * 0'   # weekly-digest: Sunday 20:00 Almaty
+    - cron: '0 3 * * 0'    # cleanup: Sunday 08:00 Almaty
+    - cron: '0 5 1 * *'    # monthly: 1st of month, 10:00 Almaty
+  workflow_dispatch:
+    inputs:
+      route:
+        description: 'Route to fire manually'
+        required: true
+        type: choice
+        options:
+          - /api/cron/day1-nudge
+          - /api/cron/weekly-digest
+          - /api/cron/cleanup
+          - /api/cron/monthly
+
+jobs:
+  fire-cron:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Determine route from schedule (or input)
+        id: which
+        run: |
+          if [ -n "${{ inputs.route }}" ]; then
+            echo "route=${{ inputs.route }}" >> "$GITHUB_OUTPUT"
+          else
+            case "${{ github.event.schedule }}" in
+              "0 16 * * *") echo "route=/api/cron/day1-nudge" >> "$GITHUB_OUTPUT" ;;
+              "0 15 * * 0") echo "route=/api/cron/weekly-digest" >> "$GITHUB_OUTPUT" ;;
+              "0 3 * * 0")  echo "route=/api/cron/cleanup" >> "$GITHUB_OUTPUT" ;;
+              "0 5 1 * *")  echo "route=/api/cron/monthly" >> "$GITHUB_OUTPUT" ;;
+              *)
+                echo "::error::Unknown cron schedule: ${{ github.event.schedule }}"
+                exit 1
+                ;;
+            esac
+          fi
+
+      - name: Fire cron route
+        env:
+          ROUTE: ${{ steps.which.outputs.route }}
+          PROD_URL: https://family-finance-taupe.vercel.app
+          CRON_SECRET: ${{ secrets.CRON_SECRET_PROD }}
+        run: |
+          if [ -z "$CRON_SECRET" ]; then
+            echo "::error::CRON_SECRET_PROD secret is not set in this repo"
+            exit 1
+          fi
+          echo "→ POST $PROD_URL$ROUTE"
+          # 5-minute curl timeout; Vercel function caps at 60s on Hobby so
+          # this is mostly defensive.
+          HTTP_CODE=$(curl -sS -m 300 -o /tmp/cron-body -w "%{http_code}" \
+            -H "Authorization: Bearer $CRON_SECRET" "$PROD_URL$ROUTE")
+          echo "← HTTP $HTTP_CODE"
+          echo "Response:"
+          cat /tmp/cron-body
+          echo ""
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::Cron $ROUTE failed with HTTP $HTTP_CODE"
+            exit 1
+          fi
+          echo "✓ $ROUTE fired successfully"
