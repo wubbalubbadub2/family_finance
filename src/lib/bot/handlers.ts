@@ -501,17 +501,20 @@ export function createBot(): Bot {
       // cron also auto-flips this to TRUE if the user blocks the bot, so any
       // /напоминания on after a block is a "re-opt-in" the user is explicitly
       // making.
-      const remindersMatch = rawText.match(/^\/напоминания(?:@\w+)?(?:\s+(on|off))?\s*$/i);
+      // Accept both Russian /напоминания and ASCII /notifications. The
+      // ASCII form is the one registered in BotFather menu (Telegram bot
+      // commands must be ASCII); Russian works when typed.
+      const remindersMatch = rawText.match(/^\/(?:напоминания|notifications)(?:@\w+)?(?:\s+(on|off))?\s*$/i);
       if (remindersMatch) {
         const arg = (remindersMatch[1] ?? '').toLowerCase();
         if (arg === 'off') {
           await setFamilyRemindersDisabled(familyId, true).catch(() => {});
-          await ctx.reply('🔕 Напоминания отключены. Передумаешь — напиши `/напоминания on`.', { parse_mode: 'Markdown' }).catch(() => {});
+          await ctx.reply('🔕 Напоминания отключены. Передумаешь — напиши /notifications on.').catch(() => {});
         } else if (arg === 'on') {
           await setFamilyRemindersDisabled(familyId, false).catch(() => {});
           await ctx.reply('🔔 Напоминания включены. Буду писать вечером, если за день не залогируешь ни одной траты.').catch(() => {});
         } else {
-          await ctx.reply('Используй `/напоминания on` или `/напоминания off`.', { parse_mode: 'Markdown' }).catch(() => {});
+          await ctx.reply('Используй /notifications on или /notifications off').catch(() => {});
         }
         return;
       }
