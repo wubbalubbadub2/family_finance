@@ -101,8 +101,7 @@ export const PRIVACY_TEXT =
 export const CONTACT_TEXT =
   `💬 На связи:\n\n` +
   `Сабина (вопросы, помощь, обратная связь) — @sabina_amangeldi\n` +
-  `Шынгыс (разработка, баги) — @shynggysislam\n\n` +
-  `Обычно отвечаем в течение дня.`;
+  `Шынгыс (разработка, баги) — @shynggysislam`;
 
 /**
  * Welcome-back for an EXISTING user re-tapping /start. One line, no name —
