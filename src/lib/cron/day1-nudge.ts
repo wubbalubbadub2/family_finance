@@ -32,7 +32,7 @@ import { captureError, logBotAction } from '@/lib/observability';
 // the italic syntax — HTML doesn't have that issue.
 const NUDGE_TEXT =
   'Спишь? Напиши мне пожалуйста, я сильно жду от тебя сообщение :)\n\n' +
-  '<i>Не хочешь напоминания — /notifications off</i>';
+  '<i>не хочешь напоминания - напиши /notifications off</i>';
 const INTER_SEND_DELAY_MS = 50;
 
 export interface SendDay1NudgesResult {

@@ -20,7 +20,7 @@ import { sendDay1Nudges } from '@/lib/cron/day1-nudge';
 // Keep in sync with NUDGE_TEXT in src/lib/cron/day1-nudge.ts.
 const NUDGE_TEXT =
   'Спишь? Напиши мне пожалуйста, я сильно жду от тебя сообщение :)\n\n' +
-  '<i>Не хочешь напоминания — /notifications off</i>';
+  '<i>не хочешь напоминания - напиши /notifications off</i>';
 
 function verifyCron(req: NextRequest): boolean {
   const authHeader = req.headers.get('authorization');
