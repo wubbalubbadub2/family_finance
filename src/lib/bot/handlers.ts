@@ -95,6 +95,15 @@ export const PRIVACY_TEXT =
   `✂️ Полный сброс. Если захочешь уйти по-английски, просто напиши /удалить_все_данные. Мы сотрем всё, что было, без возможности восстановления.\n\n` +
   `💬 Нужна помощь? На связи @sabina_amangeldi.`;
 
+// Static response for /contact slash command. Surfaces both founders so
+// users can pick the right contact: Sabina for general questions/feedback,
+// Shynggys for technical issues/bugs. Short — 3 lines + handles.
+export const CONTACT_TEXT =
+  `💬 На связи:\n\n` +
+  `Сабина (вопросы, помощь, обратная связь) — @sabina_amangeldi\n` +
+  `Шынгыс (разработка, баги) — @shynggysislam\n\n` +
+  `Обычно отвечаем в течение дня.`;
+
 /**
  * Welcome-back for an EXISTING user re-tapping /start. One line, no name —
  * the user knows who they are. Just nudges them back to the action.
@@ -516,6 +525,15 @@ export function createBot(): Bot {
       const privacyMatch = rawText.match(/^\/(?:приватность|privacy)(?:@\w+)?\s*$/i);
       if (privacyMatch) {
         await ctx.reply(PRIVACY_TEXT).catch(() => {});
+        return;
+      }
+
+      // /contact — static response with both founders' handles. ASCII for
+      // BotFather menu compatibility. No Russian alias since "контакт" /
+      // "связь" / "контакты" are too ambiguous as standalone commands.
+      const contactMatch = rawText.match(/^\/contact(?:s)?(?:@\w+)?\s*$/i);
+      if (contactMatch) {
+        await ctx.reply(CONTACT_TEXT).catch(() => {});
         return;
       }
 
