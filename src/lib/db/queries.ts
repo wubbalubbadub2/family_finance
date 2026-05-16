@@ -2282,21 +2282,22 @@ export interface Day1NudgeCandidate {
 }
 
 export async function getDay1NudgeCandidates(): Promise<Day1NudgeCandidate[]> {
-  const nowIso = new Date().toISOString();
-
   // Today's Almaty date as YYYY-MM-DD; passed into the transaction_date filter.
   const today = new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Almaty' });
   const almatyDayStartUtc = new Date(`${today}T00:00:00+05:00`).toISOString();
 
-  // 1. Eligible families: opt-in, not paywalled, not wiped, not already
-  //    nudged today. `deleted_at IS NULL` excludes soft-wiped families
-  //    (migration 019).
+  // 1. Eligible families: opt-in, not wiped, not already nudged today.
+  //    `deleted_at IS NULL` excludes soft-wiped families (migration 019).
+  //
+  //    Note: paid_until is intentionally NOT filtered. Expired families also
+  //    get the nudge — re-engagement first, paywall friction is downstream
+  //    and reactive (fires only when they reply). The italic disclaimer in
+  //    the nudge text gives them a one-shot /notifications off opt-out.
   const { data: fams, error: famErr } = await supabase
     .from('families')
     .select('id, name, paid_until, reminders_disabled, last_nudge_sent_at')
     .eq('reminders_disabled', false)
-    .is('deleted_at', null)
-    .gt('paid_until', nowIso);
+    .is('deleted_at', null);
   if (famErr) throw famErr;
   const eligible = (fams ?? []).filter(f => {
     if (!f.last_nudge_sent_at) return true;

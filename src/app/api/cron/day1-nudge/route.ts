@@ -17,7 +17,10 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { sendDay1Nudges } from '@/lib/cron/day1-nudge';
 
-const NUDGE_TEXT = 'Спишь? Напиши мне пожалуйста, я сильно жду от тебя сообщение :)';
+// Keep in sync with NUDGE_TEXT in src/lib/cron/day1-nudge.ts.
+const NUDGE_TEXT =
+  'Спишь? Напиши мне пожалуйста, я сильно жду от тебя сообщение :)\n\n' +
+  '<i>Не хочешь напоминания — /notifications off</i>';
 
 function verifyCron(req: NextRequest): boolean {
   const authHeader = req.headers.get('authorization');
@@ -40,7 +43,7 @@ async function forceSendOnce(chatId: number): Promise<{ delivered: boolean; stat
   const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ chat_id: chatId, text: NUDGE_TEXT }),
+    body: JSON.stringify({ chat_id: chatId, text: NUDGE_TEXT, parse_mode: 'HTML' }),
   });
   if (res.ok) return { delivered: true, status: res.status };
   const body = await res.text().catch(() => '');

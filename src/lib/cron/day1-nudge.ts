@@ -26,7 +26,13 @@ import {
 } from '@/lib/db/queries';
 import { captureError, logBotAction } from '@/lib/observability';
 
-const NUDGE_TEXT = 'Спишь? Напиши мне пожалуйста, я сильно жду от тебя сообщение :)';
+// Locked text + italic opt-out disclaimer. parse_mode='HTML' below; the
+// <i>…</i> wraps just the disclaimer so the warm body stays plain. Markdown
+// was avoided historically because bot usernames with underscores tripped
+// the italic syntax — HTML doesn't have that issue.
+const NUDGE_TEXT =
+  'Спишь? Напиши мне пожалуйста, я сильно жду от тебя сообщение :)\n\n' +
+  '<i>Не хочешь напоминания — /notifications off</i>';
 const INTER_SEND_DELAY_MS = 50;
 
 export interface SendDay1NudgesResult {
@@ -61,7 +67,7 @@ async function sendNudgeWithErrorDetail(chatId: number): Promise<SendOutcome> {
     const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: chatId, text: NUDGE_TEXT }),
+      body: JSON.stringify({ chat_id: chatId, text: NUDGE_TEXT, parse_mode: 'HTML' }),
     });
     if (res.ok) return { ok: true, blocked: false, errorMessage: null };
 
