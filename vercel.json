@@ -1,20 +1,3 @@
 {
-  "crons": [
-    {
-      "path": "/api/cron/monthly",
-      "schedule": "0 5 1 * *"
-    },
-    {
-      "path": "/api/cron/cleanup",
-      "schedule": "0 3 * * 0"
-    },
-    {
-      "path": "/api/cron/weekly-digest",
-      "schedule": "0 15 * * 0"
-    },
-    {
-      "path": "/api/cron/day1-nudge",
-      "schedule": "0 16 * * *"
-    }
-  ]
+  "_comment": "Cron scheduling moved to GitHub Actions (.github/workflows/scheduled-crons.yml) on 2026-05-16 after Vercel Hobby cron stopped firing for ~24h with no error. Routes still live on Vercel; only the schedule moved. Restore cron entries here if migrating back."
 }
