@@ -120,7 +120,6 @@ export const HELP_TEXT =
   `💡 Лимиты:  «лимит 50 000 на Продукты», «лимиты: Продукты 50к, Кафе 30к»\n` +
   `🎯 Цели:  «хочу накопить 500 000 к июлю», «отложил 50 000»\n\n` +
   `↩️ Исправить:  «удали последнюю», «это не Кафе, а Продукты»\n\n` +
-  `⚙️ Команды: /categories /notifications off /privacy /contact /delete_data\n\n` +
   `Не понятно? Напиши прямо — отвечу.`;
 
 // Patterns that route to HELP_TEXT without ever invoking Sonnet. Anchored —

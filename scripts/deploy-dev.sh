@@ -30,8 +30,12 @@ BEFORE=$(vercel inspect "$ALIAS_URL" 2>&1 \
 echo "→ Current alias points to: ${BEFORE:-<unknown>}"
 
 # 3. Push (no-op if nothing to push).
+# Sets DEPLOY_DEV_SCRIPT=1 to satisfy the .git/hooks/pre-push gate that
+# blocks bare `git push origin dev` (added 2026-05-18 after repeated alias
+# drift incidents — manual git push leaves the alias frozen because nothing
+# downstream re-points it).
 echo "→ git push origin dev"
-git push origin dev
+DEPLOY_DEV_SCRIPT=1 git push origin dev
 
 # 4. Wait for a NEW preview deploy to appear and be Ready. Poll up to 5 min.
 # Vercel can take 60-90s to even REGISTER a new deploy after a push (let alone
