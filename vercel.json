@@ -1,3 +1,0 @@
-{
-  "_comment": "Cron scheduling moved to GitHub Actions (.github/workflows/scheduled-crons.yml) on 2026-05-16 after Vercel Hobby cron stopped firing for ~24h with no error. Routes still live on Vercel; only the schedule moved. Restore cron entries here if migrating back."
-}
