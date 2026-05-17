@@ -1996,9 +1996,24 @@ export async function chat(
         { timeout: SONNET_TIMEOUT_MS },
       );
     } catch (e) {
+      // SDK error-class checks are the primary signal; the regex is a fallback
+      // in case the SDK changes its error wrapping or wraps a network-layer
+      // error in a different class.
+      //
+      // Real bug shipped 2026-04 and only surfaced in cohort analysis 2026-05-18:
+      // Anthropic.APIConnectionTimeoutError.message is "Request timed out."
+      // (TWO words). The original regex `/timeout/` matched single-word
+      // "timeout" but not "timed out", so every Sonnet 8s timeout propagated
+      // out of chat() instead of falling back to Haiku. 79% of /help requests
+      // (which need Sonnet to generate long natural-language replies) hit
+      // this path between 2026-05-13 and 2026-05-18.
       const errMsg = e instanceof Error ? e.message : String(e);
-      const isOverloaded = /overloaded_error|529[^\d]/i.test(errMsg);
-      const isTimeout = /timeout|aborted|connection error/i.test(errMsg);
+      const isOverloaded =
+        (e instanceof Anthropic.APIError && e.status === 529) ||
+        /overloaded_error|529[^\d]/i.test(errMsg);
+      const isTimeout =
+        e instanceof Anthropic.APIConnectionError ||   // includes APIConnectionTimeoutError subclass
+        /timeout|timed[\s_]+out|aborted|connection[\s_]+error/i.test(errMsg);
       if (isOverloaded || isTimeout) {
         console.warn(`[chat] Sonnet ${isTimeout ? 'timed out' : 'returned 529'} — falling back to ${HAIKU_MODEL}`);
         haikuFallbacks++;
