@@ -48,7 +48,7 @@ echo "→ Waiting for Vercel build (up to 5 min)..."
 NEW_DEPLOY=""
 for i in $(seq 1 60); do
   sleep 5
-  LATEST_LINE=$(vercel ls 2>/dev/null | grep "Preview" | head -1 || true)
+  LATEST_LINE=$(vercel ls 2>&1 | grep "Preview" | head -1 || true)
   if [ -z "$LATEST_LINE" ]; then continue; fi
 
   LATEST_URL=$(echo "$LATEST_LINE" | awk '{print $3}')
@@ -69,7 +69,7 @@ done
 # Fallback: nothing new after 5 min — push was likely a true no-op (no source
 # files changed). Re-alias to current latest so the alias stays current.
 if [ -z "$NEW_DEPLOY" ]; then
-  LATEST_LINE=$(vercel ls 2>/dev/null | grep "Preview" | head -1 || true)
+  LATEST_LINE=$(vercel ls 2>&1 | grep "Preview" | head -1 || true)
   if [ -n "$LATEST_LINE" ]; then
     LATEST_URL=$(echo "$LATEST_LINE" | awk '{print $3}')
     echo "→ No new deploy after 5 min — re-aliasing to current latest ($LATEST_URL)."
