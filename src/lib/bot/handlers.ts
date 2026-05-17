@@ -103,6 +103,64 @@ export const CONTACT_TEXT =
   `Сабина (вопросы, помощь, обратная связь) — @sabina_amangeldi\n` +
   `Шынгыс (разработка, баги) — @shynggysislam`;
 
+// Static response for /help slash command AND natural-language "что умеет бот"
+// variants. Help replies don't depend on per-family state — same text for every
+// user every time — so spending an LLM call on each request is wasteful AND
+// caused a silent-failure incident (2026-05-13 → 2026-05-18: 79% of /help
+// requests got NO reply at all due to Sonnet timeout + Haiku-fallback regex
+// bug that's now fixed separately). Direct static reply: instant, deterministic,
+// can't fail.
+export const HELP_TEXT =
+  `🤖 Вот что я умею\n\n` +
+  `💸 Записать трату\n` +
+  `Напиши что купила и за сколько:\n` +
+  `  • кофе 500\n` +
+  `  • такси 2300\n` +
+  `  • продукты 4500\n` +
+  `Можно несколько сразу: «кофе 500, такси 2500, продукты 4500».\n\n` +
+  `💰 Записать доход\n` +
+  `  • зарплата 280 000\n` +
+  `  • доход 50 000 репетиторство\n\n` +
+  `🤝 Долги\n` +
+  `  • мне должен Алмас 5000\n` +
+  `  • я должна 10 000 Айгуль\n\n` +
+  `📊 Спросить про траты\n` +
+  `  • «сколько на кофе?» — поиск по слову\n` +
+  `  • «итоги месяца» — сводка по категориям\n` +
+  `  • «последние 10 трат» — свежий список\n` +
+  `  • «мои категории» — список категорий\n\n` +
+  `⚙️ Команды\n` +
+  `/categories — список категорий\n` +
+  `/notifications off — выключить вечерние напоминания\n` +
+  `/privacy — как храним данные\n` +
+  `/contact — связь с нами\n` +
+  `/delete_data — удалить все данные\n\n` +
+  `Что-то непонятно? Напиши прямо — разберёмся.`;
+
+// Patterns that route to HELP_TEXT without ever invoking Sonnet. Anchored —
+// catches whole-message intent only, not "сколько ты умеешь съесть конфет"
+// type sub-phrases. Verbatim "что умеет бот" is the welcome-CTA wording,
+// the rest are common natural-language variants observed in production
+// (users on iOS sometimes capitalize the first letter, hence /i flag).
+const HELP_INTENT_PATTERNS: RegExp[] = [
+  /^\/help(@\w+)?\s*$/i,
+  /^\/(помощь|помоги)(@\w+)?\s*$/i,
+  /^что\s+(ты\s+)?умее(шь|т)(\s+(делать|бот))?\s*\??$/i,
+  /^что\s+(ты\s+)?можешь(\s+(делать|сделать))?\s*\??$/i,
+  /^что\s+умеет\s+бот\s*\??$/i,
+  /^а\s+что\s+(ты\s+|бот\s+)?(умее(шь|т)|можешь)/i,
+  /^(помощь|help|инструкция|функции|возможности)\s*\??$/i,
+  // No \b at end — JS regex \b is ASCII-only and doesn't recognize Cyrillic
+  // word boundaries, so `\b` after "пользоваться" misses Russian text. Leave
+  // open-ended; false positives unlikely since this is anchored start.
+  /^как\s+(тобой\s+)?(пользоваться|использовать)/i,
+];
+
+export function isHelpIntent(rawText: string): boolean {
+  const t = rawText.trim();
+  return HELP_INTENT_PATTERNS.some(p => p.test(t));
+}
+
 /**
  * Welcome-back for an EXISTING user re-tapping /start. One line, no name —
  * the user knows who they are. Just nudges them back to the action.
@@ -539,6 +597,16 @@ export function createBot(): Bot {
         return;
       }
 
+      // /help, /помощь AND natural-language variants ("что умеет бот", "как
+      // пользоваться", etc.). Static text — same answer for every user every
+      // time. Bypasses Sonnet entirely. Replaces the previous flow that
+      // routed help through SLASH_COMMAND_TO_NL → chat() → Sonnet, which
+      // silent-failed for 79% of requests between 2026-05-13 and 2026-05-18.
+      if (isHelpIntent(rawText)) {
+        await ctx.reply(HELP_TEXT).catch(() => {});
+        return;
+      }
+
       // /delete_data (alias /удалить_все_данные) — two-tap soft-delete of
       // the family. ASCII alias is for BotFather menu. The actual wipe
       // runs in executeConfirmedAction via wipeFamilyData() when the user
@@ -574,10 +642,12 @@ export function createBot(): Bot {
       // phrases that Sonnet already handles well — verified by user that
       // "итоги месяца" / "мои категории" / "что умеет бот" produce correct
       // replies. Unknown bare slash commands still no-op, which is fine.
+      // /help removed from this map — intercepted earlier as a static text
+      // reply (see isHelpIntent block above). /summary and /categories still
+      // route through Sonnet because they need per-family data.
       const SLASH_COMMAND_TO_NL: Record<string, string> = {
         summary: 'итоги месяца',
         categories: 'мои категории',
-        help: 'что умеет бот',
       };
 
       let cleanText = rawText
