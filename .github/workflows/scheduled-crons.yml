@@ -6,21 +6,27 @@
 # We're moving the SCHEDULING off Vercel; the routes still run on Vercel
 # (Next.js serverless functions), GitHub Actions just fires them on time.
 #
-# What it does:
-#   - 4 separate cron schedules, all UTC. Same schedules as old vercel.json.
-#   - Each scheduled fire matches its route via case-statement on the
-#     `github.event.schedule` field.
-#   - Calls https://family-finance-taupe.vercel.app/api/cron/<name> with
-#     bearer auth from GitHub secret CRON_SECRET_PROD.
-#   - Logs the response body + HTTP status to the workflow run; failures
-#     show as red in the Actions tab.
+# 2026-05-17 update: day1-nudge moved further off Vercel — the send loop
+# now runs INSIDE the GH Actions runner via scripts/cron-runners/day1-nudge.mjs.
+# Vercel only provides /candidates (read) and /mark (per-family write) endpoints.
+# This removes Vercel's 60s function timeout from the critical path, which
+# became a problem when audience grew past ~200 families.
 #
-# Required secret (set via `gh secret set CRON_SECRET_PROD`):
-#   CRON_SECRET_PROD — must match process.env.CRON_SECRET on Vercel prod.
-#                      Value lives in .env.production.local (gitignored).
+# Routes that still run end-to-end on Vercel (one curl each):
+#   /api/cron/weekly-digest
+#   /api/cron/cleanup
+#   /api/cron/monthly
+#
+# Routes split between Vercel + GH Actions:
+#   /api/cron/day1-nudge   →   Node runner here calls /candidates + /mark
+#
+# Required secrets (set via `gh secret set`):
+#   CRON_SECRET_PROD       — must match process.env.CRON_SECRET on Vercel prod
+#   TELEGRAM_BOT_TOKEN_PROD — prod bot token (only needed for day1-nudge)
 #
 # Manual trigger for testing:
 #   gh workflow run scheduled-crons.yml -f route=/api/cron/day1-nudge
+#   gh workflow run scheduled-crons.yml -f route=/api/cron/day1-nudge -f dry_run=true
 #   OR via the Actions tab → "Scheduled Crons" → Run workflow
 #
 # Notes:
@@ -49,6 +55,11 @@ on:
           - /api/cron/weekly-digest
           - /api/cron/cleanup
           - /api/cron/monthly
+      dry_run:
+        description: 'Dry-run (day1-nudge only): fetch candidates + simulate sends, no DB writes, no Telegram messages'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   fire-cron:
@@ -73,7 +84,33 @@ jobs:
             esac
           fi
 
-      - name: Fire cron route
+      # day1-nudge needs the repo checked out so we can run the Node runner.
+      # Other routes are pure curl — no checkout needed.
+      - name: Checkout (day1-nudge only)
+        if: steps.which.outputs.route == '/api/cron/day1-nudge'
+        uses: actions/checkout@v4
+
+      - name: Fire day1-nudge via Node runner
+        if: steps.which.outputs.route == '/api/cron/day1-nudge'
+        env:
+          PROD_URL: https://family-finance-taupe.vercel.app
+          CRON_SECRET: ${{ secrets.CRON_SECRET_PROD }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN_PROD }}
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+          CONCURRENCY: '10'
+        run: |
+          if [ -z "$CRON_SECRET" ]; then
+            echo "::error::CRON_SECRET_PROD secret is not set in this repo"
+            exit 1
+          fi
+          if [ -z "$TELEGRAM_BOT_TOKEN" ]; then
+            echo "::error::TELEGRAM_BOT_TOKEN_PROD secret is not set in this repo"
+            exit 1
+          fi
+          node scripts/cron-runners/day1-nudge.mjs
+
+      - name: Fire cron route via curl (non-day1-nudge)
+        if: steps.which.outputs.route != '/api/cron/day1-nudge'
         env:
           ROUTE: ${{ steps.which.outputs.route }}
           PROD_URL: https://family-finance-taupe.vercel.app
